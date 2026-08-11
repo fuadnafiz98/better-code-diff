@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rethink Solution"
+  short_description: "Challenge shortcuts before declaring work done"
+  default_prompt: "Use $rethink-solution to critically reassess this completed solution and fix any material weaknesses."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Comments"
+  short_description: "Clean noisy comments and preserve rationale"
+  default_prompt: "Use $review-comments to clean the comments in my current changes while preserving durable rationale."

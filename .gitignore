@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output and caches
+out/
+dist/
+.tsbuild/
+coverage/
+.cache/
+.vite/
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+
