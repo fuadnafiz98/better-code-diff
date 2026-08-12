@@ -1,0 +1,97 @@
+import { useEffect, useEffectEvent, useRef, useState } from 'react'
+import { IconChevronSm, IconX } from '@pierre/icons'
+
+import type { FindInPageResult } from '../../shared/contracts'
+
+const FIND_DEBOUNCE_MS = 60
+
+export function FindBar(): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [result, setResult] = useState<FindInPageResult | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const close = (): void => {
+    setOpen(false)
+    setResult(null)
+    void window.repository?.stopFindInPage()
+  }
+
+  const findNext = (forward: boolean): void => {
+    if (query === '') return
+    void window.repository?.findInPage(query, forward, true)
+  }
+
+  const handleGlobalKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    const commandKey = event.metaKey || event.ctrlKey
+    if (commandKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'f') {
+      event.preventDefault()
+      setOpen(true)
+      window.requestAnimationFrame(() => inputRef.current?.select())
+      return
+    }
+    if (open && commandKey && event.key.toLowerCase() === 'g') {
+      event.preventDefault()
+      findNext(!event.shiftKey)
+      return
+    }
+    if (open && event.key === 'Escape') {
+      event.preventDefault()
+      close()
+    }
+  })
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleGlobalKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeyDown)
+      void window.repository?.stopFindInPage()
+    }
+  }, [])
+
+  useEffect(() => window.repository?.onFoundInPage(setResult), [])
+
+  useEffect(() => {
+    if (!open) return
+    if (query === '') {
+      setResult(null)
+      void window.repository?.stopFindInPage()
+      return
+    }
+    const timeout = window.setTimeout(() => {
+      void window.repository?.findInPage(query, true, false)
+    }, FIND_DEBOUNCE_MS)
+    return () => window.clearTimeout(timeout)
+  }, [open, query])
+
+  return (
+    <div className="find-bar-anchor">
+      {open ? (
+        <div className="find-bar" role="search">
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              findNext(!event.shiftKey)
+            }}
+            placeholder="Find in view"
+            aria-label="Find in current view"
+          />
+          <span className="find-count">{query === '' ? '—' : `${result?.activeMatchOrdinal ?? 0}/${result?.matches ?? 0}`}</span>
+          <button type="button" className="find-previous" disabled={query === ''} onClick={() => findNext(false)} aria-label="Previous match" title="Previous Match (Shift+Enter)">
+            <IconChevronSm />
+          </button>
+          <button type="button" disabled={query === ''} onClick={() => findNext(true)} aria-label="Next match" title="Next Match (Enter)">
+            <IconChevronSm />
+          </button>
+          <button type="button" onClick={close} aria-label="Close find" title="Close (Escape)">
+            <IconX />
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}

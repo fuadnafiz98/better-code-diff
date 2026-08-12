@@ -4,6 +4,7 @@ node_modules/
 # Build output and caches
 out/
 dist/
+release/
 .tsbuild/
 coverage/
 .cache/
@@ -29,4 +30,3 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
-

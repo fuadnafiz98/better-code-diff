@@ -1,5 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SelectedLineRange } from '@pierre/diffs'
+import {
+  IconApproved,
+  IconCheck,
+  IconComment,
+  IconCommentAdd,
+  IconPencil,
+  IconReply,
+  IconTrash,
+  IconX
+} from '@pierre/icons'
 
 export interface ReviewReply {
   id: string
@@ -48,7 +58,7 @@ export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): Re
   return (
     <div className="review-card review-draft">
       <div className="review-card-heading">
-        <strong>New comment</strong>
+        <strong><IconCommentAdd />New comment</strong>
         <span>{formatSelectedRange(range)}</span>
       </div>
       <textarea
@@ -65,8 +75,8 @@ export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): Re
       />
       <div className="review-card-actions">
         <span>⌘ Enter to save</span>
-        <button type="button" onClick={onCancel}>Cancel</button>
-        <button className="primary" type="button" onClick={save} disabled={body.trim() === ''}>Comment</button>
+        <button type="button" onClick={onCancel}><IconX />Cancel</button>
+        <button className="primary" type="button" onClick={save} disabled={body.trim() === ''}><IconComment />Comment</button>
       </div>
     </div>
   )
@@ -120,8 +130,8 @@ export function ReviewThreadCard({
         <div className="review-edit-area">
           <textarea aria-label="Edit review comment" value={editBody} onChange={(event) => setEditBody(event.target.value)} rows={3} />
           <div className="review-card-actions">
-            <button type="button" onClick={() => { setEditBody(thread.body); setEditing(false) }}>Cancel</button>
-            <button className="primary" type="button" onClick={saveEdit}>Save</button>
+            <button type="button" onClick={() => { setEditBody(thread.body); setEditing(false) }}><IconX />Cancel</button>
+            <button className="primary" type="button" onClick={saveEdit}><IconCheck />Save</button>
           </div>
         </div>
       ) : (
@@ -150,17 +160,17 @@ export function ReviewThreadCard({
             autoFocus
           />
           <div className="review-card-actions">
-            <button type="button" onClick={() => setReplying(false)}>Cancel</button>
-            <button className="primary" type="button" onClick={saveReply} disabled={replyBody.trim() === ''}>Reply</button>
+            <button type="button" onClick={() => setReplying(false)}><IconX />Cancel</button>
+            <button className="primary" type="button" onClick={saveReply} disabled={replyBody.trim() === ''}><IconReply />Reply</button>
           </div>
         </div>
       ) : null}
 
       <footer className="review-thread-actions">
-        <button type="button" onClick={() => setReplying(true)}>Reply</button>
-        <button type="button" onClick={() => setEditing(true)}>Edit</button>
-        <button type="button" onClick={onToggleResolved}>{thread.resolved ? 'Reopen' : 'Resolve'}</button>
-        <button className="danger" type="button" onClick={onDelete}>Delete</button>
+        <button type="button" onClick={() => setReplying(true)}><IconReply />Reply</button>
+        <button type="button" onClick={() => setEditing(true)}><IconPencil />Edit</button>
+        <button type="button" onClick={onToggleResolved}><IconApproved />{thread.resolved ? 'Reopen' : 'Resolve'}</button>
+        <button className="danger" type="button" onClick={onDelete}><IconTrash />Delete</button>
       </footer>
     </article>
   )

@@ -7,8 +7,8 @@ import {
   IconDiffSplit,
   IconDiffUnified,
   IconFileCode,
+  IconFiles,
   IconFolder,
-  IconFolderOpen,
   IconGear,
   IconRefresh,
   IconReload,
@@ -25,10 +25,20 @@ import type {
   RepositorySnapshot
 } from '../../shared/contracts'
 import type { RecentFolder } from './recentFolders'
+import { PerformanceHud } from './PerformanceHud'
 
 export type SearchMode = 'files' | 'content'
 export type DiffStyle = 'split' | 'unified'
 export type WorkspaceView = 'file' | 'multi'
+
+interface ShortcutHintProps {
+  keys: string
+  label: string
+}
+
+function ShortcutHint({ keys, label }: ShortcutHintProps): React.JSX.Element {
+  return <kbd className="shortcut-hint" aria-label={label}>{keys}</kbd>
+}
 
 interface TitlebarProps {
   snapshot: RepositorySnapshot | null
@@ -45,6 +55,7 @@ interface TitlebarProps {
   onOpen(): Promise<void>
   onRefresh(): Promise<void>
   onSettingsOpen(): void
+  onGitOpen(): void
 }
 
 export function Titlebar({
@@ -61,7 +72,8 @@ export function Titlebar({
   onSearchQueryChange,
   onOpen,
   onRefresh,
-  onSettingsOpen
+  onSettingsOpen,
+  onGitOpen
 }: TitlebarProps): React.JSX.Element {
   return (
     <header className="titlebar">
@@ -74,6 +86,7 @@ export function Titlebar({
               className="icon-button"
               type="button"
               aria-label={sidebarVisible ? 'Hide explorer' : 'Show explorer'}
+              title={sidebarVisible ? 'Hide Explorer' : 'Show Explorer'}
               onClick={onSidebarToggle}
             >
               {sidebarVisible ? <IconSidebarLeft /> : <IconSidebarLeftOpen />}
@@ -104,7 +117,9 @@ export function Titlebar({
             <IconX /><span className="sr-only">Clear search</span>
           </button>
         ) : (
-          <kbd>{searchMode === 'files' ? '⌘P' : '⌘⇧F'}</kbd>
+          searchMode === 'files'
+            ? <ShortcutHint keys="⌘P" label="Command P" />
+            : <ShortcutHint keys="⇧⌘F" label="Shift Command F" />
         )}
       </div>
 
@@ -118,7 +133,7 @@ export function Titlebar({
                 aria-pressed={searchMode === 'files'}
                 onClick={() => onSearchModeChange('files')}
               >
-                Files
+                <IconFileCode />Files
               </button>
               <button
                 type="button"
@@ -126,25 +141,32 @@ export function Titlebar({
                 aria-pressed={searchMode === 'content'}
                 onClick={() => onSearchModeChange('content')}
               >
-                Content
+                <IconCodeSearch />Content
               </button>
             </div>
+            <PerformanceHud />
             <button
               className="icon-button"
               type="button"
               aria-label="Refresh repository"
+              title="Refresh Repository"
               onClick={() => void onRefresh()}
               disabled={refreshing}
             >
               <IconReload className={refreshing ? 'spin' : undefined} />
             </button>
+            {snapshot.kind === 'git' ? (
+              <button className="icon-button" type="button" onClick={onGitOpen} aria-label="Open branches and pull requests" title="Branches and pull requests">
+                <IconBranch />
+              </button>
+            ) : null}
           </>
         ) : null}
-        <button className="icon-button" type="button" onClick={onSettingsOpen} aria-label="Open settings">
+        <button className="icon-button" type="button" onClick={onSettingsOpen} aria-label="Open settings" title="Settings">
           <IconGear />
         </button>
         <button className={`open-button ${snapshot == null ? 'open-button-secondary' : ''}`} type="button" onClick={() => void onOpen()} disabled={opening}>
-          {opening ? <IconRefresh className="spin" /> : <IconFolderOpen />}
+          {opening ? <IconRefresh className="spin" /> : <IconFolder />}
           Open Folder
         </button>
       </div>
@@ -237,13 +259,13 @@ export function Welcome({
             Open any folder. Select a file to read it, or compare its working copy with HEAD when Git is available.
           </p>
           <button className="welcome-open" type="button" onClick={() => void onOpen()} disabled={opening}>
-            {opening ? <IconRefresh className="spin" /> : <IconFolderOpen />}
-            Open folder
+            {opening ? <IconRefresh className="spin" /> : <IconFolder />}
+            Open Folder
           </button>
           <div className="shortcut-list" aria-label="Keyboard shortcuts">
-            <span>Open folder</span><kbd>⌘O</kbd>
-            <span>Go to file</span><kbd>⌘P</kbd>
-            <span>Search contents</span><kbd>⌘⇧F</kbd>
+            <span>Open folder</span><ShortcutHint keys="⌘O" label="Command O" />
+            <span>Go to file</span><ShortcutHint keys="⌘P" label="Command P" />
+            <span>Search contents</span><ShortcutHint keys="⇧⌘F" label="Shift Command F" />
           </div>
         </header>
 
@@ -287,6 +309,9 @@ interface DiffToolbarProps {
   diffStyle: DiffStyle
   workspaceView: WorkspaceView
   reviewFileCount: number
+  reviewTitle?: string
+  reviewComparison?: string
+  onCloseExternalReview?(): void
   onDiffStyleChange(style: DiffStyle): void
   onWorkspaceViewChange(view: WorkspaceView): void
 }
@@ -310,11 +335,14 @@ export function DiffToolbar({
   diffStyle,
   workspaceView,
   reviewFileCount,
+  reviewTitle,
+  reviewComparison,
+  onCloseExternalReview,
   onDiffStyleChange,
   onWorkspaceViewChange
 }: DiffToolbarProps): React.JSX.Element {
   const displayName = workspaceView === 'multi'
-    ? 'Repository review'
+    ? reviewTitle ?? 'Repository review'
     : isFilePreview
       ? selectedPath?.split('/').at(-1)
       : selectedPath
@@ -329,17 +357,22 @@ export function DiffToolbar({
         ) : null}
       </div>
       <div className="diff-controls">
-        <div className="segmented-control workspace-view-control" role="group" aria-label="Review view">
-          <button type="button" aria-pressed={workspaceView === 'file'} className={workspaceView === 'file' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('file')}>
-            File
-          </button>
-          <button type="button" aria-pressed={workspaceView === 'multi'} className={workspaceView === 'multi' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('multi')}>
-            Multi-file
-          </button>
-        </div>
+        {onCloseExternalReview != null ? (
+          <button className="review-return-button" type="button" onClick={onCloseExternalReview}><IconBranch />Working Tree</button>
+        ) : null}
+        {onCloseExternalReview == null ? (
+          <div className="segmented-control workspace-view-control" role="group" aria-label="Review view">
+            <button type="button" aria-pressed={workspaceView === 'file'} className={workspaceView === 'file' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('file')}>
+              <IconFileCode />File
+            </button>
+            <button type="button" aria-pressed={workspaceView === 'multi'} className={workspaceView === 'multi' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('multi')}>
+              <IconFiles />Multi-file
+            </button>
+          </div>
+        ) : null}
         <span className="comparison-label">
           {workspaceView === 'multi'
-            ? `${reviewFileCount} ${isGitRepository ? 'changed' : 'project'} files`
+            ? reviewComparison ?? `${reviewFileCount} ${isGitRepository ? 'changed' : 'project'} files`
             : isGitRepository ? 'HEAD → Working Tree' : 'Read-only preview'}
         </span>
         {isGitRepository && (workspaceView === 'multi' || !isFilePreview) ? (

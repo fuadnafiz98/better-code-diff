@@ -6,7 +6,15 @@ import { promisify } from 'node:util'
 
 import { describe, expect, it } from 'bun:test'
 
-import { mapGitStatus, parsePorcelainStatus, RepositoryService } from './repository.js'
+import { mapGitStatus, parsePorcelainStatus, RepositoryService, resolvePackagedExecutablePath } from './repository.js'
+
+describe('resolvePackagedExecutablePath', () => {
+  it('moves packaged executables outside the asar archive', () => {
+    expect(resolvePackagedExecutablePath('/Applications/App.app/Contents/Resources/app.asar/node_modules/rg'))
+      .toBe('/Applications/App.app/Contents/Resources/app.asar.unpacked/node_modules/rg')
+    expect(resolvePackagedExecutablePath('/workspace/node_modules/rg')).toBe('/workspace/node_modules/rg')
+  })
+})
 
 const executeFile = promisify(execFile)
 
@@ -109,6 +117,41 @@ describe('RepositoryService', () => {
       expect(searchResults).toMatchObject([{ path: 'src/value.ts', line: 1 }])
     } finally {
       await rm(folderPath, { recursive: true, force: true })
+    }
+  })
+
+  it('loads local Git history and compares branches without checkout', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-branch-test-'))
+
+    try {
+      await runGit(repositoryPath, 'init', '--quiet')
+      await runGit(repositoryPath, 'branch', '-M', 'main')
+      await writeFile(join(repositoryPath, 'value.txt'), 'base\n', 'utf8')
+      await runGit(repositoryPath, 'add', 'value.txt')
+      await runGit(repositoryPath, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'Base')
+      await runGit(repositoryPath, 'switch', '--quiet', '-c', 'feature')
+      await writeFile(join(repositoryPath, 'value.txt'), 'base\nfeature\n', 'utf8')
+      await runGit(repositoryPath, 'add', 'value.txt')
+      await runGit(repositoryPath, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'Feature')
+
+      const repository = new RepositoryService()
+      await repository.open(repositoryPath)
+      const integration = await repository.getGitIntegration()
+      const review = await repository.getLocalBranchReview('main', 'feature')
+      const commitReview = await repository.getCommitReview(integration.commits[0]!.oid)
+      const rootCommitReview = await repository.getCommitReview(integration.commits[1]!.oid)
+
+      expect(integration.defaultBranch).toBe('main')
+      expect(integration.commits.map((commit) => commit.subject)).toEqual(['Feature', 'Base'])
+      expect(review.kind).toBe('local')
+      expect(review.files.map((file) => file.path)).toEqual(['value.txt'])
+      expect(review.patch).toContain('+feature')
+      expect(commitReview.title).toContain('Feature')
+      expect(commitReview.patch).toContain('+feature')
+      expect(rootCommitReview.baseRefName).toBe('Empty tree')
+      expect(rootCommitReview.patch).toContain('+base')
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true })
     }
   })
 

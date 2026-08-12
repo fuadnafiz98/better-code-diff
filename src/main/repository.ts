@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { lstat, readFile, readlink, realpath } from 'node:fs/promises'
+import { constants as fileConstants } from 'node:fs'
+import { access, lstat, readFile, readlink, realpath } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { basename, relative, resolve, sep } from 'node:path'
 
@@ -8,6 +9,15 @@ import type {
   ContentSearchResult,
   DiffFileContents,
   FileComparison,
+  GitCommit,
+  GitIntegrationSnapshot,
+  GitRemote,
+  LocalBranch,
+  LocalBranchReview,
+  PullRequestReview,
+  PullRequestReviewEvent,
+  PullRequestSummary,
+  RemoteBranch,
   RepositoryFileStatus,
   RepositorySnapshot,
   RepositoryStatusEntry
@@ -17,6 +27,7 @@ const MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 const MAX_SEARCH_RESULTS = 200
 const MAX_HEAD_CACHE_ENTRIES = 32
+const GH_EXECUTABLE_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
 const EXCLUDED_DIRECTORIES = [
   '.cache',
   '.next',
@@ -51,10 +62,31 @@ type ReadVersion = {
 
 const require = createRequire(import.meta.url)
 const { rgPath } = require('@vscode/ripgrep') as { rgPath: string }
+const RIPGREP_EXECUTABLE = resolvePackagedExecutablePath(rgPath)
+
+export function resolvePackagedExecutablePath(executablePath: string): string {
+  return executablePath.replace(/([\\/])app\.asar([\\/])/, '$1app.asar.unpacked$2')
+}
 
 interface CommandResult {
   stdout: Buffer
   stderr: Buffer
+}
+
+let ghExecutablePromise: Promise<string> | null = null
+
+function getGhExecutable(): Promise<string> {
+  ghExecutablePromise ??= (async () => {
+    for (const candidate of GH_EXECUTABLE_CANDIDATES) {
+      try {
+        await access(candidate, fileConstants.X_OK)
+        return candidate
+      } catch {
+      }
+    }
+    return 'gh'
+  })()
+  return ghExecutablePromise
 }
 
 function runCommand(
@@ -179,6 +211,91 @@ function toDiffFile(name: string, contents: Buffer, revision: string): DiffFileC
   }
 }
 
+function parseJson<T>(result: CommandResult, label: string): T {
+  try {
+    return JSON.parse(result.stdout.toString('utf8')) as T
+  } catch {
+    throw new Error(`${label} returned invalid JSON.`)
+  }
+}
+
+function parseBranches(result: CommandResult): LocalBranch[] {
+  return result.stdout.toString('utf8').split('\n').flatMap((line) => {
+    if (line === '') return []
+    const [head, name, upstream = ''] = line.split('\t')
+    if (name == null || name === '') return []
+    return [{ name, current: head === '*', upstream: upstream || null }]
+  })
+}
+
+function parseRemoteBranches(result: CommandResult): RemoteBranch[] {
+  return result.stdout.toString('utf8').split('\n').flatMap((name) => {
+    if (name === '' || name.endsWith('/HEAD')) return []
+    const separatorIndex = name.indexOf('/')
+    if (separatorIndex < 1) return []
+    return [{ name, remote: name.slice(0, separatorIndex) }]
+  })
+}
+
+function parseRemotes(result: CommandResult): GitRemote[] {
+  const remotes = new Map<string, GitRemote>()
+  for (const line of result.stdout.toString('utf8').split('\n')) {
+    const match = /^(\S+)\s+(.+)\s+\((fetch|push)\)$/.exec(line)
+    if (match == null) continue
+    const [, name, url, direction] = match
+    if (name == null || url == null || direction == null) continue
+    const remote = remotes.get(name) ?? { name, fetchUrl: '', pushUrl: '' }
+    if (direction === 'fetch') remote.fetchUrl = url
+    else remote.pushUrl = url
+    remotes.set(name, remote)
+  }
+  return [...remotes.values()]
+}
+
+function parseCommits(result: CommandResult | null): GitCommit[] {
+  if (result == null) return []
+  return result.stdout.toString('utf8').split('\x1e').flatMap((record) => {
+    const trimmedRecord = record.replace(/^\n+|\n+$/g, '')
+    if (trimmedRecord === '') return []
+    const [oid, shortOid, parents = '', authorName, authorEmail, authoredAt, subject, decorations = ''] = trimmedRecord.split('\x1f')
+    if (oid == null || shortOid == null || authorName == null || authorEmail == null || authoredAt == null || subject == null) return []
+    return [{
+      oid,
+      shortOid,
+      parents: parents === '' ? [] : parents.split(' '),
+      authorName,
+      authorEmail,
+      authoredAt,
+      subject,
+      decorations: decorations === '' ? [] : decorations.split(', ').map((decoration) => decoration.trim())
+    }]
+  })
+}
+
+function parseAheadBehind(result: CommandResult | null): { ahead: number; behind: number } {
+  if (result == null) return { ahead: 0, behind: 0 }
+  const [aheadText = '0', behindText = '0'] = result.stdout.toString('utf8').trim().split(/\s+/)
+  return { ahead: Number(aheadText) || 0, behind: Number(behindText) || 0 }
+}
+
+function requirePullRequestNumber(number: number): void {
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new Error('Pull request number must be a positive integer.')
+  }
+}
+
+function normalizePullRequestSelector(selector: number | string): string {
+  if (typeof selector === 'number') {
+    requirePullRequestNumber(selector)
+    return String(selector)
+  }
+  const trimmedSelector = selector.trim()
+  if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(trimmedSelector)) {
+    return trimmedSelector
+  }
+  throw new Error('Pull request selector must be a positive number or a GitHub pull request URL.')
+}
+
 export class RepositoryService {
   #root: string | null = null
   #kind: RepositorySnapshot['kind'] = 'folder'
@@ -231,7 +348,7 @@ export class RepositoryService {
 
   async #refreshFolder(root: string): Promise<RepositorySnapshot> {
     const pathsResult = await runCommand(
-      rgPath,
+      RIPGREP_EXECUTABLE,
       [
         '--files',
         '--hidden',
@@ -298,7 +415,7 @@ export class RepositoryService {
 
     return new Promise((resolveSearch, rejectSearch) => {
       const child = spawn(
-        rgPath,
+        RIPGREP_EXECUTABLE,
         [
           '--json',
           '--fixed-strings',
@@ -374,6 +491,206 @@ export class RepositoryService {
         resolveSearch(results)
       })
     })
+  }
+
+  async getGitIntegration(): Promise<GitIntegrationSnapshot> {
+    this.#requireGitRepository()
+    const ghExecutable = await getGhExecutable()
+    const branchesPromise = this.#git([
+      'for-each-ref',
+      '--sort=-committerdate',
+      '--format=%(HEAD)%09%(refname:short)%09%(upstream:short)',
+      'refs/heads'
+    ])
+    const pullRequestsPromise = runCommand(ghExecutable, [
+      'pr',
+      'list',
+      '--state', 'all',
+      '--limit', '100',
+      '--json',
+      'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles'
+    ], this.#requireRoot()).then(
+      (result) => ({ pullRequests: parseJson<PullRequestSummary[]>(result, 'GitHub CLI'), message: null }),
+      (error: unknown) => ({
+        pullRequests: [],
+        message: error instanceof Error ? error.message : String(error)
+      })
+    )
+
+    const [branchesResult, remoteBranchesResult, remotesResult, commitsResult, defaultBranchResult, aheadBehindResult, githubResult] = await Promise.all([
+      branchesPromise,
+      this.#git(['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/remotes']),
+      this.#git(['remote', '-v']),
+      this.#gitAllowFailure(['log', '-100', '--format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1e']),
+      this.#gitAllowFailure(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']),
+      this.#gitAllowFailure(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}']),
+      pullRequestsPromise
+    ])
+    const branches = parseBranches(branchesResult)
+    const defaultRemoteBranch = defaultBranchResult?.stdout.toString('utf8').trim() || null
+    const defaultBranch = defaultRemoteBranch?.replace(/^[^/]+\//, '')
+      ?? (branches.some((branch) => branch.name === 'main') ? 'main' : null)
+      ?? (branches.some((branch) => branch.name === 'master') ? 'master' : null)
+      ?? branches.find((branch) => branch.current)?.name
+      ?? null
+    const counts = parseAheadBehind(aheadBehindResult)
+    return {
+      branches,
+      remoteBranches: parseRemoteBranches(remoteBranchesResult),
+      remotes: parseRemotes(remotesResult),
+      commits: parseCommits(commitsResult),
+      defaultBranch,
+      ahead: counts.ahead,
+      behind: counts.behind,
+      pullRequests: githubResult.pullRequests,
+      githubAvailable: githubResult.message == null,
+      githubMessage: githubResult.message
+    }
+  }
+
+  async switchBranch(name: string): Promise<RepositorySnapshot> {
+    this.#requireGitRepository()
+    const branchesResult = await this.#git([
+      'for-each-ref', '--format=%(refname:short)', 'refs/heads'
+    ])
+    const branches = new Set(branchesResult.stdout.toString('utf8').split('\n').filter(Boolean))
+    if (!branches.has(name)) throw new Error('The selected local branch no longer exists.')
+    await this.#git(['switch', '--no-guess', name])
+    return this.refresh()
+  }
+
+  async getLocalBranchReview(baseRef: string, headRef: string): Promise<LocalBranchReview> {
+    this.#requireGitRepository()
+    const branchResult = await this.#git(['for-each-ref', '--format=%(refname:short)', 'refs/heads'])
+    const branches = new Set(branchResult.stdout.toString('utf8').split('\n').filter(Boolean))
+    if (!branches.has(baseRef) || !branches.has(headRef)) throw new Error('Both comparison refs must be local branches.')
+    if (baseRef === headRef) throw new Error('Select two different branches to compare.')
+    const comparison = `${baseRef}...${headRef}`
+    const [pathsResult, patchResult, headResult] = await Promise.all([
+      this.#git(['diff', '--name-only', '-z', '--find-renames', comparison, '--']),
+      this.#git(['diff', '--no-color', '--find-renames', comparison, '--']),
+      this.#git(['rev-parse', headRef])
+    ])
+    const paths = prepareVisiblePaths(pathsResult.stdout)
+    return {
+      kind: 'local',
+      id: `${comparison}:${headResult.stdout.toString('utf8').trim()}`,
+      title: `${headRef} compared with ${baseRef}`,
+      baseRefName: baseRef,
+      headRefName: headRef,
+      files: paths.map((path) => ({ path, additions: 0, deletions: 0 })),
+      patch: patchResult.stdout.toString('utf8')
+    }
+  }
+
+  async getCommitReview(oid: string): Promise<LocalBranchReview> {
+    this.#requireGitRepository()
+    if (!/^[0-9a-f]{7,40}$/i.test(oid)) throw new Error('Commit ID is invalid.')
+    await this.#git(['cat-file', '-e', `${oid}^{commit}`])
+    const commitResult = await this.#git(['rev-list', '--parents', '-n', '1', oid])
+    const [commitOid, firstParent] = commitResult.stdout.toString('utf8').trim().split(' ')
+    if (commitOid == null) throw new Error('Commit could not be resolved.')
+    const pathArgs = firstParent == null
+      ? ['diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '-z', '--find-renames', commitOid, '--']
+      : ['diff', '--name-only', '-z', '--find-renames', firstParent, commitOid, '--']
+    const patchArgs = firstParent == null
+      ? ['show', '--format=', '--no-color', '--find-renames', commitOid, '--']
+      : ['diff', '--no-color', '--find-renames', firstParent, commitOid, '--']
+    const [pathsResult, patchResult, metadataResult] = await Promise.all([
+      this.#git(pathArgs),
+      this.#git(patchArgs),
+      this.#git(['show', '-s', '--format=%h%x1f%s', commitOid])
+    ])
+    const [shortOid = commitOid.slice(0, 8), subject = 'Commit'] = metadataResult.stdout.toString('utf8').trim().split('\x1f')
+    const paths = prepareVisiblePaths(pathsResult.stdout)
+    return {
+      kind: 'local',
+      id: `commit:${commitOid}`,
+      title: `${shortOid} ${subject}`,
+      baseRefName: firstParent?.slice(0, 8) ?? 'Empty tree',
+      headRefName: shortOid,
+      files: paths.map((path) => ({ path, additions: 0, deletions: 0 })),
+      patch: patchResult.stdout.toString('utf8')
+    }
+  }
+
+  async fetchRemote(): Promise<GitIntegrationSnapshot> {
+    this.#requireGitRepository()
+    await this.#git(['fetch', '--all', '--prune'])
+    return this.getGitIntegration()
+  }
+
+  async pullCurrentBranch(): Promise<RepositorySnapshot> {
+    this.#requireGitRepository()
+    await this.#git(['pull', '--ff-only'])
+    return this.refresh()
+  }
+
+  async pushCurrentBranch(): Promise<GitIntegrationSnapshot> {
+    this.#requireGitRepository()
+    const snapshot = this.#requireSnapshot()
+    const branch = snapshot.branch
+    if (branch == null) throw new Error('The repository is not on a local branch.')
+    const upstreamResult = await this.#gitAllowFailure(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+    if (upstreamResult == null) {
+      const remotesResult = await this.#git(['remote'])
+      const remotes = remotesResult.stdout.toString('utf8').split('\n').filter(Boolean)
+      const remote = remotes.includes('origin') ? 'origin' : remotes[0]
+      if (remote == null) throw new Error('Add a Git remote before pushing this branch.')
+      await this.#git(['push', '--set-upstream', remote, branch])
+    } else {
+      await this.#git(['push'])
+    }
+    return this.getGitIntegration()
+  }
+
+  async getPullRequestReview(selector: number | string): Promise<PullRequestReview> {
+    this.#requireGitRepository()
+    const normalizedSelector = normalizePullRequestSelector(selector)
+    const ghExecutable = await getGhExecutable()
+    const fields = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles,files'
+    const [detailsResult, diffResult] = await Promise.all([
+      runCommand(ghExecutable, ['pr', 'view', normalizedSelector, '--json', fields], this.#requireRoot()),
+      runCommand(ghExecutable, ['pr', 'diff', normalizedSelector, '--color', 'never'], this.#requireRoot())
+    ])
+    const details = parseJson<PullRequestSummary & { files: PullRequestReview['files'] }>(detailsResult, 'GitHub CLI')
+    const { files, ...pullRequest } = details
+    return {
+      kind: 'github',
+      selector: normalizedSelector,
+      pullRequest,
+      files,
+      patch: diffResult.stdout.toString('utf8')
+    }
+  }
+
+  async checkoutPullRequest(number: number): Promise<RepositorySnapshot> {
+    this.#requireGitRepository()
+    requirePullRequestNumber(number)
+    await runCommand(await getGhExecutable(), ['pr', 'checkout', String(number)], this.#requireRoot())
+    return this.refresh()
+  }
+
+  async submitPullRequestReview(
+    selector: number | string,
+    reviewEvent: string,
+    body: string
+  ): Promise<void> {
+    this.#requireGitRepository()
+    const normalizedSelector = normalizePullRequestSelector(selector)
+    const events: PullRequestReviewEvent[] = ['approve', 'comment', 'request-changes']
+    if (!events.includes(reviewEvent as PullRequestReviewEvent)) {
+      throw new Error('Unknown pull request review action.')
+    }
+    if (typeof body !== 'string') throw new Error('Pull request review body must be text.')
+    const trimmedBody = body.trim()
+    if (reviewEvent !== 'approve' && trimmedBody === '') {
+      throw new Error('A review comment is required for this action.')
+    }
+    const eventFlag = reviewEvent === 'request-changes' ? '--request-changes' : `--${reviewEvent}`
+    const args = ['pr', 'review', normalizedSelector, eventFlag]
+    if (trimmedBody !== '') args.push('--body', trimmedBody)
+    await runCommand(await getGhExecutable(), args, this.#requireRoot())
   }
 
   async #readHeadFile(
@@ -457,6 +774,10 @@ export class RepositoryService {
   async #git(args: readonly string[]): Promise<CommandResult> {
     if (this.#kind !== 'git') throw new Error('The open folder is not a Git repository.')
     return runCommand('git', ['-C', this.#requireRoot(), ...args])
+  }
+
+  #requireGitRepository(): void {
+    if (this.#kind !== 'git') throw new Error('The open folder is not a Git repository.')
   }
 
   async #gitAllowFailure(args: readonly string[]): Promise<CommandResult | null> {

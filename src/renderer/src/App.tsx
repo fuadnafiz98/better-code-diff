@@ -14,6 +14,7 @@ import {
 import type {
   ContentSearchResult,
   FileComparison,
+  RepositoryChangeEvent,
   RepositorySnapshot
 } from '../../shared/contracts'
 import {
@@ -34,25 +35,17 @@ import {
   type AppPreferences
 } from './preferences'
 import { SettingsPage } from './SettingsPage'
+import { RepositoryPanel } from './GitHubPanel'
+import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import {
   loadRecentFolders,
   rememberRecentFolder,
   saveRecentFolders,
   type RecentFolder
 } from './recentFolders'
+import { useGitWorkflow } from './useGitWorkflow'
 
 const RepositoryWorkspace = lazy(() => import('./RepositoryWorkspace'))
-
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-function requireRepositoryApi(): NonNullable<Window['repository']> {
-  if (window.repository == null) {
-    throw new Error('Desktop integration did not load. Restart the Electron app with “bun run dev”.')
-  }
-  return window.repository
-}
 
 export function App(): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(null)
@@ -73,9 +66,12 @@ export function App(): React.JSX.Element {
   const [searchQuery, setSearchQuery] = useState('')
   const [contentResults, setContentResults] = useState<ContentSearchResult[]>([])
   const [searchingContent, setSearchingContent] = useState(false)
+  const [repositoryChange, setRepositoryChange] = useState<RepositoryChangeEvent | null>(null)
+  const [comparisonRevision, setComparisonRevision] = useState(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const comparisonRequestRef = useRef(0)
   const contentSearchRequestRef = useRef(0)
+  const lastComparisonPathRef = useRef<string | null>(null)
   const deferredSearchQuery = useDeferredValue(searchQuery)
 
   const indexedPaths = useMemo(
@@ -105,12 +101,21 @@ export function App(): React.JSX.Element {
     []
   )
 
+  const gitWorkflow = useGitWorkflow({
+    snapshot,
+    applySnapshot,
+    onError: setError,
+    onSelectPath: setSelectedPath,
+    onWorkspaceViewChange: setWorkspaceView
+  })
+
   const openFolder = useCallback(async () => {
     setOpening(true)
     setError(null)
     try {
       const nextSnapshot = await requireRepositoryApi().openFolder()
       if (nextSnapshot != null) {
+        gitWorkflow.reset()
         setSelectedPath(null)
         applySnapshot(nextSnapshot)
         setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
@@ -120,13 +125,14 @@ export function App(): React.JSX.Element {
     } finally {
       setOpening(false)
     }
-  }, [applySnapshot])
+  }, [applySnapshot, gitWorkflow])
 
   const openRecentFolder = useCallback(async (folder: RecentFolder) => {
     setOpeningRecentPath(folder.path)
     setError(null)
     try {
       const nextSnapshot = await requireRepositoryApi().openPath(folder.path)
+      gitWorkflow.reset()
       setSelectedPath(null)
       applySnapshot(nextSnapshot)
       setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
@@ -135,7 +141,7 @@ export function App(): React.JSX.Element {
     } finally {
       setOpeningRecentPath(null)
     }
-  }, [applySnapshot])
+  }, [applySnapshot, gitWorkflow])
 
   const refreshRepository = useCallback(async () => {
     if (snapshot == null) return
@@ -159,6 +165,18 @@ export function App(): React.JSX.Element {
     []
   )
 
+  const handleRepositoryChange = useEffectEvent((change: RepositoryChangeEvent): void => {
+    startTransition(() => {
+      applySnapshot(change.snapshot)
+      setRepositoryChange(change)
+      if (selectedPath != null && change.changedPaths.includes(selectedPath)) {
+        setComparisonRevision(change.revision)
+      }
+    })
+  })
+
+  useEffect(() => requireRepositoryApi().onDidChange(handleRepositoryChange), [])
+
   useEffect(() => {
     const requestId = comparisonRequestRef.current + 1
     comparisonRequestRef.current = requestId
@@ -167,7 +185,9 @@ export function App(): React.JSX.Element {
       setLoadingDiff(false)
       return
     }
-    setLoadingDiff(true)
+    const pathChanged = lastComparisonPathRef.current !== selectedPath
+    lastComparisonPathRef.current = selectedPath
+    if (pathChanged) setLoadingDiff(true)
     setError(null)
     void requireRepositoryApi()
       .getComparison(selectedPath)
@@ -180,7 +200,7 @@ export function App(): React.JSX.Element {
       .finally(() => {
         if (comparisonRequestRef.current === requestId) setLoadingDiff(false)
       })
-  }, [selectedPath, workspaceView])
+  }, [comparisonRevision, selectedPath, workspaceView])
 
   useEffect(() => {
     if (searchMode !== 'content' || deferredSearchQuery.trim().length < 2) {
@@ -225,6 +245,11 @@ export function App(): React.JSX.Element {
       setSettingsOpen(false)
       return
     }
+    if (event.key === 'Escape' && gitWorkflow.panelOpen) {
+      event.preventDefault()
+      gitWorkflow.setPanelOpen(false)
+      return
+    }
     if (!(event.metaKey || event.ctrlKey)) return
     if (event.key === ',') {
       event.preventDefault()
@@ -267,7 +292,27 @@ export function App(): React.JSX.Element {
         onOpen={openFolder}
         onRefresh={refreshRepository}
         onSettingsOpen={() => setSettingsOpen(true)}
+        onGitOpen={gitWorkflow.openPanel}
       />
+
+      {gitWorkflow.panelOpen && snapshot?.kind === 'git' ? (
+        <RepositoryPanel
+          integration={gitWorkflow.integration}
+          loading={gitWorkflow.loadingIntegration}
+          actionKey={gitWorkflow.actionKey}
+          onClose={() => gitWorkflow.setPanelOpen(false)}
+          onReload={() => void gitWorkflow.loadIntegration()}
+          onSwitchBranch={(name) => void gitWorkflow.switchBranch(name)}
+          onReviewLocalBranch={(baseRef, headRef) => void gitWorkflow.reviewLocalBranch(baseRef, headRef)}
+          onReviewCommit={(oid) => void gitWorkflow.reviewCommit(oid)}
+          onFetch={() => void gitWorkflow.fetchRemote()}
+          onPull={() => void gitWorkflow.pullCurrentBranch()}
+          onPush={() => void gitWorkflow.pushCurrentBranch()}
+          onReview={(pullRequest) => void gitWorkflow.reviewPullRequest(pullRequest)}
+          onOpenPullRequest={(number) => void gitWorkflow.openPullRequestReview(number)}
+          onCheckout={(pullRequest) => void gitWorkflow.checkoutPullRequest(pullRequest)}
+        />
+      ) : null}
 
       {settingsOpen ? (
         <SettingsPage preferences={preferences} onChange={setPreferences} onClose={() => setSettingsOpen(false)} />
@@ -306,9 +351,15 @@ export function App(): React.JSX.Element {
             diffStyle={diffStyle}
             workspaceView={workspaceView}
             preferences={preferences}
+            repositoryReview={gitWorkflow.repositoryReview}
+            repositoryChange={repositoryChange}
             onSelectPath={setSelectedPath}
             onDiffStyleChange={setDiffStyle}
             onWorkspaceViewChange={setWorkspaceView}
+            onClosePullRequestReview={gitWorkflow.closeReview}
+            submittingPullRequestReview={gitWorkflow.submittingReview}
+            pullRequestReviewMessage={gitWorkflow.submissionMessage}
+            onSubmitPullRequestReview={(reviewEvent, body) => void gitWorkflow.submitReview(reviewEvent, body)}
           />
         </Suspense>
       )}

@@ -1,4 +1,4 @@
-import { IconGear, IconX } from '@pierre/icons'
+import { IconGear, IconReload, IconX } from '@pierre/icons'
 
 import {
   CODE_FONTS,
@@ -37,7 +37,7 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
             <h1>Editor appearance</h1>
             <p>Changes apply immediately and persist on this Mac.</p>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close settings"><IconX /></button>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close settings" title="Close Settings"><IconX /></button>
         </header>
 
         <div className="settings-scroll">
@@ -83,7 +83,7 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
             <pre style={codeStyle}><code><i>const</i> message = <b>'{CODE_FONTS[preferences.codeFont].label} → diff-first'</b>{'\n'}console.log(message)</code></pre>
           </div>
 
-          <button className="settings-reset" type="button" onClick={() => onChange(DEFAULT_PREFERENCES)}>Reset defaults</button>
+          <button className="settings-reset" type="button" onClick={() => onChange(DEFAULT_PREFERENCES)}><IconReload />Reset Defaults</button>
         </div>
       </div>
     </section>

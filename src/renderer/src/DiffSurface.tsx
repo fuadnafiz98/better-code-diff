@@ -16,6 +16,7 @@ import {
   DIFF_HIGHLIGHTER_LIMITS,
   DIFF_WORKER_POOL_OPTIONS
 } from './diffWorkerConfig'
+import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
 import { CODE_FONTS, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -59,9 +60,10 @@ const INTERACTION_CSS = `
     min-height: 30px;
   }
 
-  [data-expand-button] {
-    border-radius: 7px;
-    corner-shape: squircle;
+  button[data-expand-button][data-expand-button] {
+    border-radius: 24% !important;
+    corner-shape: squircle !important;
+    clip-path: polygon(18% 0, 82% 0, 91% 3%, 97% 9%, 100% 18%, 100% 82%, 97% 91%, 91% 97%, 82% 100%, 18% 100%, 9% 97%, 3% 91%, 0 82%, 0 18%, 3% 9%, 9% 3%) !important;
     cursor: pointer;
     color: rgba(231, 232, 235, 0.72);
   }
@@ -77,205 +79,8 @@ const INTERACTION_CSS = `
     font-size: 11px;
   }
 
-  [data-selected-line] {
-    background: rgba(64, 139, 230, 0.16) !important;
-  }
-
-  [data-drag-range] {
-    background: rgba(64, 139, 230, 0.16) !important;
-  }
-
-  [data-gutter] [data-drag-range] {
-    position: relative;
-  }
-
-  [data-gutter] [data-drag-range]::after {
-    content: "";
-    position: absolute;
-    z-index: 2;
-    top: 0;
-    right: -4px;
-    bottom: 0;
-    width: 2px;
-    border-radius: 2px;
-    background: #58a6ff;
-    pointer-events: none;
-  }
-
-  [data-gutter] [data-drag-range="first"]::after {
-    top: 50%;
-  }
-
-  [data-gutter] [data-drag-range="last"]::after {
-    bottom: 50%;
-  }
-
-  [data-gutter] [data-drag-range="single"]::after {
-    display: none;
-  }
-
-  [data-utility-button] {
-    position: relative;
-    border-radius: 7px;
-    corner-shape: squircle;
-    background: #58a6ff;
-    color: #07111f;
-  }
-
+  ${DRAG_SELECTION_CSS}
 `
-const dragGuideTeardowns = new WeakMap<HTMLElement, () => void>()
-
-interface DragLine {
-  index: number
-  lineNumber: number
-}
-
-interface DragGuideState {
-  side: HTMLElement
-  sideName: 'additions' | 'deletions'
-  start: DragLine
-  current: DragLine
-  moved: boolean
-}
-
-function findClosestGutterLine(side: HTMLElement, pointerY: number): DragLine | null {
-  const lines = [...side.querySelectorAll<HTMLElement>('[data-gutter] [data-column-number]')]
-  let closest: { distance: number; line: DragLine } | null = null
-
-  for (const element of lines) {
-    const index = Number(element.dataset.lineIndex?.split(',')[0])
-    const lineNumber = Number(element.dataset.columnNumber)
-    if (!Number.isFinite(index) || !Number.isFinite(lineNumber)) continue
-
-    const bounds = element.getBoundingClientRect()
-    const distance = Math.abs(pointerY - (bounds.top + bounds.height / 2))
-    if (closest == null || distance < closest.distance) {
-      closest = { distance, line: { index, lineNumber } }
-    }
-  }
-
-  return closest?.line ?? null
-}
-
-function renderDragGuide(side: HTMLElement, startIndex: number, endIndex: number): void {
-  const firstIndex = Math.min(startIndex, endIndex)
-  const lastIndex = Math.max(startIndex, endIndex)
-
-  for (const element of side.querySelectorAll<HTMLElement>('[data-line-index]')) {
-    const index = Number(element.dataset.lineIndex?.split(',')[0])
-    if (index < firstIndex || index > lastIndex) {
-      element.removeAttribute('data-drag-range')
-      continue
-    }
-
-    const boundary = firstIndex === lastIndex
-      ? 'single'
-      : index === firstIndex
-        ? 'first'
-        : index === lastIndex
-          ? 'last'
-          : ''
-    element.setAttribute('data-drag-range', boundary)
-  }
-}
-
-function clearDragGuide(root: ShadowRoot): void {
-  for (const element of root.querySelectorAll<HTMLElement>('[data-drag-range]')) {
-    element.removeAttribute('data-drag-range')
-  }
-}
-
-function syncDragGuideLifecycle(
-  node: HTMLElement,
-  phase: string,
-  onRangeSelected: (range: SelectedLineRange) => void
-): void {
-  if (phase === 'unmount') {
-    dragGuideTeardowns.get(node)?.()
-    dragGuideTeardowns.delete(node)
-    return
-  }
-  if (dragGuideTeardowns.has(node) || node.shadowRoot == null) return
-
-  const root = node.shadowRoot
-  let drag: DragGuideState | null = null
-  let suppressClick = false
-
-  const onPointerDown = (event: Event): void => {
-    const pointerEvent = event as PointerEvent
-    const path = pointerEvent.composedPath()
-    const utilityButton = path.find(
-      (target): target is HTMLElement => target instanceof HTMLElement && target.hasAttribute('data-utility-button')
-    )
-    if (utilityButton == null) return
-
-    const side = utilityButton.closest<HTMLElement>('[data-additions], [data-deletions]')
-    if (side == null) return
-    const start = findClosestGutterLine(side, pointerEvent.clientY)
-    if (start == null) return
-
-    drag = {
-      side,
-      sideName: side.hasAttribute('data-deletions') ? 'deletions' : 'additions',
-      start,
-      current: start,
-      moved: false
-    }
-    renderDragGuide(side, start.index, start.index)
-  }
-
-  const onPointerMove = (event: Event): void => {
-    const pointerEvent = event as PointerEvent
-    if (drag == null || (pointerEvent.buttons & 1) === 0) return
-    const current = findClosestGutterLine(drag.side, pointerEvent.clientY)
-    if (current == null) return
-
-    drag.current = current
-    drag.moved ||= current.index !== drag.start.index
-    renderDragGuide(drag.side, drag.start.index, current.index)
-  }
-
-  const onPointerUp = (event: Event): void => {
-    if (drag == null) return
-    const completedDrag = drag
-    drag = null
-
-    if (completedDrag.moved) {
-      suppressClick = true
-      event.preventDefault()
-      event.stopImmediatePropagation()
-      onRangeSelected({
-        start: Math.min(completedDrag.start.lineNumber, completedDrag.current.lineNumber),
-        end: Math.max(completedDrag.start.lineNumber, completedDrag.current.lineNumber),
-        side: completedDrag.sideName
-      })
-      window.setTimeout(() => { suppressClick = false }, 0)
-    }
-
-    window.requestAnimationFrame(() => clearDragGuide(root))
-  }
-
-  const onClick = (event: Event): void => {
-    if (!suppressClick) return
-    event.preventDefault()
-    event.stopImmediatePropagation()
-  }
-
-  root.addEventListener('pointerdown', onPointerDown, true)
-  root.addEventListener('pointermove', onPointerMove, true)
-  root.addEventListener('pointerup', onPointerUp, true)
-  root.addEventListener('pointercancel', onPointerUp, true)
-  root.addEventListener('click', onClick, true)
-
-  dragGuideTeardowns.set(node, () => {
-    root.removeEventListener('pointerdown', onPointerDown, true)
-    root.removeEventListener('pointermove', onPointerMove, true)
-    root.removeEventListener('pointerup', onPointerUp, true)
-    root.removeEventListener('pointercancel', onPointerUp, true)
-    root.removeEventListener('click', onClick, true)
-    clearDragGuide(root)
-  })
-}
 const HIGHLIGHTER_OPTIONS = {
   langs: DIFF_HIGHLIGHTER_LANGUAGES,
   ...DIFF_HIGHLIGHTER_LIMITS
