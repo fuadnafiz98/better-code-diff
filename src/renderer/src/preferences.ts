@@ -1,6 +1,17 @@
+import { DEFAULT_KEYBINDINGS, type KeybindingMap } from './keybindings'
+
 export type CodeFont = 'fira-code' | 'sf-mono' | 'menlo' | 'monaco'
 export type InterfaceFont = 'inter' | 'system'
-export type EditorTheme = 'pierre-dark' | 'pierre-dark-soft' | 'github-dark' | 'vitesse-dark'
+export type EditorTheme =
+  | 'pierre-dark'
+  | 'pierre-dark-soft'
+  | 'github-dark'
+  | 'vitesse-dark'
+  | 'pierre-light'
+  | 'github-light'
+  | 'vitesse-light'
+  | 'light-plus'
+export type EditorThemeType = 'dark' | 'light'
 
 export interface AppPreferences {
   codeFont: CodeFont
@@ -10,6 +21,8 @@ export interface AppPreferences {
   interfaceFont: InterfaceFont
   showLineNumbers: boolean
   wordWrap: boolean
+  foldUnchanged: boolean
+  keybindings: KeybindingMap
 }
 
 export const CODE_FONTS: Record<CodeFont, { label: string; fontFamily: string }> = {
@@ -46,7 +59,23 @@ export const EDITOR_THEMES: Record<EditorTheme, string> = {
   'pierre-dark': 'Pierre Dark',
   'pierre-dark-soft': 'Pierre Dark Soft',
   'github-dark': 'GitHub Dark',
-  'vitesse-dark': 'Vitesse Dark'
+  'vitesse-dark': 'Vitesse Dark',
+  'pierre-light': 'Pierre Light',
+  'github-light': 'GitHub Light',
+  'vitesse-light': 'Vitesse Light',
+  'light-plus': 'Light Plus'
+}
+
+export const EDITOR_THEME_GROUPS: ReadonlyArray<{
+  label: string
+  themes: readonly EditorTheme[]
+}> = [
+  { label: 'Light', themes: ['pierre-light', 'github-light', 'vitesse-light', 'light-plus'] },
+  { label: 'Dark', themes: ['pierre-dark', 'pierre-dark-soft', 'github-dark', 'vitesse-dark'] }
+]
+
+export function getEditorThemeType(theme: EditorTheme): EditorThemeType {
+  return theme.endsWith('-light') || theme === 'light-plus' ? 'light' : 'dark'
 }
 
 export const DEFAULT_PREFERENCES: AppPreferences = {
@@ -56,7 +85,9 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   editorTheme: 'pierre-dark',
   interfaceFont: 'inter',
   showLineNumbers: true,
-  wordWrap: false
+  wordWrap: false,
+  foldUnchanged: true,
+  keybindings: DEFAULT_KEYBINDINGS
 }
 
 const STORAGE_KEY = 'better-code-diff:preferences:v1'
@@ -81,11 +112,22 @@ export function loadPreferences(): AppPreferences {
       showLineNumbers: typeof parsed.showLineNumbers === 'boolean'
         ? parsed.showLineNumbers
         : DEFAULT_PREFERENCES.showLineNumbers,
-      wordWrap: typeof parsed.wordWrap === 'boolean' ? parsed.wordWrap : DEFAULT_PREFERENCES.wordWrap
+      wordWrap: typeof parsed.wordWrap === 'boolean' ? parsed.wordWrap : DEFAULT_PREFERENCES.wordWrap,
+      foldUnchanged: typeof parsed.foldUnchanged === 'boolean' ? parsed.foldUnchanged : DEFAULT_PREFERENCES.foldUnchanged,
+      keybindings: loadKeybindings(parsed.keybindings)
     }
   } catch {
     return DEFAULT_PREFERENCES
   }
+}
+
+function loadKeybindings(value: Partial<KeybindingMap> | undefined): KeybindingMap {
+  if (value == null || typeof value !== 'object') return DEFAULT_KEYBINDINGS
+  const keybindings = { ...DEFAULT_KEYBINDINGS }
+  for (const command of Object.keys(DEFAULT_KEYBINDINGS) as Array<keyof KeybindingMap>) {
+    if (typeof value[command] === 'string') keybindings[command] = value[command]
+  }
+  return keybindings
 }
 
 export function savePreferences(preferences: AppPreferences): void {

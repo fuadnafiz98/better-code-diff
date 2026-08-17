@@ -6,7 +6,22 @@ import { promisify } from 'node:util'
 
 import { describe, expect, it } from 'bun:test'
 
-import { mapGitStatus, parsePorcelainStatus, RepositoryService, resolvePackagedExecutablePath } from './repository.js'
+import {
+  createPullRequestReviewPayload,
+  isSameGitHubLogin,
+  mapGitStatus,
+  normalizePullRequestSelector,
+  parsePorcelainStatus,
+  RepositoryService,
+  resolvePackagedExecutablePath
+} from './repository.js'
+
+describe('isSameGitHubLogin', () => {
+  it('compares GitHub logins without case sensitivity', () => {
+    expect(isSameGitHubLogin('PierreComputer', 'pierrecomputer')).toBe(true)
+    expect(isSameGitHubLogin('reviewer', 'author')).toBe(false)
+  })
+})
 
 describe('resolvePackagedExecutablePath', () => {
   it('moves packaged executables outside the asar archive', () => {
@@ -43,6 +58,84 @@ describe('parsePorcelainStatus', () => {
   })
 })
 
+describe('normalizePullRequestSelector', () => {
+  it('accepts a selector that was normalized while opening the review', () => {
+    const storedSelector = normalizePullRequestSelector(123)
+
+    expect(storedSelector).toBe('123')
+    expect(normalizePullRequestSelector(storedSelector)).toBe('123')
+  })
+
+  it('normalizes hash-prefixed PR numbers', () => {
+    expect(normalizePullRequestSelector(' #123 ')).toBe('123')
+  })
+
+  it('rejects invalid numeric selectors', () => {
+    expect(() => normalizePullRequestSelector('0')).toThrow('positive integer')
+  })
+})
+
+describe('createPullRequestReviewPayload', () => {
+  it('creates a GitHub review with an inline range comment', () => {
+    expect(createPullRequestReviewPayload('0123456789abcdef0123456789abcdef01234567', 'request-changes', 'Please update this.', [{
+      path: 'src/value.ts',
+      body: 'This range needs a guard.',
+      line: 14,
+      side: 'RIGHT',
+      startLine: 11,
+      startSide: 'RIGHT'
+    }])).toEqual({
+      commitOID: '0123456789abcdef0123456789abcdef01234567',
+      event: 'REQUEST_CHANGES',
+      body: 'Please update this.',
+      threads: [{
+        path: 'src/value.ts',
+        body: 'This range needs a guard.',
+        line: 14,
+        side: 'RIGHT',
+        startLine: 11,
+        startSide: 'RIGHT'
+      }]
+    })
+  })
+
+  it('allows requested changes without a summary when an inline comment exists', () => {
+    expect(createPullRequestReviewPayload('0123456789abcdef0123456789abcdef01234567', 'request-changes', '', [{
+      path: 'src/value.ts',
+      body: 'Please guard this branch.',
+      line: 14,
+      side: 'RIGHT'
+    }])).toEqual({
+      commitOID: '0123456789abcdef0123456789abcdef01234567',
+      event: 'REQUEST_CHANGES',
+      threads: [{
+        path: 'src/value.ts',
+        body: 'Please guard this branch.',
+        line: 14,
+        side: 'RIGHT'
+      }]
+    })
+  })
+
+  it('rejects an empty requested-changes review', () => {
+    expect(() => createPullRequestReviewPayload(
+      '0123456789abcdef0123456789abcdef01234567',
+      'request-changes',
+      '',
+      []
+    )).toThrow('summary or at least one inline comment')
+  })
+
+  it('rejects unsafe inline paths', () => {
+    expect(() => createPullRequestReviewPayload('0123456789abcdef0123456789abcdef01234567', 'approve', '', [{
+      path: '../secret.txt',
+      body: 'Do not expose this.',
+      line: 1,
+      side: 'RIGHT'
+    }])).toThrow('invalid path')
+  })
+})
+
 describe('RepositoryService', () => {
   it('loads status, file comparisons, and ripgrep content results', async () => {
     const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-test-'))
@@ -70,6 +163,7 @@ describe('RepositoryService', () => {
       const repository = new RepositoryService()
       const snapshot = await repository.open(repositoryPath)
       const comparison = await repository.getComparison('tracked.txt')
+      const workingTreePatch = await repository.getWorkingTreePatch(['tracked.txt', 'untracked.txt'])
       const searchResults = await repository.searchContent('searchable')
 
       expect(snapshot.kind).toBe('git')
@@ -81,6 +175,9 @@ describe('RepositoryService', () => {
       expect(comparison.oldFile?.contents).toBe('original value\n')
       expect(comparison.newFile?.contents).toBe('updated searchable value\n')
       expect(comparison.mode).toBe('diff')
+      expect(workingTreePatch).toContain('-original value')
+      expect(workingTreePatch).toContain('+updated searchable value')
+      expect(workingTreePatch).toContain('+another searchable value')
       expect(searchResults.map((result) => result.path).sort()).toEqual([
         'tracked.txt',
         'untracked.txt'

@@ -1,13 +1,15 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-import type { FindInPageResult, RepositoryApi, RepositoryChangeEvent } from '../shared/contracts.js'
+import type { FindInPageResult, PerformanceMetrics, RepositoryApi, RepositoryChangeEvent } from '../shared/contracts.js'
 import { IPC_CHANNELS } from '../shared/contracts.js'
 
 const repositoryApi: RepositoryApi = {
+  getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
   openPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPath, path),
   refresh: () => ipcRenderer.invoke(IPC_CHANNELS.refresh),
   getComparison: (path) => ipcRenderer.invoke(IPC_CHANNELS.getComparison, path),
+  getWorkingTreePatch: (paths) => ipcRenderer.invoke(IPC_CHANNELS.getWorkingTreePatch, paths),
   searchContent: (query) => ipcRenderer.invoke(IPC_CHANNELS.searchContent, query),
   getGitIntegration: () => ipcRenderer.invoke(IPC_CHANNELS.getGitIntegration),
   switchBranch: (name) => ipcRenderer.invoke(IPC_CHANNELS.switchBranch, name),
@@ -18,8 +20,34 @@ const repositoryApi: RepositoryApi = {
   pushCurrentBranch: () => ipcRenderer.invoke(IPC_CHANNELS.pushCurrentBranch),
   getPullRequestReview: (selector) => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestReview, selector),
   checkoutPullRequest: (number) => ipcRenderer.invoke(IPC_CHANNELS.checkoutPullRequest, number),
-  submitPullRequestReview: (selector, event, body) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, event, body),
-  getPerformanceMetrics: () => ipcRenderer.invoke(IPC_CHANNELS.getPerformanceMetrics),
+  submitPullRequestReview: (selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, commitId, event, body, comments),
+  getPerformanceMetrics: async () => {
+    const [mainMetrics, rendererMemory] = await Promise.all([
+      ipcRenderer.invoke(IPC_CHANNELS.getPerformanceMetrics) as Promise<Omit<PerformanceMetrics,
+        | 'rendererPrivateMegabytes'
+        | 'rendererHeapUsedMegabytes'
+        | 'rendererHeapTotalMegabytes'
+        | 'rendererBlinkAllocatedMegabytes'
+        | 'rendererBlinkTotalMegabytes'
+        | 'rendererDomNodes'>>,
+      process.getProcessMemoryInfo()
+    ])
+    const heap = process.getHeapStatistics()
+    const blink = process.getBlinkMemoryInfo()
+    const rendererDocument = (globalThis as unknown as {
+      document?: { getElementsByTagName(name: string): { length: number } }
+    }).document
+    return {
+      ...mainMetrics,
+      rendererPrivateMegabytes: rendererMemory.private / 1_024,
+      rendererHeapUsedMegabytes: heap.usedHeapSize / 1_024,
+      rendererHeapTotalMegabytes: heap.totalHeapSize / 1_024,
+      rendererBlinkAllocatedMegabytes: blink.allocated / 1_024,
+      rendererBlinkTotalMegabytes: blink.total / 1_024,
+      rendererDomNodes: rendererDocument?.getElementsByTagName('*').length ?? 0
+    }
+  },
+  setVisibility: (visible) => ipcRenderer.invoke(IPC_CHANNELS.setVisibility, visible),
   findInPage: (query, forward, findNext) => ipcRenderer.invoke(IPC_CHANNELS.findInPage, query, forward, findNext),
   stopFindInPage: () => ipcRenderer.invoke(IPC_CHANNELS.stopFindInPage),
   onFoundInPage: (listener) => {

@@ -30,10 +30,25 @@ export interface RepositoryChangeEvent {
 export interface PerformanceMetrics {
   cpuPercent: number
   gpuProcessCpuPercent: number | null
-  memoryMegabytes: number
+  workingSetMegabytes: number
+  memoryByProcessType: Array<{ type: string; megabytes: number }>
+  mainPrivateMegabytes: number
+  rendererPrivateMegabytes: number
+  rendererHeapUsedMegabytes: number
+  rendererHeapTotalMegabytes: number
+  rendererBlinkAllocatedMegabytes: number
+  rendererBlinkTotalMegabytes: number
+  rendererDomNodes: number
+  lastRendererTermination: RendererTermination | null
   processCount: number
   production: boolean
   sampledAt: number
+}
+
+export interface RendererTermination {
+  reason: string
+  exitCode: number
+  occurredAt: number
 }
 
 export interface FindInPageResult {
@@ -99,6 +114,8 @@ export interface PullRequestFile {
 export interface PullRequestReview {
   kind: 'github'
   selector: string
+  commitId: string
+  viewerCanSubmitDecision: boolean
   pullRequest: PullRequestSummary
   files: PullRequestFile[]
   patch: string
@@ -131,6 +148,15 @@ export interface GitIntegrationSnapshot {
 
 export type PullRequestReviewEvent = 'approve' | 'comment' | 'request-changes'
 
+export interface PullRequestReviewComment {
+  path: string
+  body: string
+  line: number
+  side: 'LEFT' | 'RIGHT'
+  startLine?: number
+  startSide?: 'LEFT' | 'RIGHT'
+}
+
 export interface DiffFileContents {
   name: string
   contents: string
@@ -155,10 +181,12 @@ export interface ContentSearchResult {
 }
 
 export interface RepositoryApi {
+  getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
   openPath(path: string): Promise<RepositorySnapshot>
   refresh(): Promise<RepositorySnapshot>
   getComparison(path: string): Promise<FileComparison>
+  getWorkingTreePatch(paths: string[]): Promise<string>
   searchContent(query: string): Promise<ContentSearchResult[]>
   getGitIntegration(): Promise<GitIntegrationSnapshot>
   switchBranch(name: string): Promise<RepositorySnapshot>
@@ -169,8 +197,15 @@ export interface RepositoryApi {
   pushCurrentBranch(): Promise<GitIntegrationSnapshot>
   getPullRequestReview(selector: number | string): Promise<PullRequestReview>
   checkoutPullRequest(number: number): Promise<RepositorySnapshot>
-  submitPullRequestReview(selector: number | string, event: PullRequestReviewEvent, body: string): Promise<void>
+  submitPullRequestReview(
+    selector: number | string,
+    commitId: string,
+    event: PullRequestReviewEvent,
+    body: string,
+    comments: PullRequestReviewComment[]
+  ): Promise<void>
   getPerformanceMetrics(): Promise<PerformanceMetrics>
+  setVisibility(visible: boolean): Promise<void>
   findInPage(query: string, forward: boolean, findNext: boolean): Promise<number>
   stopFindInPage(): Promise<void>
   onFoundInPage(listener: (result: FindInPageResult) => void): () => void
@@ -178,10 +213,12 @@ export interface RepositoryApi {
 }
 
 export const IPC_CHANNELS = {
+  getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
   openPath: 'repository:open-path',
   refresh: 'repository:refresh',
   getComparison: 'repository:get-comparison',
+  getWorkingTreePatch: 'repository:get-working-tree-patch',
   searchContent: 'repository:search-content',
   getGitIntegration: 'repository:get-git-integration',
   switchBranch: 'repository:switch-branch',
@@ -194,6 +231,7 @@ export const IPC_CHANNELS = {
   checkoutPullRequest: 'repository:checkout-pull-request',
   submitPullRequestReview: 'repository:submit-pull-request-review',
   getPerformanceMetrics: 'app:get-performance-metrics',
+  setVisibility: 'app:set-visibility',
   findInPage: 'app:find-in-page',
   stopFindInPage: 'app:stop-find-in-page',
   foundInPage: 'app:found-in-page',

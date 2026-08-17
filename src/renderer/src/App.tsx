@@ -1,5 +1,6 @@
 import {
   lazy,
+  memo,
   startTransition,
   Suspense,
   useCallback,
@@ -28,14 +29,20 @@ import {
 } from './AppView'
 import { createFileSearchIndex, rankFilePaths } from './fileSearch'
 import {
+  CommandPaletteController,
+  type CommandPaletteHandle
+} from './CommandPalette'
+import { commandFromEvent } from './keybindings'
+import {
   CODE_FONTS,
+  getEditorThemeType,
   INTERFACE_FONTS,
   loadPreferences,
   savePreferences,
   type AppPreferences
 } from './preferences'
 import { SettingsPage } from './SettingsPage'
-import { RepositoryPanel } from './GitHubPanel'
+import { PullRequestLoadingIndicator } from './PullRequestLoadingIndicator'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import {
   loadRecentFolders,
@@ -46,8 +53,133 @@ import {
 import { useGitWorkflow } from './useGitWorkflow'
 
 const RepositoryWorkspace = lazy(() => import('./RepositoryWorkspace'))
+const RepositoryPanel = lazy(async () => ({
+  default: (await import('./GitHubPanel')).RepositoryPanel
+}))
+
+function useWindowVisibilitySync(): void {
+  useEffect(() => {
+    let frame = 0
+    const refreshLayout = (): void => {
+      void window.repository?.setVisibility(!document.hidden)
+      if (document.hidden) return
+      window.cancelAnimationFrame(frame)
+      frame = window.requestAnimationFrame(() => {
+        frame = window.requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+      })
+    }
+    document.addEventListener('visibilitychange', refreshLayout)
+    window.addEventListener('focus', refreshLayout)
+    void window.repository?.setVisibility(!document.hidden)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      document.removeEventListener('visibilitychange', refreshLayout)
+      window.removeEventListener('focus', refreshLayout)
+      void window.repository?.setVisibility(false)
+    }
+  }, [])
+}
+
+interface AppLayoutProps {
+  snapshot: RepositorySnapshot | null
+  selectedPath: string | null
+  comparison: FileComparison | null
+  repositoryChange: RepositoryChangeEvent | null
+  opening: boolean
+  openingRecentPath: string | null
+  refreshing: boolean
+  loadingDiff: boolean
+  error: string | null
+  sidebarVisible: boolean
+  diffStyle: DiffStyle
+  workspaceView: WorkspaceView
+  preferences: AppPreferences
+  settingsOpen: boolean
+  recentFolders: RecentFolder[]
+  searchMode: SearchMode
+  searchQuery: string
+  deferredSearchQuery: string
+  fileResults: string[]
+  contentResults: ContentSearchResult[]
+  searchingContent: boolean
+  searchIsOpen: boolean
+  searchInputRef: React.RefObject<HTMLInputElement | null>
+  commandPaletteRef: React.RefObject<CommandPaletteHandle | null>
+  gitWorkflow: ReturnType<typeof useGitWorkflow>
+  setSearchMode: React.Dispatch<React.SetStateAction<SearchMode>>
+  setSearchQuery: React.Dispatch<React.SetStateAction<string>>
+  setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>
+  setError: React.Dispatch<React.SetStateAction<string | null>>
+  setRecentFolders: React.Dispatch<React.SetStateAction<RecentFolder[]>>
+  setPreferences: React.Dispatch<React.SetStateAction<AppPreferences>>
+  setSelectedPath: React.Dispatch<React.SetStateAction<string | null>>
+  setDiffStyle: React.Dispatch<React.SetStateAction<DiffStyle>>
+  setWorkspaceView: React.Dispatch<React.SetStateAction<WorkspaceView>>
+  toggleSidebar(withMotion: boolean): void
+  openFolder(): Promise<void>
+  openRecentFolder(folder: RecentFolder): Promise<void>
+  refreshRepository(): Promise<void>
+  selectSearchResult(path: string): void
+  openPullRequestFromPalette(selector: number | string): void
+  openSettingsFromPalette(): void
+}
+
+const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Element {
+  const { gitWorkflow } = view
+  return <main className="app-shell" data-theme-type={getEditorThemeType(view.preferences.editorTheme)}>
+    <Titlebar snapshot={view.snapshot} sidebarVisible={view.sidebarVisible} searchMode={view.searchMode}
+      searchQuery={view.searchQuery} searchInputRef={view.searchInputRef} searchingContent={view.searchingContent}
+      opening={view.opening} refreshing={view.refreshing} keybindings={view.preferences.keybindings}
+      onSidebarToggle={() => view.toggleSidebar(true)} onSearchModeChange={view.setSearchMode}
+      onSearchQueryChange={view.setSearchQuery} onOpen={view.openFolder} onRefresh={view.refreshRepository}
+      onSettingsOpen={() => view.setSettingsOpen(true)} onGitOpen={gitWorkflow.openPanel} />
+
+    {gitWorkflow.actionKey?.startsWith('review:') ? <PullRequestLoadingIndicator /> : null}
+    {gitWorkflow.panelOpen && view.snapshot?.kind === 'git' ? <Suspense fallback={null}>
+      <RepositoryPanel integration={gitWorkflow.integration} loading={gitWorkflow.loadingIntegration}
+        actionKey={gitWorkflow.actionKey} onClose={() => gitWorkflow.setPanelOpen(false)}
+        onReload={() => void gitWorkflow.loadIntegration()} onSwitchBranch={(name) => void gitWorkflow.switchBranch(name)}
+        onReviewLocalBranch={(base, head) => void gitWorkflow.reviewLocalBranch(base, head)}
+        onReviewCommit={(oid) => void gitWorkflow.reviewCommit(oid)} onFetch={() => void gitWorkflow.fetchRemote()}
+        onPull={() => void gitWorkflow.pullCurrentBranch()} onPush={() => void gitWorkflow.pushCurrentBranch()}
+        onReview={(pullRequest) => void gitWorkflow.reviewPullRequest(pullRequest)}
+        onOpenPullRequest={(selector) => void gitWorkflow.openPullRequestReview(selector)}
+        onCheckout={(pullRequest) => void gitWorkflow.checkoutPullRequest(pullRequest)} />
+    </Suspense> : null}
+
+    <CommandPaletteController ref={view.commandPaletteRef} gitRepositoryOpen={view.snapshot?.kind === 'git'}
+      keybindings={view.preferences.keybindings} onOpenPullRequest={view.openPullRequestFromPalette}
+      onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettingsFromPalette} />
+    {view.settingsOpen ? <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
+      onClose={() => view.setSettingsOpen(false)} /> : null}
+    {!view.settingsOpen && view.searchIsOpen ? <SearchResults mode={view.searchMode} query={view.deferredSearchQuery}
+      fileResults={view.fileResults} contentResults={view.contentResults} onSelect={view.selectSearchResult} /> : null}
+    {!view.settingsOpen && view.error != null ? <ErrorBanner message={view.error} onDismiss={() => view.setError(null)} /> : null}
+
+    {view.snapshot == null ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} opening={view.opening}
+      recentFolders={view.recentFolders} openingRecentPath={view.openingRecentPath} onRecentOpen={view.openRecentFolder}
+      onRecentRemove={(path) => view.setRecentFolders((current) => current.filter((folder) => folder.path !== path))}
+      keybindings={view.preferences.keybindings} />) : (
+      <div className="workspace-host" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
+        <Suspense fallback={<div className="workspace"><div className="diff-state"><span>Preparing workspace…</span></div></div>}>
+          <RepositoryWorkspace key={`${view.snapshot.root}:${gitWorkflow.repositoryReview == null ? 'working-tree'
+            : gitWorkflow.repositoryReview.kind === 'github' ? gitWorkflow.repositoryReview.pullRequest.url : gitWorkflow.repositoryReview.id}`}
+            snapshot={view.snapshot} selectedPath={view.selectedPath} comparison={view.comparison}
+            loadingDiff={view.loadingDiff} sidebarVisible={view.sidebarVisible} diffStyle={view.diffStyle}
+            workspaceView={view.workspaceView} preferences={view.preferences} onPreferencesChange={view.setPreferences}
+            repositoryReview={gitWorkflow.repositoryReview} repositoryChange={view.repositoryChange}
+            onSelectPath={view.setSelectedPath} onDiffStyleChange={view.setDiffStyle}
+            onWorkspaceViewChange={view.setWorkspaceView} onClosePullRequestReview={gitWorkflow.closeReview}
+            submittingPullRequestReview={gitWorkflow.submittingReview} pullRequestReviewMessage={gitWorkflow.submissionMessage}
+            onSubmitPullRequestReview={gitWorkflow.submitReview} />
+        </Suspense>
+      </div>
+    )}
+  </main>
+})
 
 export function App(): React.JSX.Element {
+  useWindowVisibilitySync()
   const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(null)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [comparison, setComparison] = useState<FileComparison | null>(null)
@@ -72,6 +204,7 @@ export function App(): React.JSX.Element {
   const comparisonRequestRef = useRef(0)
   const contentSearchRequestRef = useRef(0)
   const lastComparisonPathRef = useRef<string | null>(null)
+  const commandPaletteRef = useRef<CommandPaletteHandle>(null)
   const deferredSearchQuery = useDeferredValue(searchQuery)
 
   const indexedPaths = useMemo(
@@ -108,6 +241,27 @@ export function App(): React.JSX.Element {
     onSelectPath: setSelectedPath,
     onWorkspaceViewChange: setWorkspaceView
   })
+
+  const openPullRequestFromPalette = useCallback((selector: number | string) => {
+    void gitWorkflow.openPullRequestReview(selector)
+  }, [gitWorkflow.openPullRequestReview])
+
+  const openSettingsFromPalette = useCallback(() => setSettingsOpen(true), [])
+
+  const toggleSidebar = useCallback((withMotion: boolean) => {
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const shouldAnimate = withMotion && !reduceMotion
+
+    if (!shouldAnimate) {
+      document.documentElement.dataset.sidebarMotion = 'instant'
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          delete document.documentElement.dataset.sidebarMotion
+        })
+      })
+    }
+    setSidebarVisible((visible) => !visible)
+  }, [])
 
   const openFolder = useCallback(async () => {
     setOpening(true)
@@ -178,6 +332,20 @@ export function App(): React.JSX.Element {
   useEffect(() => requireRepositoryApi().onDidChange(handleRepositoryChange), [])
 
   useEffect(() => {
+    const repository = window.repository
+    if (repository == null) return
+    let cancelled = false
+    void repository.getSessionSnapshot().then((sessionSnapshot) => {
+      if (cancelled || sessionSnapshot == null) return
+      applySnapshot(sessionSnapshot)
+      setRecentFolders((current) => rememberRecentFolder(current, sessionSnapshot))
+    }).catch((sessionError: unknown) => {
+      if (!cancelled) setError(getErrorMessage(sessionError))
+    })
+    return () => { cancelled = true }
+  }, [applySnapshot])
+
+  useEffect(() => {
     const requestId = comparisonRequestRef.current + 1
     comparisonRequestRef.current = requestId
     if (selectedPath == null || workspaceView === 'multi') {
@@ -240,6 +408,10 @@ export function App(): React.JSX.Element {
   }, [recentFolders])
 
   const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
+      event.preventDefault()
+      return
+    }
     if (event.key === 'Escape' && settingsOpen) {
       event.preventDefault()
       setSettingsOpen(false)
@@ -250,21 +422,33 @@ export function App(): React.JSX.Element {
       gitWorkflow.setPanelOpen(false)
       return
     }
-    if (!(event.metaKey || event.ctrlKey)) return
-    if (event.key === ',') {
-      event.preventDefault()
+    if (event.defaultPrevented || event.repeat) return
+    const command = commandFromEvent(event, preferences.keybindings)
+    if (command == null) return
+    event.preventDefault()
+    if (command === 'openSettings') {
+      commandPaletteRef.current?.close()
       setSettingsOpen(true)
-    } else if (event.key.toLowerCase() === 'p') {
-      event.preventDefault()
+    } else if (command === 'openCommandPalette') {
+      commandPaletteRef.current?.toggle()
+    } else if (settingsOpen) {
+      return
+    } else if (command === 'goToFile') {
       setSearchMode('files')
       searchInputRef.current?.focus()
-    } else if (event.shiftKey && event.key.toLowerCase() === 'f') {
-      event.preventDefault()
+    } else if (command === 'searchContent') {
       setSearchMode('content')
       searchInputRef.current?.focus()
-    } else if (event.key.toLowerCase() === 'o') {
-      event.preventDefault()
+    } else if (command === 'openFolder') {
       void openFolder()
+    } else if (command === 'toggleSidebar' && snapshot != null) {
+      toggleSidebar(false)
+    } else if (command === 'toggleWordWrap') {
+      setPreferences((current) => ({ ...current, wordWrap: !current.wordWrap }))
+    } else if (command === 'toggleFoldUnchanged') {
+      setPreferences((current) => ({ ...current, foldUnchanged: !current.foldUnchanged }))
+    } else if (command === 'toggleMultiFile' && snapshot != null) {
+      setWorkspaceView((view) => view === 'file' ? 'multi' : 'file')
     }
   })
 
@@ -275,94 +459,14 @@ export function App(): React.JSX.Element {
 
   const searchIsOpen = snapshot != null && searchQuery.trim().length > 0
 
-  return (
-    <main className="app-shell">
-      <Titlebar
-        snapshot={snapshot}
-        sidebarVisible={sidebarVisible}
-        searchMode={searchMode}
-        searchQuery={searchQuery}
-        searchInputRef={searchInputRef}
-        searchingContent={searchingContent}
-        opening={opening}
-        refreshing={refreshing}
-        onSidebarToggle={() => setSidebarVisible((visible) => !visible)}
-        onSearchModeChange={setSearchMode}
-        onSearchQueryChange={setSearchQuery}
-        onOpen={openFolder}
-        onRefresh={refreshRepository}
-        onSettingsOpen={() => setSettingsOpen(true)}
-        onGitOpen={gitWorkflow.openPanel}
-      />
-
-      {gitWorkflow.panelOpen && snapshot?.kind === 'git' ? (
-        <RepositoryPanel
-          integration={gitWorkflow.integration}
-          loading={gitWorkflow.loadingIntegration}
-          actionKey={gitWorkflow.actionKey}
-          onClose={() => gitWorkflow.setPanelOpen(false)}
-          onReload={() => void gitWorkflow.loadIntegration()}
-          onSwitchBranch={(name) => void gitWorkflow.switchBranch(name)}
-          onReviewLocalBranch={(baseRef, headRef) => void gitWorkflow.reviewLocalBranch(baseRef, headRef)}
-          onReviewCommit={(oid) => void gitWorkflow.reviewCommit(oid)}
-          onFetch={() => void gitWorkflow.fetchRemote()}
-          onPull={() => void gitWorkflow.pullCurrentBranch()}
-          onPush={() => void gitWorkflow.pushCurrentBranch()}
-          onReview={(pullRequest) => void gitWorkflow.reviewPullRequest(pullRequest)}
-          onOpenPullRequest={(number) => void gitWorkflow.openPullRequestReview(number)}
-          onCheckout={(pullRequest) => void gitWorkflow.checkoutPullRequest(pullRequest)}
-        />
-      ) : null}
-
-      {settingsOpen ? (
-        <SettingsPage preferences={preferences} onChange={setPreferences} onClose={() => setSettingsOpen(false)} />
-      ) : null}
-
-      {!settingsOpen && searchIsOpen ? (
-        <SearchResults
-          mode={searchMode}
-          query={deferredSearchQuery}
-          fileResults={fileResults}
-          contentResults={contentResults}
-          onSelect={selectSearchResult}
-        />
-      ) : null}
-
-      {!settingsOpen && error != null ? <ErrorBanner message={error} onDismiss={() => setError(null)} /> : null}
-
-      {settingsOpen ? null : snapshot == null ? (
-        <Welcome
-          onOpen={openFolder}
-          opening={opening}
-          recentFolders={recentFolders}
-          openingRecentPath={openingRecentPath}
-          onRecentOpen={openRecentFolder}
-          onRecentRemove={(path) => setRecentFolders((current) => current.filter((folder) => folder.path !== path))}
-        />
-      ) : (
-        <Suspense fallback={<div className="workspace"><div className="diff-state"><span>Preparing workspace…</span></div></div>}>
-          <RepositoryWorkspace
-            key={snapshot.root}
-            snapshot={snapshot}
-            selectedPath={selectedPath}
-            comparison={comparison}
-            loadingDiff={loadingDiff}
-            sidebarVisible={sidebarVisible}
-            diffStyle={diffStyle}
-            workspaceView={workspaceView}
-            preferences={preferences}
-            repositoryReview={gitWorkflow.repositoryReview}
-            repositoryChange={repositoryChange}
-            onSelectPath={setSelectedPath}
-            onDiffStyleChange={setDiffStyle}
-            onWorkspaceViewChange={setWorkspaceView}
-            onClosePullRequestReview={gitWorkflow.closeReview}
-            submittingPullRequestReview={gitWorkflow.submittingReview}
-            pullRequestReviewMessage={gitWorkflow.submissionMessage}
-            onSubmitPullRequestReview={(reviewEvent, body) => void gitWorkflow.submitReview(reviewEvent, body)}
-          />
-        </Suspense>
-      )}
-    </main>
-  )
+  const view: AppLayoutProps = {
+    snapshot, selectedPath, comparison, repositoryChange, opening, openingRecentPath, refreshing,
+    loadingDiff, error, sidebarVisible, diffStyle, workspaceView, preferences, settingsOpen,
+    recentFolders, searchMode, searchQuery, deferredSearchQuery, fileResults, contentResults,
+    searchingContent, searchIsOpen, searchInputRef, commandPaletteRef, gitWorkflow, setSearchMode,
+    setSearchQuery, setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath,
+    setDiffStyle, setWorkspaceView, toggleSidebar, openFolder, openRecentFolder, refreshRepository,
+    selectSearchResult, openPullRequestFromPalette, openSettingsFromPalette
+  }
+  return <AppLayout {...view} />
 }

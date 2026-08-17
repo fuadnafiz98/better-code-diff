@@ -91,6 +91,7 @@ export class RepositoryWatcher {
   #pendingPaths = new Set<string>()
   #timer: ReturnType<typeof setTimeout> | null = null
   #refreshing = false
+  #suspended = false
   #generation = 0
   #revision = 0
 
@@ -122,6 +123,17 @@ export class RepositoryWatcher {
     if (this.#snapshot?.root === snapshot.root) this.#snapshot = snapshot
   }
 
+  setSuspended(suspended: boolean): void {
+    if (this.#suspended === suspended) return
+    this.#suspended = suspended
+    if (suspended) {
+      if (this.#timer != null) clearTimeout(this.#timer)
+      this.#timer = null
+    } else if (this.#pendingPaths.size > 0) {
+      this.#schedule(this.#generation)
+    }
+  }
+
   stop(): void {
     this.#generation += 1
     this.#watcher?.close()
@@ -133,6 +145,7 @@ export class RepositoryWatcher {
   }
 
   #schedule(generation: number): void {
+    if (this.#suspended) return
     if (this.#timer != null) clearTimeout(this.#timer)
     this.#timer = setTimeout(() => {
       this.#timer = null
@@ -141,7 +154,7 @@ export class RepositoryWatcher {
   }
 
   async #flush(generation: number): Promise<void> {
-    if (generation !== this.#generation || this.#snapshot == null) return
+    if (generation !== this.#generation || this.#snapshot == null || this.#suspended) return
     if (this.#refreshing) {
       this.#schedule(generation)
       return
@@ -149,12 +162,14 @@ export class RepositoryWatcher {
 
     const previous = this.#snapshot
     const filesystemPaths = new Set(this.#pendingPaths)
+    const previousPathSet = new Set(previous.paths)
     this.#pendingPaths.clear()
     this.#refreshing = true
     try {
       const knownContentPaths = [...filesystemPaths].filter((path) =>
-        path !== '*' && !path.startsWith('.git/') && previous.paths.includes(path)
+        path !== '*' && !path.startsWith('.git/') && previousPathSet.has(path)
       )
+      const knownContentPathSet = new Set(knownContentPaths)
       if (knownContentPaths.length > 0) this.#publish(previous, knownContentPaths)
 
       const snapshot = await this.refresh()
@@ -164,7 +179,7 @@ export class RepositoryWatcher {
       const nextStatus = statusSignature(snapshot)
       const metadataPaths = collectChangedPaths(previous, snapshot, filesystemPaths)
         .filter((path) =>
-          !knownContentPaths.includes(path) || previousStatus.get(path) !== nextStatus.get(path)
+          !knownContentPathSet.has(path) || previousStatus.get(path) !== nextStatus.get(path)
         )
       if (!snapshotsMatch(previous, snapshot) || metadataPaths.length > 0) {
         this.#publish(snapshot, metadataPaths)

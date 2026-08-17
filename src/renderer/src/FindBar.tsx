@@ -67,7 +67,7 @@ export function FindBar(): React.JSX.Element {
   return (
     <div className="find-bar-anchor">
       {open ? (
-        <div className="find-bar" role="search">
+        <search className="find-bar">
           <input
             ref={inputRef}
             value={query}
@@ -90,7 +90,7 @@ export function FindBar(): React.JSX.Element {
           <button type="button" onClick={close} aria-label="Close find" title="Close (Escape)">
             <IconX />
           </button>
-        </div>
+        </search>
       ) : null}
     </div>
   )

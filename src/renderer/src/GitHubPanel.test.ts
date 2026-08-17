@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { parsePullRequestSelector } from './GitHubPanel'
+import { parsePullRequestSelector } from './pullRequestSelector'
 
 describe('parsePullRequestSelector', () => {
   it('accepts a number and hash-prefixed number', () => {

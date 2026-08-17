@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   IconBraces,
   IconBranch,
@@ -14,6 +14,9 @@ import type {
   GitIntegrationSnapshot,
   PullRequestSummary
 } from '../../shared/contracts'
+import { parsePullRequestSelector } from './pullRequestSelector'
+
+const shortDateFormatter = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
 
 interface RepositoryPanelProps {
   integration: GitIntegrationSnapshot | null
@@ -41,23 +44,12 @@ function formatRelativeDate(value: string): string {
   if (elapsedDays === 0) return 'today'
   if (elapsedDays === 1) return 'yesterday'
   if (elapsedDays < 30) return `${elapsedDays}d ago`
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(timestamp)
+  return shortDateFormatter.format(timestamp)
 }
 
 function formatDecision(decision: string | null): string | null {
   if (decision == null || decision === '') return null
   return decision.toLowerCase().replaceAll('_', ' ')
-}
-
-export function parsePullRequestSelector(value: string): number | string | null {
-  const trimmedValue = value.trim()
-  const directMatch = /^#?(\d+)$/.exec(trimmedValue)
-  const urlMatch = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)(?:\/.*)?$/i.exec(trimmedValue)
-  if (directMatch == null && urlMatch != null) return trimmedValue
-  const rawNumber = directMatch?.[1]
-  if (rawNumber == null) return null
-  const number = Number(rawNumber)
-  return Number.isSafeInteger(number) && number > 0 ? number : null
 }
 
 export function RepositoryPanel({
@@ -76,12 +68,19 @@ export function RepositoryPanel({
   onOpenPullRequest,
   onCheckout
 }: RepositoryPanelProps): React.JSX.Element {
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const [tab, setTab] = useState<PanelTab>('history')
   const [selectedBaseBranch, setSelectedBaseBranch] = useState('')
   const [pullRequestQuery, setPullRequestQuery] = useState('')
   const [pullRequestQueryError, setPullRequestQueryError] = useState<string | null>(null)
   const currentBranch = integration?.branches.find((branch) => branch.current)?.name ?? null
   const baseBranch = selectedBaseBranch || integration?.defaultBranch || currentBranch || ''
+
+  useEffect(() => {
+    const dialog = dialogRef.current
+    dialog?.showModal()
+    return () => dialog?.close()
+  }, [])
 
   const submitPullRequestQuery = (): void => {
     const selector = parsePullRequestSelector(pullRequestQuery)
@@ -94,10 +93,11 @@ export function RepositoryPanel({
   }
 
   return (
-    <div className="git-panel-layer" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onClose()
+    <dialog ref={dialogRef} className="git-panel-layer" aria-labelledby="git-panel-title" onCancel={(event) => {
+      event.preventDefault()
+      onClose()
     }}>
-      <aside className="git-panel" role="dialog" aria-modal="true" aria-labelledby="git-panel-title">
+      <aside className="git-panel">
         <header className="git-panel-header">
           <div>
             <IconBranch />
@@ -262,6 +262,6 @@ export function RepositoryPanel({
           )}
         </div>
       </aside>
-    </div>
+    </dialog>
   )
 }

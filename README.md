@@ -41,7 +41,11 @@ Use the Electron window opened by `bun run dev`. The renderer URL on its own doe
 
 | Command | Description |
 | --- | --- |
-| `bun run dev` | Start the Electron development app |
+| `bun run dev` | Start the branded development app |
+| `bun run dev:background` | Start development without showing or focusing a window |
+| `bun run update:mac` | Build and install without interrupting or opening the app |
+| `bun run update:mac:open` | Build, install, and explicitly open the app |
+| `bun run open:mac` | Open the installed app |
 | `bun run build` | Build the main process, preload script, and renderer |
 | `bun run preview` | Preview the production renderer build |
 | `bun run typecheck` | Type-check Node and renderer projects |

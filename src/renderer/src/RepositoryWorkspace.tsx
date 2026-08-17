@@ -1,17 +1,26 @@
-import { lazy, memo, Suspense, useCallback, useLayoutEffect, useMemo } from 'react'
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useFileTree } from '@pierre/trees/react'
+import { WorkerPoolContextProvider } from '@pierre/diffs/react'
 
-import type { FileComparison, PullRequestReviewEvent, RepositoryChangeEvent, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
+import type { FileComparison, PullRequestReviewComment, PullRequestReviewEvent, RepositoryChangeEvent, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
 import { DiffToolbar, type DiffStyle, type WorkspaceView } from './AppView'
 import { Explorer } from './Explorer'
-import type { AppPreferences } from './preferences'
+import { getEditorThemeType, type AppPreferences } from './preferences'
 import { SidebarResizer } from './SidebarResizer'
 import { PullRequestReviewBar } from './PullRequestReviewBar'
+import type { ReviewThread } from './ReviewComments'
+import { createPullRequestReviewComments } from './pullRequestReviewComments'
 import { getDirectoryPaths } from './treeExpansion'
 import { FindBar } from './FindBar'
+import {
+  DIFF_HIGHLIGHTER_LANGUAGES,
+  DIFF_HIGHLIGHTER_LIMITS,
+  DIFF_WORKER_POOL_OPTIONS
+} from './diffWorkerConfig'
 
 const DiffSurface = lazy(() => import('./DiffSurface'))
 const MultiFileReview = lazy(() => import('./MultiFileReview'))
+const HIDDEN_VIEWER_RELEASE_DELAY_MS = 30_000
 
 const TREE_STYLES = `
   *,
@@ -51,6 +60,7 @@ interface RepositoryWorkspaceProps {
   diffStyle: DiffStyle
   workspaceView: WorkspaceView
   preferences: AppPreferences
+  onPreferencesChange(preferences: AppPreferences): void
   repositoryReview: RepositoryReview | null
   repositoryChange: RepositoryChangeEvent | null
   onSelectPath(path: string): void
@@ -59,7 +69,7 @@ interface RepositoryWorkspaceProps {
   onClosePullRequestReview(): void
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
-  onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string): void
+  onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string, comments: PullRequestReviewComment[]): Promise<boolean>
 }
 
 const RepositoryWorkspace = memo(function RepositoryWorkspace({
@@ -71,6 +81,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   diffStyle,
   workspaceView,
   preferences,
+  onPreferencesChange,
   repositoryReview,
   repositoryChange,
   onSelectPath,
@@ -82,6 +93,14 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   onSubmitPullRequestReview
 }: RepositoryWorkspaceProps): React.JSX.Element {
   const isFilePreview = workspaceView === 'file' && comparison?.mode === 'file'
+  const [threadsByPath, setThreadsByPath] = useState<Record<string, ReviewThread[]>>({})
+  const [reviewSessionRevision, setReviewSessionRevision] = useState(0)
+  const [reviewScrollRevision, setReviewScrollRevision] = useState(0)
+  const [viewerSuspended, setViewerSuspended] = useState(false)
+  const viewerReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const visibleMultiFilePathRef = useRef<string | null>(null)
+  const multiFileScrollTopRef = useRef(0)
+  const [multiFileNavigationRevision, setMultiFileNavigationRevision] = useState(0)
   const reviewPaths = useMemo(
     () => repositoryReview?.files.map((file) => file.path)
       ?? (snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : snapshot.paths),
@@ -96,6 +115,64 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   )
   const pathSegments = selectedPath?.split('/') ?? []
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
+  const reviewIdentity = repositoryReview == null
+    ? 'working-tree'
+    : repositoryReview.kind === 'github'
+      ? `github:${repositoryReview.pullRequest.url}`
+      : repositoryReview.id
+  const reviewComments = useMemo<PullRequestReviewComment[]>(
+    () => createPullRequestReviewComments(threadsByPath),
+    [threadsByPath]
+  )
+  const highlighterOptions = useMemo(() => ({
+    langs: DIFF_HIGHLIGHTER_LANGUAGES,
+    theme: preferences.editorTheme,
+    ...DIFF_HIGHLIGHTER_LIMITS
+  }), [preferences.editorTheme])
+
+  const submitPullRequestReview = useCallback(async (event: PullRequestReviewEvent, body: string) => {
+    const submitted = await onSubmitPullRequestReview(event, body, reviewComments)
+    if (submitted) {
+      setThreadsByPath({})
+      setReviewSessionRevision((revision) => revision + 1)
+    }
+    return submitted
+  }, [onSubmitPullRequestReview, reviewComments])
+
+  const openReviewSummary = useCallback(() => {
+    multiFileScrollTopRef.current = 0
+    onWorkspaceViewChange('multi')
+    setReviewScrollRevision((revision) => revision + 1)
+  }, [onWorkspaceViewChange])
+
+  const handleMultiFileScrollPositionChange = useCallback((scrollTop: number) => {
+    multiFileScrollTopRef.current = scrollTop
+  }, [])
+
+  useEffect(() => {
+    const clearViewerReleaseTimer = (): void => {
+      if (viewerReleaseTimerRef.current == null) return
+      clearTimeout(viewerReleaseTimerRef.current)
+      viewerReleaseTimerRef.current = null
+    }
+    const handleVisibility = (): void => {
+      clearViewerReleaseTimer()
+      if (document.hidden) {
+        viewerReleaseTimerRef.current = setTimeout(
+          () => setViewerSuspended(true),
+          HIDDEN_VIEWER_RELEASE_DELAY_MS
+        )
+      } else {
+        setViewerSuspended(false)
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    handleVisibility()
+    return () => {
+      clearViewerReleaseTimer()
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [])
   const pathSet = useMemo(() => new Set(treePaths), [treePaths])
   const directoryPaths = useMemo(() => getDirectoryPaths(treePaths), [treePaths])
   const changedDirectoryPaths = useMemo(
@@ -104,8 +181,11 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   )
   const handleTreeSelection = useCallback((paths: readonly string[]) => {
     const path = paths.at(-1)
-    if (path != null && pathSet.has(path)) onSelectPath(path)
-  }, [onSelectPath, pathSet])
+    if (path === visibleMultiFilePathRef.current) return
+    if (path == null || !pathSet.has(path)) return
+    onSelectPath(path)
+    if (workspaceView === 'multi') setMultiFileNavigationRevision((revision) => revision + 1)
+  }, [onSelectPath, pathSet, workspaceView])
 
   const { model } = useFileTree({
     id: 'repository-tree',
@@ -142,10 +222,21 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     model.scrollToPath(selectedPath, { focus: false, offset: 'nearest' })
   }, [model, selectedPath, treePaths])
 
+  const handleVisibleMultiFilePathChange = useCallback((path: string) => {
+    if (!pathSet.has(path)) return
+    visibleMultiFilePathRef.current = path
+    for (const directoryPath of getDirectoryPaths([path])) {
+      const item = model.getItem(directoryPath)
+      if (item != null && 'expand' in item) item.expand()
+    }
+    model.getItem(path)?.select()
+    model.scrollToPath(path, { focus: false, offset: 'center' })
+  }, [model, pathSet])
+
   return (
     <div className={`workspace ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
-      {sidebarVisible ? <Explorer filePaths={treePaths} model={model} /> : null}
-      {sidebarVisible ? <SidebarResizer /> : null}
+      <Explorer filePaths={treePaths} model={model} themeType={getEditorThemeType(preferences.editorTheme)} />
+      <SidebarResizer />
       <section className={`diff-panel ${isFilePreview ? 'file-preview-mode' : 'diff-mode'}`} id="repository-diff">
         <DiffToolbar
           comparison={comparison}
@@ -157,12 +248,23 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
           reviewFileCount={reviewPaths.length}
           reviewTitle={repositoryReview == null ? undefined : repositoryReview.kind === 'github' ? `#${repositoryReview.pullRequest.number} ${repositoryReview.pullRequest.title}` : repositoryReview.title}
           reviewComparison={repositoryReview == null ? undefined : repositoryReview.kind === 'github' ? `${repositoryReview.pullRequest.baseRefName} → ${repositoryReview.pullRequest.headRefName}` : `${repositoryReview.baseRefName} → ${repositoryReview.headRefName}`}
+          wordWrap={preferences.wordWrap}
+          foldUnchanged={preferences.foldUnchanged}
           onCloseExternalReview={repositoryReview == null ? undefined : onClosePullRequestReview}
           onDiffStyleChange={onDiffStyleChange}
           onWorkspaceViewChange={onWorkspaceViewChange}
+          onWordWrapToggle={() => onPreferencesChange({ ...preferences, wordWrap: !preferences.wordWrap })}
+          onFoldUnchangedToggle={() => onPreferencesChange({ ...preferences, foldUnchanged: !preferences.foldUnchanged })}
         />
         {repositoryReview?.kind === 'github' && repositoryReview.pullRequest.state === 'OPEN' ? (
-          <PullRequestReviewBar submitting={submittingPullRequestReview} message={pullRequestReviewMessage} onSubmit={onSubmitPullRequestReview} />
+          <PullRequestReviewBar
+            submitting={submittingPullRequestReview}
+            message={pullRequestReviewMessage}
+            inlineCommentCount={reviewComments.length}
+            viewerCanSubmitDecision={repositoryReview.viewerCanSubmitDecision}
+            onOpen={openReviewSummary}
+            onSubmit={submitPullRequestReview}
+          />
         ) : repositoryReview?.kind === 'github' ? (
           <div className="pr-review-readonly" role="status">
             This pull request is {repositoryReview.pullRequest.state.toLowerCase()}. Review submission is disabled.
@@ -181,20 +283,34 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
           </nav>
         ) : null}
         <FindBar />
-        <Suspense fallback={<div className="diff-state"><span>Preparing viewer…</span></div>}>
-          {workspaceView === 'multi' ? (
-            <MultiFileReview
+        {viewerSuspended ? (
+          <div className="diff-state"><span>Viewer paused while the app is hidden.</span></div>
+        ) : (
+          <WorkerPoolContextProvider poolOptions={DIFF_WORKER_POOL_OPTIONS} highlighterOptions={highlighterOptions}>
+            <Suspense fallback={<div className="diff-state"><span>Preparing viewer…</span></div>}>
+              {workspaceView === 'multi' ? (
+                <MultiFileReview
+              key={`${reviewIdentity}:${reviewSessionRevision}`}
               paths={reviewPaths}
-              selectedPath={selectedPath}
               diffStyle={diffStyle}
               preferences={preferences}
               repositoryReview={repositoryReview}
               repositoryChange={repositoryChange}
-            />
-          ) : (
-            <DiffSurface comparison={comparison} loading={loadingDiff} diffStyle={diffStyle} preferences={preferences} />
-          )}
-        </Suspense>
+              scrollToReviewRevision={reviewScrollRevision}
+              navigationPath={selectedPath}
+              navigationRevision={multiFileNavigationRevision}
+              initialScrollTop={multiFileScrollTopRef.current}
+              onScrollPositionChange={handleMultiFileScrollPositionChange}
+              onVisiblePathChange={handleVisibleMultiFilePathChange}
+              threadsByPath={threadsByPath}
+              setThreadsByPath={setThreadsByPath}
+                />
+              ) : (
+                <DiffSurface comparison={comparison} loading={loadingDiff} diffStyle={diffStyle} preferences={preferences} />
+              )}
+            </Suspense>
+          </WorkerPoolContextProvider>
+        )}
         {isFilePreview ? (
           <footer className="editor-statusbar">
             <span>Read only</span>

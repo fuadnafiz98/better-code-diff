@@ -1,6 +1,6 @@
-import { memo, useCallback, useMemo, useState, type CSSProperties } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import type { DiffLineAnnotation, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
-import { File, MultiFileDiff, Virtualizer, WorkerPoolContextProvider } from '@pierre/diffs/react'
+import { File, MultiFileDiff, useVirtualizer, Virtualizer } from '@pierre/diffs/react'
 import {
   IconCodeSearch,
   IconFile,
@@ -11,22 +11,17 @@ import {
 
 import type { FileComparison } from '../../shared/contracts'
 import type { DiffStyle } from './AppView'
-import {
-  DIFF_HIGHLIGHTER_LANGUAGES,
-  DIFF_HIGHLIGHTER_LIMITS,
-  DIFF_WORKER_POOL_OPTIONS
-} from './diffWorkerConfig'
 import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
-import { CODE_FONTS, INTERFACE_FONTS, type AppPreferences } from './preferences'
+import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
   ReviewThreadCard,
   type ReviewAnnotationMetadata,
   type ReviewThread
 } from './ReviewComments'
+import { BackToTopButton, BACK_TO_TOP_THRESHOLD, preferredScrollBehavior } from './BackToTopButton'
 
 const DIFF_OPTIONS = {
-  themeType: 'dark' as const,
   diffIndicators: 'bars' as const,
   lineDiffType: 'word-alt' as const,
   stickyHeader: true,
@@ -81,16 +76,34 @@ const INTERACTION_CSS = `
 
   ${DRAG_SELECTION_CSS}
 `
-const HIGHLIGHTER_OPTIONS = {
-  langs: DIFF_HIGHLIGHTER_LANGUAGES,
-  ...DIFF_HIGHLIGHTER_LIMITS
-}
-
 interface DiffSurfaceProps {
   comparison: FileComparison | null
   loading: boolean
   diffStyle: DiffStyle
   preferences: AppPreferences
+}
+
+function VirtualizedBackToTop(): React.JSX.Element {
+  const virtualizer = useVirtualizer()
+  const [visible, setVisible] = useState(false)
+
+  useEffect(() => {
+    const currentVirtualizer = virtualizer
+    if (currentVirtualizer == null) return
+    const root = currentVirtualizer.getRoot()
+    if (!(root instanceof HTMLElement)) return
+    const handleScroll = (): void => setVisible(currentVirtualizer.getScrollTop() > BACK_TO_TOP_THRESHOLD)
+    root.addEventListener('scroll', handleScroll, { passive: true })
+    handleScroll()
+    return () => root.removeEventListener('scroll', handleScroll)
+  }, [virtualizer])
+
+  return (
+    <BackToTopButton
+      visible={visible}
+      onClick={() => virtualizer?.scrollTo({ top: 0, behavior: preferredScrollBehavior() })}
+    />
+  )
 }
 
 function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfaceProps): React.JSX.Element {
@@ -234,7 +247,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
             file={comparison.newFile}
             options={{
               theme: preferences.editorTheme,
-              themeType: DIFF_OPTIONS.themeType,
+              themeType: getEditorThemeType(preferences.editorTheme),
               overflow: preferences.wordWrap ? 'wrap' : 'scroll',
               stickyHeader: DIFF_OPTIONS.stickyHeader,
               tokenizeMaxLineLength: DIFF_OPTIONS.tokenizeMaxLineLength,
@@ -249,6 +262,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
             className="pierre-diff editor-file"
             style={codeStyle}
           />
+          <VirtualizedBackToTop />
         </Virtualizer>
       </>
     )
@@ -258,11 +272,12 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
     ...DIFF_OPTIONS,
     ...interactionOptions,
     theme: preferences.editorTheme,
+    themeType: getEditorThemeType(preferences.editorTheme),
     overflow: preferences.wordWrap ? 'wrap' as const : 'scroll' as const,
     disableLineNumbers: !preferences.showLineNumbers,
     diffStyle,
     hunkSeparators: 'line-info-basic' as const,
-    expandUnchanged: false,
+    expandUnchanged: !preferences.foldUnchanged,
     collapsedContextThreshold: 4,
     unsafeCSS: INTERACTION_CSS
   }
@@ -280,25 +295,13 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
       ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={null} {...sharedDiffProps} />
       : <MultiFileDiff<ReviewAnnotationMetadata> oldFile={null} newFile={comparison.newFile!} {...sharedDiffProps} />
 
-  return <Virtualizer className="diff-scroll" contentClassName="diff-content">{diff}</Virtualizer>
+  return <Virtualizer className="diff-scroll" contentClassName="diff-content">{diff}<VirtualizedBackToTop /></Virtualizer>
 }
 
 const MemoizedDiffContents = memo(DiffContents)
 
 const DiffSurface = memo(function DiffSurface(props: DiffSurfaceProps): React.JSX.Element {
-  const highlighterOptions = useMemo(() => ({
-    ...HIGHLIGHTER_OPTIONS,
-    theme: props.preferences.editorTheme
-  }), [props.preferences.editorTheme])
-
-  return (
-    <WorkerPoolContextProvider
-      poolOptions={DIFF_WORKER_POOL_OPTIONS}
-      highlighterOptions={highlighterOptions}
-    >
-      <MemoizedDiffContents {...props} />
-    </WorkerPoolContextProvider>
-  )
+  return <MemoizedDiffContents {...props} />
 })
 
 export default DiffSurface

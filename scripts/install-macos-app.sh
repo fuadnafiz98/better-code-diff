@@ -31,8 +31,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
-
 ditto "$source_app" "$staged_app"
 
 staged_bundle_id="$(defaults read "$staged_app/Contents/Info.plist" CFBundleIdentifier)"
@@ -54,5 +52,4 @@ fi
 trap - EXIT
 
 version="$(defaults read "$target_app/Contents/Info.plist" CFBundleShortVersionString)"
-open "$target_app"
-echo "Installed and opened Better Code Diff $version from the latest local build."
+echo "Installed Better Code Diff $version. The running app, if any, was not interrupted."

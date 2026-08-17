@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 
 import type {
   GitIntegrationSnapshot,
+  PullRequestReviewComment,
   PullRequestReviewEvent,
   PullRequestSummary,
   RepositoryReview,
@@ -191,24 +192,33 @@ export function useGitWorkflow({
     }
   }, [onError])
 
-  const submitReview = useCallback(async (reviewEvent: PullRequestReviewEvent, body: string) => {
-    if (repositoryReview?.kind !== 'github') return
+  const submitReview = useCallback(async (
+    reviewEvent: PullRequestReviewEvent,
+    body: string,
+    comments: PullRequestReviewComment[]
+  ): Promise<boolean> => {
+    if (repositoryReview?.kind !== 'github') return false
     const pullRequest = repositoryReview.pullRequest
     const selector = repositoryReview.selector
     const actionLabel = reviewEvent === 'approve'
       ? 'approve'
       : reviewEvent === 'request-changes' ? 'request changes on' : 'comment on'
-    if (!window.confirm(`Submit this review to GitHub and ${actionLabel} #${pullRequest.number}?`)) return
+    const commentSummary = comments.length === 0
+      ? ''
+      : ` with ${comments.length} inline ${comments.length === 1 ? 'comment' : 'comments'}`
+    if (!window.confirm(`Submit this review${commentSummary} to GitHub and ${actionLabel} #${pullRequest.number}?`)) return false
 
     setSubmittingReview(true)
     setSubmissionMessage(null)
     onError(null)
     try {
-      await requireRepositoryApi().submitPullRequestReview(selector, reviewEvent, body)
+      await requireRepositoryApi().submitPullRequestReview(selector, repositoryReview.commitId, reviewEvent, body, comments)
       setIntegration(null)
       setSubmissionMessage('Review submitted to GitHub.')
+      return true
     } catch (error) {
       onError(getErrorMessage(error))
+      return false
     } finally {
       setSubmittingReview(false)
     }

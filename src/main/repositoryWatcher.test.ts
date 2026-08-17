@@ -78,4 +78,42 @@ describe('RepositoryWatcher', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('coalesces file changes while suspended and publishes after resume', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'better-code-diff-watcher-'))
+    const current = snapshot({ root, kind: 'folder', branch: null, head: null, statuses: [] })
+    const events: RepositoryChangeEvent[] = []
+    let resolveEvent!: (event: RepositoryChangeEvent) => void
+    let rejectEvent!: (error: unknown) => void
+    const resumedEvent = new Promise<RepositoryChangeEvent>((resolve, reject) => {
+      resolveEvent = resolve
+      rejectEvent = reject
+    })
+    const timeout = setTimeout(() => rejectEvent(new Error('Resumed watcher event timed out.')), 2_000)
+    const watcher = new RepositoryWatcher(
+      async () => current,
+      (event) => {
+        events.push(event)
+        resolveEvent(event)
+      },
+      rejectEvent
+    )
+
+    try {
+      const sourceDirectory = join(root, 'src')
+      await mkdir(sourceDirectory)
+      await writeFile(join(sourceDirectory, 'existing.ts'), 'first\n', 'utf8')
+      watcher.start(current)
+      watcher.setSuspended(true)
+      await writeFile(join(sourceDirectory, 'existing.ts'), 'second\n', 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      expect(events).toHaveLength(0)
+      watcher.setSuspended(false)
+      expect((await resumedEvent).changedPaths).toEqual(['src/existing.ts'])
+    } finally {
+      clearTimeout(timeout)
+      watcher.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })

@@ -15,6 +15,7 @@ import type {
   LocalBranch,
   LocalBranchReview,
   PullRequestReview,
+  PullRequestReviewComment,
   PullRequestReviewEvent,
   PullRequestSummary,
   RemoteBranch,
@@ -26,7 +27,19 @@ import type {
 const MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 const MAX_SEARCH_RESULTS = 200
-const MAX_HEAD_CACHE_ENTRIES = 32
+const MAX_HEAD_CACHE_ENTRIES = 16
+const MAX_HEAD_CACHE_BYTES = 16 * 1024 * 1024
+const MAX_PATCH_COMMAND_CONCURRENCY = 4
+const MAX_PULL_REQUEST_REVIEW_COMMENTS = 100
+const MAX_REVIEW_BODY_LENGTH = 65_536
+const SELF_REVIEW_DECISION_ERROR = 'GitHub does not allow you to approve or request changes on your own pull request. Submit the review as a comment instead.'
+const ADD_PULL_REQUEST_REVIEW_MUTATION = `
+  mutation AddPullRequestReview($input: AddPullRequestReviewInput!) {
+    addPullRequestReview(input: $input) {
+      pullRequestReview { id }
+    }
+  }
+`
 const GH_EXECUTABLE_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
 const EXCLUDED_DIRECTORIES = [
   '.cache',
@@ -58,6 +71,10 @@ type ReadVersion = {
   contents: Buffer | null
   binary: boolean
   oversized: boolean
+}
+
+export function isSameGitHubLogin(firstLogin: string, secondLogin: string): boolean {
+  return firstLogin.trim().toLowerCase() === secondLogin.trim().toLowerCase()
 }
 
 const require = createRequire(import.meta.url)
@@ -93,10 +110,11 @@ function runCommand(
   executable: string,
   args: readonly string[],
   cwd?: string,
-  allowedExitCodes: readonly number[] = []
+  allowedExitCodes: readonly number[] = [],
+  input?: string
 ): Promise<CommandResult> {
   return new Promise((resolveCommand, rejectCommand) => {
-    execFile(
+    const child = execFile(
       executable,
       [...args],
       {
@@ -121,7 +139,63 @@ function runCommand(
         resolveCommand(result)
       }
     )
+    if (input != null) {
+      child.stdin?.on('error', () => {})
+      child.stdin?.end(input)
+    }
   })
+}
+
+async function mapWithConcurrency<Value, Result>(
+  values: readonly Value[],
+  concurrency: number,
+  transform: (value: Value) => Promise<Result>
+): Promise<Result[]> {
+  const results = new Array<Result>(values.length)
+  let nextIndex = 0
+  const runNext = async (): Promise<void> => {
+    const index = nextIndex
+    nextIndex += 1
+    if (index >= values.length) return
+    const value = values[index]!
+    results[index] = await transform(value)
+    return runNext()
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => runNext())
+  )
+  return results
+}
+
+function isTransientGitHubError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /HTTP\s+(?:502|503|504)\b|timed?\s*out|timeout|connection reset/i.test(message)
+}
+
+async function runGitHubReadCommand(
+  executable: string,
+  args: readonly string[],
+  cwd: string
+): Promise<CommandResult> {
+  const retryDelays = [0, 250, 750] as const
+  let lastError: unknown
+  for (const retryDelay of retryDelays) {
+    if (retryDelay > 0) await new Promise((resolve) => setTimeout(resolve, retryDelay))
+    try {
+      return await runCommand(executable, args, cwd)
+    } catch (error) {
+      lastError = error
+      if (!isTransientGitHubError(error)) throw error
+    }
+  }
+  throw lastError
+}
+
+function gitHubIntegrationErrorMessage(error: unknown): string {
+  if (isTransientGitHubError(error)) {
+    return 'GitHub timed out while loading the pull request list. Retry, or open a pull request directly by number or URL.'
+  }
+  return error instanceof Error ? error.message : String(error)
 }
 
 function splitNullDelimited(buffer: Buffer): string[] {
@@ -284,16 +358,116 @@ function requirePullRequestNumber(number: number): void {
   }
 }
 
-function normalizePullRequestSelector(selector: number | string): string {
+export function normalizePullRequestSelector(selector: number | string): string {
   if (typeof selector === 'number') {
     requirePullRequestNumber(selector)
     return String(selector)
   }
   const trimmedSelector = selector.trim()
+  const numberMatch = /^#?(\d+)$/.exec(trimmedSelector)
+  if (numberMatch != null) {
+    const pullRequestNumber = Number(numberMatch[1])
+    requirePullRequestNumber(pullRequestNumber)
+    return String(pullRequestNumber)
+  }
   if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(trimmedSelector)) {
     return trimmedSelector
   }
   throw new Error('Pull request selector must be a positive number or a GitHub pull request URL.')
+}
+
+function validatePullRequestTarget(url: string, number: number): void {
+  requirePullRequestNumber(number)
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:\/.*)?$/i.exec(url)
+  if (match == null || Number(match[3]) !== number) {
+    throw new Error('GitHub returned an invalid pull request URL.')
+  }
+}
+
+function validatePullRequestReviewComments(value: unknown): PullRequestReviewComment[] {
+  if (!Array.isArray(value)) throw new Error('Pull request review comments must be a list.')
+  if (value.length > MAX_PULL_REQUEST_REVIEW_COMMENTS) {
+    throw new Error(`A review can contain at most ${MAX_PULL_REQUEST_REVIEW_COMMENTS} inline comments.`)
+  }
+
+  return value.map((comment, index) => {
+    if (comment == null || typeof comment !== 'object') {
+      throw new Error(`Inline comment ${index + 1} is invalid.`)
+    }
+    const candidate = comment as Partial<PullRequestReviewComment>
+    const path = typeof candidate.path === 'string' ? candidate.path.trim() : ''
+    const body = typeof candidate.body === 'string' ? candidate.body.trim() : ''
+    const safePath = path !== ''
+      && !path.startsWith('/')
+      && !path.includes('\\')
+      && !path.split('/').includes('..')
+      && !path.includes('\0')
+    if (!safePath) throw new Error(`Inline comment ${index + 1} has an invalid path.`)
+    if (body === '' || body.length > MAX_REVIEW_BODY_LENGTH) {
+      throw new Error(`Inline comment ${index + 1} has an invalid body.`)
+    }
+    if (!Number.isSafeInteger(candidate.line) || candidate.line! < 1) {
+      throw new Error(`Inline comment ${index + 1} has an invalid line.`)
+    }
+    if (candidate.side !== 'LEFT' && candidate.side !== 'RIGHT') {
+      throw new Error(`Inline comment ${index + 1} has an invalid side.`)
+    }
+    if (candidate.startLine != null) {
+      if (!Number.isSafeInteger(candidate.startLine) || candidate.startLine < 1) {
+        throw new Error(`Inline comment ${index + 1} has an invalid start line.`)
+      }
+      if (candidate.startSide !== 'LEFT' && candidate.startSide !== 'RIGHT') {
+        throw new Error(`Inline comment ${index + 1} has an invalid start side.`)
+      }
+    } else if (candidate.startSide != null) {
+      throw new Error(`Inline comment ${index + 1} has a start side without a start line.`)
+    }
+    return {
+      path,
+      body,
+      line: candidate.line!,
+      side: candidate.side,
+      ...(candidate.startLine == null
+        ? {}
+        : { startLine: candidate.startLine, startSide: candidate.startSide })
+    }
+  })
+}
+
+export function createPullRequestReviewPayload(
+  commitIdValue: unknown,
+  reviewEvent: string,
+  bodyValue: unknown,
+  commentsValue: unknown
+): Record<string, unknown> {
+  if (typeof commitIdValue !== 'string' || !/^[0-9a-f]{40}$/i.test(commitIdValue)) {
+    throw new Error('The pull request commit ID is invalid.')
+  }
+  const events: PullRequestReviewEvent[] = ['approve', 'comment', 'request-changes']
+  if (!events.includes(reviewEvent as PullRequestReviewEvent)) {
+    throw new Error('Unknown pull request review action.')
+  }
+  if (typeof bodyValue !== 'string') throw new Error('Pull request review body must be text.')
+  const body = bodyValue.trim()
+  if (body.length > MAX_REVIEW_BODY_LENGTH) throw new Error('Pull request review body is too long.')
+  const comments = validatePullRequestReviewComments(commentsValue)
+  if (reviewEvent !== 'approve' && body === '' && comments.length === 0) {
+    throw new Error('Add a review summary or at least one inline comment for this action.')
+  }
+  return {
+    commitOID: commitIdValue,
+    event: reviewEvent === 'request-changes' ? 'REQUEST_CHANGES' : reviewEvent.toUpperCase(),
+    ...(body === '' ? {} : { body }),
+    threads: comments.map((comment) => ({
+      path: comment.path,
+      body: comment.body,
+      line: comment.line,
+      side: comment.side,
+      ...(comment.startLine == null
+        ? {}
+        : { startLine: comment.startLine, startSide: comment.startSide })
+    }))
+  }
 }
 
 export class RepositoryService {
@@ -302,8 +476,14 @@ export class RepositoryService {
   #snapshot: RepositorySnapshot | null = null
   #pathSet = new Set<string>()
   #statusByPath = new Map<string, RepositoryStatusEntry>()
-  #headFileCache = new Map<string, Promise<ReadVersion | null>>()
+  #headFileCache = new Map<string, { promise: Promise<ReadVersion | null>; bytes: number }>()
+  #headFileCacheBytes = 0
   #activeSearch: ReturnType<typeof spawn> | null = null
+  #githubViewerLogin: string | null = null
+
+  getSessionSnapshot(): RepositorySnapshot | null {
+    return this.#snapshot
+  }
 
   async open(folderPath: string): Promise<RepositorySnapshot> {
     const selectedRoot = await realpath(folderPath)
@@ -313,7 +493,8 @@ export class RepositoryService {
 
     this.#kind = rootResult == null ? 'folder' : 'git'
     this.#root = rootResult?.stdout.toString('utf8').trim() || selectedRoot
-    this.#headFileCache.clear()
+    this.#githubViewerLogin = null
+    this.#clearHeadFileCache()
     return this.refresh()
   }
 
@@ -405,6 +586,50 @@ export class RepositoryService {
       binary,
       oversized
     }
+  }
+
+  async getWorkingTreePatch(pathsValue: unknown): Promise<string> {
+    this.#requireGitRepository()
+    if (!Array.isArray(pathsValue) || pathsValue.length > this.#pathSet.size) {
+      throw new Error('Working tree patch paths must be a valid list.')
+    }
+    const paths = pathsValue.map((path) => {
+      if (typeof path !== 'string' || !this.#pathSet.has(path)) {
+        throw new Error('Working tree patch path is not in the repository.')
+      }
+      return path
+    })
+    if (paths.length === 0) return ''
+
+    const snapshot = this.#requireSnapshot()
+    const untrackedPaths = paths.filter((path) => this.#statusByPath.get(path)?.status === 'untracked')
+    const trackedPaths = snapshot.head == null
+      ? []
+      : paths.filter((path) => this.#statusByPath.get(path)?.status !== 'untracked')
+    const patchParts: string[] = []
+
+    if (trackedPaths.length > 0) {
+      const result = await this.#git([
+        'diff', '--no-color', '--find-renames', '--unified=3', snapshot.head!, '--', ...trackedPaths
+      ])
+      const patch = result.stdout.toString('utf8')
+      if (patch !== '') patchParts.push(patch)
+    }
+
+    const newPaths = snapshot.head == null ? paths : untrackedPaths
+    const newFilePatches = await mapWithConcurrency(
+      newPaths,
+      MAX_PATCH_COMMAND_CONCURRENCY,
+      async (path) => {
+        const result = await this.#gitAllowExitCodeOne([
+          'diff', '--no-index', '--no-color', '--unified=3', '--', '/dev/null', path
+        ])
+        return result.stdout.toString('utf8')
+      }
+    )
+    patchParts.push(...newFilePatches.filter((patch) => patch !== ''))
+
+    return patchParts.join('\n')
   }
 
   async searchContent(query: string): Promise<ContentSearchResult[]> {
@@ -502,7 +727,7 @@ export class RepositoryService {
       '--format=%(HEAD)%09%(refname:short)%09%(upstream:short)',
       'refs/heads'
     ])
-    const pullRequestsPromise = runCommand(ghExecutable, [
+    const pullRequestsPromise = runGitHubReadCommand(ghExecutable, [
       'pr',
       'list',
       '--state', 'all',
@@ -513,7 +738,7 @@ export class RepositoryService {
       (result) => ({ pullRequests: parseJson<PullRequestSummary[]>(result, 'GitHub CLI'), message: null }),
       (error: unknown) => ({
         pullRequests: [],
-        message: error instanceof Error ? error.message : String(error)
+        message: gitHubIntegrationErrorMessage(error)
       })
     )
 
@@ -648,16 +873,19 @@ export class RepositoryService {
     this.#requireGitRepository()
     const normalizedSelector = normalizePullRequestSelector(selector)
     const ghExecutable = await getGhExecutable()
-    const fields = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles,files'
-    const [detailsResult, diffResult] = await Promise.all([
-      runCommand(ghExecutable, ['pr', 'view', normalizedSelector, '--json', fields], this.#requireRoot()),
-      runCommand(ghExecutable, ['pr', 'diff', normalizedSelector, '--color', 'never'], this.#requireRoot())
+    const fields = 'number,title,url,state,isDraft,author,headRefName,headRefOid,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles,files'
+    const [detailsResult, diffResult, viewerLogin] = await Promise.all([
+      runGitHubReadCommand(ghExecutable, ['pr', 'view', normalizedSelector, '--json', fields], this.#requireRoot()),
+      runGitHubReadCommand(ghExecutable, ['pr', 'diff', normalizedSelector, '--color', 'never'], this.#requireRoot()),
+      this.#getGitHubViewerLogin(ghExecutable)
     ])
-    const details = parseJson<PullRequestSummary & { files: PullRequestReview['files'] }>(detailsResult, 'GitHub CLI')
-    const { files, ...pullRequest } = details
+    const details = parseJson<PullRequestSummary & { files: PullRequestReview['files']; headRefOid: string }>(detailsResult, 'GitHub CLI')
+    const { files, headRefOid, ...pullRequest } = details
     return {
       kind: 'github',
       selector: normalizedSelector,
+      commitId: headRefOid,
+      viewerCanSubmitDecision: !isSameGitHubLogin(viewerLogin, pullRequest.author.login),
       pullRequest,
       files,
       patch: diffResult.stdout.toString('utf8')
@@ -673,24 +901,78 @@ export class RepositoryService {
 
   async submitPullRequestReview(
     selector: number | string,
+    commitIdValue: unknown,
     reviewEvent: string,
-    body: string
+    body: string,
+    commentsValue: unknown
   ): Promise<void> {
     this.#requireGitRepository()
     const normalizedSelector = normalizePullRequestSelector(selector)
-    const events: PullRequestReviewEvent[] = ['approve', 'comment', 'request-changes']
-    if (!events.includes(reviewEvent as PullRequestReviewEvent)) {
-      throw new Error('Unknown pull request review action.')
+    const payload = createPullRequestReviewPayload(commitIdValue, reviewEvent, body, commentsValue)
+    const ghExecutable = await getGhExecutable()
+    const [targetResult, viewerLogin] = await Promise.all([
+      runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'view', normalizedSelector, '--json', 'id,number,url,headRefOid,author'],
+        this.#requireRoot()
+      ),
+      this.#getGitHubViewerLogin(ghExecutable)
+    ])
+    const targetDetails = parseJson<{
+      id: string
+      number: number
+      url: string
+      headRefOid: string
+      author: { login: string }
+    }>(targetResult, 'GitHub CLI')
+    if (targetDetails.headRefOid !== commitIdValue) {
+      throw new Error('This pull request changed after you opened it. Reload the review before submitting comments.')
     }
-    if (typeof body !== 'string') throw new Error('Pull request review body must be text.')
-    const trimmedBody = body.trim()
-    if (reviewEvent !== 'approve' && trimmedBody === '') {
-      throw new Error('A review comment is required for this action.')
+    if (typeof targetDetails.id !== 'string' || targetDetails.id === '' || targetDetails.id.length > 256) {
+      throw new Error('GitHub returned an invalid pull request ID.')
     }
-    const eventFlag = reviewEvent === 'request-changes' ? '--request-changes' : `--${reviewEvent}`
-    const args = ['pr', 'review', normalizedSelector, eventFlag]
-    if (trimmedBody !== '') args.push('--body', trimmedBody)
-    await runCommand(await getGhExecutable(), args, this.#requireRoot())
+    validatePullRequestTarget(targetDetails.url, targetDetails.number)
+    if (reviewEvent !== 'comment' && isSameGitHubLogin(viewerLogin, targetDetails.author.login)) {
+      throw new Error(SELF_REVIEW_DECISION_ERROR)
+    }
+    try {
+      await runCommand(
+        ghExecutable,
+        ['api', 'graphql', '--input', '-'],
+        this.#requireRoot(),
+        [],
+        JSON.stringify({
+          query: ADD_PULL_REQUEST_REVIEW_MUTATION,
+          variables: {
+            input: {
+              pullRequestId: targetDetails.id,
+              ...payload
+            }
+          }
+        })
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/can not (?:approve|request changes on) your own pull request/i.test(message)) {
+        throw new Error(SELF_REVIEW_DECISION_ERROR)
+      }
+      throw error
+    }
+  }
+
+  async #getGitHubViewerLogin(ghExecutable: string): Promise<string> {
+    if (this.#githubViewerLogin != null) return this.#githubViewerLogin
+    const result = await runGitHubReadCommand(
+      ghExecutable,
+      ['api', 'user', '--jq', '.login'],
+      this.#requireRoot()
+    )
+    const login = result.stdout.toString('utf8').trim()
+    if (login === '' || login.length > 64 || /[\x00-\x1f\x7f]/.test(login)) {
+      throw new Error('GitHub returned an invalid viewer login.')
+    }
+    this.#githubViewerLogin = login
+    return login
   }
 
   async #readHeadFile(
@@ -699,20 +981,28 @@ export class RepositoryService {
   ): Promise<ReadVersion | null> {
     if (head == null) return null
     const object = `${head}:${path}`
-    const cachedVersion = this.#headFileCache.get(object)
-    if (cachedVersion != null) {
+    const cachedEntry = this.#headFileCache.get(object)
+    if (cachedEntry != null) {
       this.#headFileCache.delete(object)
-      this.#headFileCache.set(object, cachedVersion)
-      return cachedVersion
+      this.#headFileCache.set(object, cachedEntry)
+      return cachedEntry.promise
     }
 
-    const version = this.#loadHeadFile(object)
-    if (this.#headFileCache.size >= MAX_HEAD_CACHE_ENTRIES) {
-      const oldestObject = this.#headFileCache.keys().next().value
-      if (oldestObject != null) this.#headFileCache.delete(oldestObject)
-    }
-    this.#headFileCache.set(object, version)
-    return version
+    const entry = { promise: Promise.resolve<ReadVersion | null>(null), bytes: 0 }
+    entry.promise = this.#loadHeadFile(object).then((version) => {
+      if (this.#headFileCache.get(object) === entry) {
+        entry.bytes = version?.contents?.byteLength ?? 0
+        this.#headFileCacheBytes += entry.bytes
+        this.#evictHeadFileCache()
+      }
+      return version
+    }).catch((error: unknown) => {
+      if (this.#headFileCache.get(object) === entry) this.#deleteHeadCacheEntry(object)
+      throw error
+    })
+    this.#headFileCache.set(object, entry)
+    this.#evictHeadFileCache()
+    return entry.promise
   }
 
   async #loadHeadFile(object: string): Promise<ReadVersion | null> {
@@ -788,9 +1078,14 @@ export class RepositoryService {
     }
   }
 
+  #gitAllowExitCodeOne(args: readonly string[]): Promise<CommandResult> {
+    if (this.#kind !== 'git') throw new Error('The open folder is not a Git repository.')
+    return runCommand('git', ['-C', this.#requireRoot(), ...args], undefined, [1])
+  }
+
   #setSnapshot(snapshot: RepositorySnapshot): void {
     if (this.#snapshot?.root !== snapshot.root || this.#snapshot?.head !== snapshot.head) {
-      this.#headFileCache.clear()
+      this.#clearHeadFileCache()
     }
     this.#snapshot = snapshot
     this.#pathSet = new Set(snapshot.paths)
@@ -800,6 +1095,29 @@ export class RepositoryService {
   #cancelActiveSearch(): void {
     this.#activeSearch?.kill()
     this.#activeSearch = null
+  }
+
+  #deleteHeadCacheEntry(object: string): void {
+    const entry = this.#headFileCache.get(object)
+    if (entry == null) return
+    this.#headFileCacheBytes -= entry.bytes
+    this.#headFileCache.delete(object)
+  }
+
+  #evictHeadFileCache(): void {
+    while (
+      this.#headFileCache.size > MAX_HEAD_CACHE_ENTRIES
+      || this.#headFileCacheBytes > MAX_HEAD_CACHE_BYTES
+    ) {
+      const oldestObject = this.#headFileCache.keys().next().value
+      if (oldestObject == null) return
+      this.#deleteHeadCacheEntry(oldestObject)
+    }
+  }
+
+  #clearHeadFileCache(): void {
+    this.#headFileCache.clear()
+    this.#headFileCacheBytes = 0
   }
 
   #requireRoot(): string {

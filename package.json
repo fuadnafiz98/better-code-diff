@@ -6,15 +6,19 @@
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "bash scripts/run-electron-vite.sh",
+    "dev:background": "BETTER_CODE_DIFF_BACKGROUND=1 bash scripts/run-electron-vite.sh",
     "build": "electron-vite build",
     "icon:mac": "bash scripts/generate-macos-icon.sh",
     "dist:mac": "bun run icon:mac && bun run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64",
     "install:mac": "bash scripts/install-macos-app.sh",
     "update:mac": "bun run dist:mac && bun run install:mac",
+    "open:mac": "open -a \"Better Code Diff\"",
+    "update:mac:open": "bun run update:mac && bun run open:mac",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "test": "bun test"
+    "test": "bun test",
+    "perf:snapshot": "bash scripts/benchmark-memory.sh"
   },
   "dependencies": {
     "@fontsource-variable/fira-code": "^5.3.0",

@@ -1,11 +1,8 @@
-export const DIFF_WORKER_COUNT = Math.min(
-  4,
-  Math.max(2, Math.floor(navigator.hardwareConcurrency / 2))
-)
+export const DIFF_WORKER_COUNT = 1
 
 export const DIFF_WORKER_POOL_OPTIONS = {
   poolSize: DIFF_WORKER_COUNT,
-  totalASTLRUCacheSize: 48,
+  totalASTLRUCacheSize: 8,
   workerFactory: () =>
     new Worker(new URL('@pierre/diffs/worker/worker.js', import.meta.url), {
       type: 'module'

@@ -3,26 +3,28 @@ import type { FileTree as FileTreeModel } from '@pierre/trees'
 import { themeToTreeStyles } from '@pierre/trees'
 import { FileTree, useFileTreeSearch } from '@pierre/trees/react'
 import pierreDarkTheme from '@pierre/theme/pierre-dark'
+import pierreLightTheme from '@pierre/theme/pierre-light'
 import { IconChevronsClose, IconExpandAll, IconSearch, IconX } from '@pierre/icons'
 
 import { getDirectoryPaths } from './treeExpansion'
-
-const TREE_STYLE = {
-  ...themeToTreeStyles(pierreDarkTheme),
-  height: '100%',
-  colorScheme: 'dark',
-  fontFamily: '"Fira Code Variable", "Fira Code", monospace'
-} as React.CSSProperties
+import type { EditorThemeType } from './preferences'
 
 interface ExplorerProps {
   filePaths: readonly string[]
   model: FileTreeModel
+  themeType: EditorThemeType
 }
 
-export const Explorer = memo(function Explorer({ filePaths, model }: ExplorerProps) {
+export const Explorer = memo(function Explorer({ filePaths, model, themeType }: ExplorerProps) {
   const search = useFileTreeSearch(model)
   const directoryPaths = useMemo(() => getDirectoryPaths(filePaths), [filePaths])
   const visibleFileCount = search.value.length > 0 ? search.matchingPaths.length : filePaths.length
+  const treeStyle = useMemo(() => ({
+    ...themeToTreeStyles(themeType === 'light' ? pierreLightTheme : pierreDarkTheme),
+    height: '100%',
+    colorScheme: themeType,
+    fontFamily: '"Fira Code Variable", "Fira Code", monospace'
+  }) as React.CSSProperties, [themeType])
 
   const expandAll = useCallback(() => {
     for (const directoryPath of directoryPaths) {
@@ -61,7 +63,7 @@ export const Explorer = memo(function Explorer({ filePaths, model }: ExplorerPro
           </button>
         </div>
       </div>
-      <FileTree className="project-tree" model={model} style={TREE_STYLE} />
+      <FileTree className="project-tree" model={model} style={treeStyle} />
     </aside>
   )
 })

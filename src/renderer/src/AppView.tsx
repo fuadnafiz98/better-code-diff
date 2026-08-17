@@ -26,6 +26,7 @@ import type {
 } from '../../shared/contracts'
 import type { RecentFolder } from './recentFolders'
 import { PerformanceHud } from './PerformanceHud'
+import { formatKeybinding, type KeybindingMap } from './keybindings'
 
 export type SearchMode = 'files' | 'content'
 export type DiffStyle = 'split' | 'unified'
@@ -49,6 +50,7 @@ interface TitlebarProps {
   searchingContent: boolean
   opening: boolean
   refreshing: boolean
+  keybindings: KeybindingMap
   onSidebarToggle(): void
   onSearchModeChange(mode: SearchMode): void
   onSearchQueryChange(query: string): void
@@ -67,6 +69,7 @@ export function Titlebar({
   searchingContent,
   opening,
   refreshing,
+  keybindings,
   onSidebarToggle,
   onSearchModeChange,
   onSearchQueryChange,
@@ -118,8 +121,8 @@ export function Titlebar({
           </button>
         ) : (
           searchMode === 'files'
-            ? <ShortcutHint keys="⌘P" label="Command P" />
-            : <ShortcutHint keys="⇧⌘F" label="Shift Command F" />
+            ? <ShortcutHint keys={formatKeybinding(keybindings.goToFile)} label="Go to file shortcut" />
+            : <ShortcutHint keys={formatKeybinding(keybindings.searchContent)} label="Search contents shortcut" />
         )}
       </div>
 
@@ -236,6 +239,7 @@ interface WelcomeProps {
   opening: boolean
   openingRecentPath: string | null
   recentFolders: readonly RecentFolder[]
+  keybindings: KeybindingMap
   onOpen(): Promise<void>
   onRecentOpen(folder: RecentFolder): Promise<void>
   onRecentRemove(path: string): void
@@ -246,6 +250,7 @@ export function Welcome({
   opening,
   openingRecentPath,
   recentFolders,
+  keybindings,
   onRecentOpen,
   onRecentRemove
 }: WelcomeProps): React.JSX.Element {
@@ -263,9 +268,9 @@ export function Welcome({
             Open Folder
           </button>
           <div className="shortcut-list" aria-label="Keyboard shortcuts">
-            <span>Open folder</span><ShortcutHint keys="⌘O" label="Command O" />
-            <span>Go to file</span><ShortcutHint keys="⌘P" label="Command P" />
-            <span>Search contents</span><ShortcutHint keys="⇧⌘F" label="Shift Command F" />
+            <span>Open folder</span><ShortcutHint keys={formatKeybinding(keybindings.openFolder)} label="Open folder shortcut" />
+            <span>Go to file</span><ShortcutHint keys={formatKeybinding(keybindings.goToFile)} label="Go to file shortcut" />
+            <span>Search contents</span><ShortcutHint keys={formatKeybinding(keybindings.searchContent)} label="Search contents shortcut" />
           </div>
         </header>
 
@@ -311,9 +316,13 @@ interface DiffToolbarProps {
   reviewFileCount: number
   reviewTitle?: string
   reviewComparison?: string
+  wordWrap: boolean
+  foldUnchanged: boolean
   onCloseExternalReview?(): void
   onDiffStyleChange(style: DiffStyle): void
   onWorkspaceViewChange(view: WorkspaceView): void
+  onWordWrapToggle(): void
+  onFoldUnchangedToggle(): void
 }
 
 function formatStatus(status: FileComparison['status']): string {
@@ -337,9 +346,13 @@ export function DiffToolbar({
   reviewFileCount,
   reviewTitle,
   reviewComparison,
+  wordWrap,
+  foldUnchanged,
   onCloseExternalReview,
   onDiffStyleChange,
-  onWorkspaceViewChange
+  onWorkspaceViewChange,
+  onWordWrapToggle,
+  onFoldUnchangedToggle
 }: DiffToolbarProps): React.JSX.Element {
   const displayName = workspaceView === 'multi'
     ? reviewTitle ?? 'Repository review'
@@ -357,6 +370,16 @@ export function DiffToolbar({
         ) : null}
       </div>
       <div className="diff-controls">
+        <div className="editor-option-controls" role="group" aria-label="Editor display options">
+          <button type="button" aria-pressed={wordWrap} className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle} title="Toggle word wrap">
+            Wrap
+          </button>
+          {isGitRepository && (workspaceView === 'multi' || !isFilePreview) ? (
+            <button type="button" aria-pressed={foldUnchanged} className={foldUnchanged ? 'active' : undefined} onClick={onFoldUnchangedToggle} title="Toggle unchanged context folding">
+              Fold context
+            </button>
+          ) : null}
+        </div>
         {onCloseExternalReview != null ? (
           <button className="review-return-button" type="button" onClick={onCloseExternalReview}><IconBranch />Working Tree</button>
         ) : null}
