@@ -1,5 +1,6 @@
 export type RepositoryFileStatus =
   | 'added'
+  | 'conflicted'
   | 'deleted'
   | 'modified'
   | 'renamed'
@@ -89,6 +90,12 @@ export interface PullRequestAuthor {
   login: string
 }
 
+export interface PullRequestChecks {
+  passing: number
+  failing: number
+  pending: number
+}
+
 export interface PullRequestSummary {
   number: number
   title: string
@@ -103,12 +110,79 @@ export interface PullRequestSummary {
   additions: number
   deletions: number
   changedFiles: number
+  checks?: PullRequestChecks | null
+  mergeable?: string | null
+}
+
+export type InboxPullRequest = Pick<
+  PullRequestSummary,
+  'number' | 'title' | 'url' | 'state' | 'isDraft' | 'author' | 'updatedAt'
+>
+
+export type PullRequestInboxSectionKey = 'review-requested' | 'assigned' | 'mentioned' | 'authored'
+
+export interface PullRequestInboxSection {
+  key: PullRequestInboxSectionKey
+  title: string
+  pullRequests: InboxPullRequest[]
+}
+
+export interface PullRequestInboxSnapshot {
+  available: boolean
+  message: string | null
+  sections: PullRequestInboxSection[]
 }
 
 export interface PullRequestFile {
   path: string
   additions: number
   deletions: number
+}
+
+export interface RemoteReviewComment {
+  id: string
+  body: string
+  authorLogin: string
+  createdAt: string
+}
+
+export interface RemoteReviewThread {
+  id: string
+  path: string
+  line: number | null
+  startLine: number | null
+  side: 'LEFT' | 'RIGHT'
+  resolved: boolean
+  outdated: boolean
+  comments: RemoteReviewComment[]
+}
+
+export interface RemoteReviewSummary {
+  id: string
+  state: string
+  body: string
+  authorLogin: string
+  submittedAt: string | null
+}
+
+export interface PullRequestConversation {
+  available: boolean
+  message: string | null
+  body: string
+  threads: RemoteReviewThread[]
+  reviews: RemoteReviewSummary[]
+}
+
+export interface OmittedDiffFile {
+  path: string
+  reason: 'too-large'
+  additions: number
+  deletions: number
+}
+
+export interface WorkingTreePatch {
+  patch: string
+  omittedFiles: OmittedDiffFile[]
 }
 
 export interface PullRequestReview {
@@ -119,6 +193,7 @@ export interface PullRequestReview {
   pullRequest: PullRequestSummary
   files: PullRequestFile[]
   patch: string
+  omittedFiles: OmittedDiffFile[]
 }
 
 export interface LocalBranchReview {
@@ -129,6 +204,7 @@ export interface LocalBranchReview {
   headRefName: string
   files: PullRequestFile[]
   patch: string
+  omittedFiles: OmittedDiffFile[]
 }
 
 export type RepositoryReview = PullRequestReview | LocalBranchReview
@@ -147,6 +223,8 @@ export interface GitIntegrationSnapshot {
 }
 
 export type PullRequestReviewEvent = 'approve' | 'comment' | 'request-changes'
+
+export type PullRequestMergeStrategy = 'squash' | 'merge' | 'rebase'
 
 export interface PullRequestReviewComment {
   path: string
@@ -180,15 +258,35 @@ export interface ContentSearchResult {
   preview: string
 }
 
+export type AgentProvider = 'claude' | 'codex'
+
+export interface AgentAskInput {
+  id: string
+  provider: AgentProvider
+  prompt: string
+  context: string
+  resumeSessionId?: string
+}
+
+export interface AgentStreamEvent {
+  id: string
+  /** `activity` reports what the agent is doing (a tool call, thinking). */
+  kind: 'text' | 'session' | 'done' | 'error' | 'activity'
+  text?: string
+  sessionId?: string
+}
+
 export interface RepositoryApi {
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
   openPath(path: string): Promise<RepositorySnapshot>
   refresh(): Promise<RepositorySnapshot>
   getComparison(path: string): Promise<FileComparison>
-  getWorkingTreePatch(paths: string[]): Promise<string>
+  getWorkingTreePatch(paths: string[]): Promise<WorkingTreePatch>
   searchContent(query: string): Promise<ContentSearchResult[]>
+  cancelContentSearch(): void
   getGitIntegration(): Promise<GitIntegrationSnapshot>
+  getPullRequestInbox(): Promise<PullRequestInboxSnapshot>
   switchBranch(name: string): Promise<RepositorySnapshot>
   getLocalBranchReview(baseRef: string, headRef: string): Promise<LocalBranchReview>
   getCommitReview(oid: string): Promise<LocalBranchReview>
@@ -196,6 +294,11 @@ export interface RepositoryApi {
   pullCurrentBranch(): Promise<RepositorySnapshot>
   pushCurrentBranch(): Promise<GitIntegrationSnapshot>
   getPullRequestReview(selector: number | string): Promise<PullRequestReview>
+  getPullRequestConversation(selector: number | string): Promise<PullRequestConversation>
+  replyToPullRequestThread(threadId: string, body: string): Promise<void>
+  setPullRequestThreadResolved(threadId: string, resolved: boolean): Promise<void>
+  mergePullRequest(selector: number | string, strategy: PullRequestMergeStrategy): Promise<void>
+  markPullRequestReady(selector: number | string): Promise<void>
   checkoutPullRequest(number: number): Promise<RepositorySnapshot>
   submitPullRequestReview(
     selector: number | string,
@@ -204,6 +307,9 @@ export interface RepositoryApi {
     body: string,
     comments: PullRequestReviewComment[]
   ): Promise<void>
+  askAgent(request: AgentAskInput): Promise<void>
+  cancelAgent(id: string): Promise<void>
+  onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void
   getPerformanceMetrics(): Promise<PerformanceMetrics>
   setVisibility(visible: boolean): Promise<void>
   findInPage(query: string, forward: boolean, findNext: boolean): Promise<number>
@@ -220,7 +326,9 @@ export const IPC_CHANNELS = {
   getComparison: 'repository:get-comparison',
   getWorkingTreePatch: 'repository:get-working-tree-patch',
   searchContent: 'repository:search-content',
+  cancelContentSearch: 'repository:cancel-content-search',
   getGitIntegration: 'repository:get-git-integration',
+  getPullRequestInbox: 'repository:get-pull-request-inbox',
   switchBranch: 'repository:switch-branch',
   getLocalBranchReview: 'repository:get-local-branch-review',
   getCommitReview: 'repository:get-commit-review',
@@ -228,8 +336,16 @@ export const IPC_CHANNELS = {
   pullCurrentBranch: 'repository:pull-current-branch',
   pushCurrentBranch: 'repository:push-current-branch',
   getPullRequestReview: 'repository:get-pull-request-review',
+  getPullRequestConversation: 'repository:get-pull-request-conversation',
+  replyToPullRequestThread: 'repository:reply-to-pull-request-thread',
+  setPullRequestThreadResolved: 'repository:set-pull-request-thread-resolved',
+  mergePullRequest: 'repository:merge-pull-request',
+  markPullRequestReady: 'repository:mark-pull-request-ready',
   checkoutPullRequest: 'repository:checkout-pull-request',
   submitPullRequestReview: 'repository:submit-pull-request-review',
+  askAgent: 'agent:ask',
+  cancelAgent: 'agent:cancel',
+  agentEvent: 'agent:event',
   getPerformanceMetrics: 'app:get-performance-metrics',
   setVisibility: 'app:set-visibility',
   findInPage: 'app:find-in-page',

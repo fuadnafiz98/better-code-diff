@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SelectedLineRange } from '@pierre/diffs'
+
+import type { RemoteReviewThread } from '../../shared/contracts'
 import {
   IconApproved,
   IconCheck,
@@ -7,6 +9,7 @@ import {
   IconCommentAdd,
   IconPencil,
   IconReply,
+  IconSparkles,
   IconTrash,
   IconX
 } from '@pierre/icons'
@@ -27,8 +30,38 @@ export interface ReviewThread {
 }
 
 export type ReviewAnnotationMetadata =
+  | { kind: 'selection'; range: SelectedLineRange }
   | { kind: 'draft'; range: SelectedLineRange }
   | { kind: 'thread'; thread: ReviewThread }
+  | { kind: 'remote'; thread: RemoteReviewThread }
+
+interface SelectionActionsProps {
+  range: SelectedLineRange
+  onComment(): void
+  onAskAgent(): void
+  onDismiss(): void
+}
+
+// Selecting lines offers both destinations rather than assuming a comment, so the
+// same selection can go to a teammate or to the agent.
+export function SelectionActions({
+  range,
+  onComment,
+  onAskAgent,
+  onDismiss
+}: SelectionActionsProps): React.JSX.Element {
+  return (
+    <div className="selection-actions" role="group" aria-label={`Actions for ${formatSelectedRange(range)}`}>
+      <span className="selection-actions-range">{formatSelectedRange(range)}</span>
+      <button type="button" onClick={onComment}><IconCommentAdd />Add comment</button>
+      <button type="button" onClick={onAskAgent}>
+        <IconSparkles />Add to Chat<kbd>⌘I</kbd>
+      </button>
+      <button className="selection-actions-dismiss" type="button" onClick={onDismiss}
+        aria-label="Clear selection" title="Clear selection"><IconX /></button>
+    </div>
+  )
+}
 
 interface DraftCommentProps {
   range: SelectedLineRange
@@ -38,7 +71,10 @@ interface DraftCommentProps {
 
 export function formatSelectedRange(range: SelectedLineRange): string {
   const side = range.side === 'deletions' ? 'old' : range.side === 'additions' ? 'new' : null
-  const lines = range.start === range.end ? `Line ${range.start}` : `Lines ${range.start}–${range.end}`
+  // Dragging upward reports the anchor first, so the ends are ordered for display.
+  const first = Math.min(range.start, range.end)
+  const last = Math.max(range.start, range.end)
+  const lines = first === last ? `Line ${first}` : `Lines ${first}–${last}`
   return side == null ? lines : `${lines} · ${side}`
 }
 

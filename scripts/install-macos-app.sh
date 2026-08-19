@@ -2,11 +2,17 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
-source_app="$project_dir/release/mac-arm64/Better Code Diff.app"
-target_app="/Applications/Better Code Diff.app"
-staged_app="/Applications/.Better Code Diff.installing.$$"
-backup_app="/Applications/.Better Code Diff.previous.$$"
-bundle_id="com.fuadnafiz.bettercodediff"
+source_app="$project_dir/release/mac-arm64/Horus.app"
+user_applications="${HOME}/Applications"
+target_app="$user_applications/Horus.app"
+staged_app="$user_applications/.Horus.installing.$$"
+backup_app="$user_applications/.Horus.previous.$$"
+legacy_app="/Applications/Horus.app"
+previous_app="$user_applications/Better Code Diff.app"
+cache_dir="${HOME}/Library/Caches/Horus"
+trash_dir="${HOME}/.Trash"
+bundle_id="com.fuadnafiz.horus"
+previous_bundle_id="com.fuadnafiz.bettercodediff"
 
 if [[ ! -d "$source_app" ]]; then
   echo "Missing packaged app: $source_app" >&2
@@ -22,7 +28,7 @@ fi
 
 cleanup() {
   if [[ -d "$staged_app" ]]; then
-    rm -rf "$staged_app"
+    mv "$staged_app" "$trash_dir/Horus incomplete install.$$"
   fi
 
   if [[ -d "$backup_app" && ! -d "$target_app" ]]; then
@@ -30,6 +36,15 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+mkdir -p "$user_applications" "$trash_dir"
+
+pkill -x "Horus" 2>/dev/null || true
+pkill -x "Horus Helper" 2>/dev/null || true
+pkill -x "Horus Helper (Renderer)" 2>/dev/null || true
+pkill -x "Better Code Diff" 2>/dev/null || true
+pkill -x "Better Code Diff Helper" 2>/dev/null || true
+pkill -x "Better Code Diff Helper (Renderer)" 2>/dev/null || true
 
 ditto "$source_app" "$staged_app"
 
@@ -46,10 +61,30 @@ fi
 mv "$staged_app" "$target_app"
 
 if [[ -d "$backup_app" ]]; then
-  rm -rf "$backup_app"
+  mv "$backup_app" "$trash_dir/Horus previous.$$"
 fi
+
+if [[ -d "$legacy_app" ]]; then
+  legacy_bundle_id="$(defaults read "$legacy_app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)"
+  if [[ "$legacy_bundle_id" == "$bundle_id" ]]; then
+  mv "$legacy_app" "$trash_dir/Horus legacy.$$"
+  fi
+fi
+
+if [[ -d "$previous_app" ]]; then
+  installed_bundle_id="$(defaults read "$previous_app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)"
+  if [[ "$installed_bundle_id" == "$previous_bundle_id" ]]; then
+    mv "$previous_app" "$trash_dir/Better Code Diff replaced by Horus.$$"
+  fi
+fi
+
+if [[ -d "$cache_dir" ]]; then
+  mv "$cache_dir" "$trash_dir/Horus cache.$$"
+fi
+
+mv "$source_app" "$trash_dir/Horus build.$$"
 
 trap - EXIT
 
 version="$(defaults read "$target_app/Contents/Info.plist" CFBundleShortVersionString)"
-echo "Installed Better Code Diff $version. The running app, if any, was not interrupted."
+echo "Installed Horus $version in $target_app."

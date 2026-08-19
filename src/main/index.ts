@@ -1,19 +1,21 @@
 import { isAbsolute, join } from 'node:path'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, realpath, writeFile } from 'node:fs/promises'
 
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell, type RenderProcessGoneDetails } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, nativeTheme, shell, type RenderProcessGoneDetails } from 'electron'
 
 import { IPC_CHANNELS, type RendererTermination } from '../shared/contracts.js'
-import { RepositoryService } from './repository.js'
+import { AgentService } from './agentService.js'
+import { isPathWithinApprovedRoots, RepositoryService } from './repository.js'
 import { RepositoryWatcher } from './repositoryWatcher.js'
 
-const PRODUCT_NAME = 'Better Code Diff'
-const startHidden = process.env.BETTER_CODE_DIFF_BACKGROUND === '1'
+const PRODUCT_NAME = 'Horus'
+const startHidden = process.env.HORUS_BACKGROUND === '1'
 
 app.setName(PRODUCT_NAME)
 process.title = PRODUCT_NAME
 
 const repository = new RepositoryService()
+const agentService = new AgentService()
 const repositoryWatcher = new RepositoryWatcher(
   () => repository.refresh(),
   (change) => {
@@ -28,10 +30,70 @@ const MAX_AUTOMATIC_RECOVERIES = 3
 const RECOVERY_WINDOW_MS = 60_000
 const UNRESPONSIVE_RECOVERY_DELAY_MS = 8_000
 const MAX_RENDERER_TERMINATION_RECORDS = 20
+const MAX_APPROVED_ROOT_RECORDS = 40
 let lastRendererTermination: RendererTermination | null = null
+let approvedRoots: string[] = []
+let approvedRootsPromise: Promise<void> | null = null
 
 function rendererDiagnosticsPath(): string {
   return join(app.getPath('userData'), 'renderer-terminations.json')
+}
+
+function approvedRootsPath(): string {
+  return join(app.getPath('userData'), 'approved-roots.json')
+}
+
+function loadApprovedRoots(): Promise<void> {
+  approvedRootsPromise ??= (async () => {
+    try {
+      const records = JSON.parse(await readFile(approvedRootsPath(), 'utf8')) as unknown
+      approvedRoots = Array.isArray(records)
+        ? records.filter((record): record is string => typeof record === 'string' && isAbsolute(record))
+        : []
+    } catch {
+      approvedRoots = []
+    }
+  })()
+  return approvedRootsPromise
+}
+
+async function approveRoots(...paths: readonly string[]): Promise<void> {
+  await loadApprovedRoots()
+  const replacedRoots = new Set(paths)
+  const nextRoots = approvedRoots.filter((root) => !replacedRoots.has(root))
+  nextRoots.push(...paths)
+  approvedRoots = nextRoots.slice(-MAX_APPROVED_ROOT_RECORDS)
+  await writeFile(approvedRootsPath(), JSON.stringify(approvedRoots, null, 2), 'utf8')
+    .catch((error) => console.error('Could not persist approved repository roots:', error))
+}
+
+// A renderer must not be able to choose an arbitrary root on its own, but a
+// folder the user already trusts should not be unreachable either: consent is
+// taken in the main process, then remembered.
+async function requireApprovedRoot(folderPath: string, window: BrowserWindow | null): Promise<void> {
+  await loadApprovedRoots()
+  const resolvedPath = await realpath(folderPath).catch(() => folderPath)
+  if (isPathWithinApprovedRoots(approvedRoots, resolvedPath)) return
+
+  const { response } = window == null
+    ? await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Open Folder', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      message: 'Open this folder?',
+      detail: folderPath
+    })
+    : await dialog.showMessageBox(window, {
+      type: 'question',
+      buttons: ['Open Folder', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      message: 'Open this folder?',
+      detail: folderPath
+    })
+  if (response !== 0) throw new Error('Opening that folder was cancelled.')
+  await approveRoots(resolvedPath)
 }
 
 async function loadLastRendererTermination(): Promise<void> {
@@ -173,6 +235,7 @@ function registerIpcHandlers(): void {
     if (result.canceled || folderPath == null) return null
     repositoryWatcher.stop()
     const snapshot = await repository.open(folderPath).then(startTracking)
+    await approveRoots(await realpath(folderPath).catch(() => folderPath), snapshot.root)
     BrowserWindow.fromWebContents(event.sender)?.maximize()
     return snapshot
   })
@@ -180,8 +243,10 @@ function registerIpcHandlers(): void {
     if (typeof folderPath !== 'string' || !isAbsolute(folderPath)) {
       throw new Error('Recent folder path must be absolute.')
     }
+    await requireApprovedRoot(folderPath, BrowserWindow.fromWebContents(event.sender))
     repositoryWatcher.stop()
     const snapshot = await repository.open(folderPath).then(startTracking)
+    await approveRoots(snapshot.root)
     BrowserWindow.fromWebContents(event.sender)?.maximize()
     return snapshot
   })
@@ -195,7 +260,28 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.searchContent, (_event, query: string) =>
     repository.searchContent(query)
   )
+  ipcMain.on(IPC_CHANNELS.cancelContentSearch, () => repository.cancelContentSearch())
   ipcMain.handle(IPC_CHANNELS.getGitIntegration, () => repository.getGitIntegration())
+  ipcMain.handle(IPC_CHANNELS.getPullRequestInbox, () => repository.getPullRequestInbox())
+  ipcMain.handle(IPC_CHANNELS.askAgent, async (event, request: unknown) => {
+    const snapshot = repository.getSessionSnapshot()
+    if (snapshot == null) throw new Error('Open a repository before asking the agent.')
+    const sender = event.sender
+    await agentService.ask(request, snapshot.root, (agentEvent) => {
+      if (!sender.isDestroyed()) sender.send(IPC_CHANNELS.agentEvent, agentEvent)
+    })
+  })
+  ipcMain.handle(IPC_CHANNELS.cancelAgent, (_event, id: unknown) => agentService.cancel(id))
+  ipcMain.handle(IPC_CHANNELS.getPullRequestConversation, (_event, selector: number | string) =>
+    repository.getPullRequestConversation(selector))
+  ipcMain.handle(IPC_CHANNELS.replyToPullRequestThread, (_event, threadId: unknown, body: unknown) =>
+    repository.replyToPullRequestThread(threadId, body))
+  ipcMain.handle(IPC_CHANNELS.setPullRequestThreadResolved, (_event, threadId: unknown, resolved: unknown) =>
+    repository.setPullRequestThreadResolved(threadId, resolved))
+  ipcMain.handle(IPC_CHANNELS.mergePullRequest, (_event, selector: number | string, strategy: unknown) =>
+    repository.mergePullRequest(selector, strategy))
+  ipcMain.handle(IPC_CHANNELS.markPullRequestReady, (_event, selector: number | string) =>
+    repository.markPullRequestReady(selector))
   ipcMain.handle(IPC_CHANNELS.switchBranch, (_event, name: string) =>
     repository.switchBranch(name).then(trackSnapshot)
   )
@@ -269,11 +355,22 @@ function registerIpcHandlers(): void {
   })
 }
 
+// An unpackaged run has no bundle icon, so macOS falls back to Electron's default.
+// Pointing the dock at the same source image electron-builder packages makes a dev
+// run look like the installed app.
+function applyDevelopmentDockIcon(): void {
+  if (app.isPackaged || process.platform !== 'darwin') return
+  const icon = nativeImage.createFromPath(join(__dirname, '../../build/icon.png'))
+  if (!icon.isEmpty()) app.dock?.setIcon(icon)
+}
+
 app.whenReady().then(() => {
   nativeTheme.themeSource = 'dark'
   app.setAboutPanelOptions({ applicationName: PRODUCT_NAME })
+  applyDevelopmentDockIcon()
   if (startHidden) app.dock?.hide()
   void loadLastRendererTermination()
+  void loadApprovedRoots()
   registerIpcHandlers()
   createMainWindow()
   app.on('activate', () => {

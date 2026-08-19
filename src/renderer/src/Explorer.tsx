@@ -43,9 +43,9 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType }: 
   return (
     <aside className="sidebar" id="repository-explorer">
       <div className="sidebar-heading">
-        <span>Explorer</span>
+        <strong>Explorer</strong>
         <div className="sidebar-heading-actions">
-          <span>{visibleFileCount.toLocaleString()} files</span>
+          <span className="sidebar-file-count">{visibleFileCount.toLocaleString()} files</span>
           <button type="button" aria-label="Expand all folders" title="Expand all folders" onClick={expandAll}>
             <IconExpandAll />
           </button>

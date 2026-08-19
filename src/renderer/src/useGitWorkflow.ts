@@ -1,7 +1,9 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 
 import type {
   GitIntegrationSnapshot,
+  PullRequestInboxSnapshot,
+  PullRequestMergeStrategy,
   PullRequestReviewComment,
   PullRequestReviewEvent,
   PullRequestSummary,
@@ -19,6 +21,8 @@ interface UseGitWorkflowOptions {
   onWorkspaceViewChange(view: WorkspaceView): void
 }
 
+export type RepositoryPanelTab = 'history' | 'branches' | 'remotes' | 'pull-requests'
+
 export function useGitWorkflow({
   snapshot,
   applySnapshot,
@@ -27,8 +31,11 @@ export function useGitWorkflow({
   onWorkspaceViewChange
 }: UseGitWorkflowOptions) {
   const [panelOpen, setPanelOpen] = useState(false)
+  const [panelTab, setPanelTab] = useState<RepositoryPanelTab>('pull-requests')
   const [integration, setIntegration] = useState<GitIntegrationSnapshot | null>(null)
   const [loadingIntegration, setLoadingIntegration] = useState(false)
+  const [inbox, setInbox] = useState<PullRequestInboxSnapshot | null>(null)
+  const [loadingInbox, setLoadingInbox] = useState(false)
   const [actionKey, setActionKey] = useState<string | null>(null)
   const [repositoryReview, setRepositoryReview] = useState<RepositoryReview | null>(null)
   const [submittingReview, setSubmittingReview] = useState(false)
@@ -38,6 +45,7 @@ export function useGitWorkflow({
     setRepositoryReview(null)
     setSubmissionMessage(null)
     setIntegration(null)
+    setInbox(null)
     setPanelOpen(false)
   }, [])
 
@@ -53,10 +61,59 @@ export function useGitWorkflow({
     }
   }, [onError])
 
+  const loadInbox = useCallback(async () => {
+    setLoadingInbox(true)
+    try {
+      setInbox(await requireRepositoryApi().getPullRequestInbox())
+    } catch (error) {
+      setInbox({ available: false, message: getErrorMessage(error), sections: [] })
+    } finally {
+      setLoadingInbox(false)
+    }
+  }, [])
+
+  const mergePullRequest = useCallback(async (
+    pullRequest: PullRequestSummary,
+    strategy: PullRequestMergeStrategy
+  ) => {
+    setActionKey(`merge:${pullRequest.number}`)
+    onError(null)
+    try {
+      await requireRepositoryApi().mergePullRequest(pullRequest.number, strategy)
+      await loadIntegration()
+    } catch (error) {
+      onError(getErrorMessage(error))
+    } finally {
+      setActionKey(null)
+    }
+  }, [loadIntegration, onError])
+
+  const markPullRequestReady = useCallback(async (pullRequest: PullRequestSummary) => {
+    setActionKey(`ready:${pullRequest.number}`)
+    onError(null)
+    try {
+      await requireRepositoryApi().markPullRequestReady(pullRequest.number)
+      await loadIntegration()
+    } catch (error) {
+      onError(getErrorMessage(error))
+    } finally {
+      setActionKey(null)
+    }
+  }, [loadIntegration, onError])
+
   const openPanel = useCallback(() => {
+    setPanelTab('pull-requests')
     setPanelOpen(true)
     void loadIntegration()
-  }, [loadIntegration])
+    void loadInbox()
+  }, [loadIntegration, loadInbox])
+
+  const openBranches = useCallback(() => {
+    setPanelTab('branches')
+    setPanelOpen(true)
+    void loadIntegration()
+    void loadInbox()
+  }, [loadInbox, loadIntegration])
 
   const confirmWorkingTreeChange = useCallback((action: string): boolean => {
     if ((snapshot?.statuses.length ?? 0) === 0) return true
@@ -230,11 +287,14 @@ export function useGitWorkflow({
     onSelectPath(snapshot?.statuses[0]?.path ?? null)
   }, [onSelectPath, snapshot?.statuses])
 
-  return {
+  return useMemo(() => ({
     panelOpen,
+    panelTab,
     setPanelOpen,
     integration,
     loadingIntegration,
+    inbox,
+    loadingInbox,
     actionKey,
     repositoryReview,
     submittingReview,
@@ -242,6 +302,7 @@ export function useGitWorkflow({
     reset,
     loadIntegration,
     openPanel,
+    openBranches,
     switchBranch,
     reviewPullRequest,
     openPullRequestReview,
@@ -252,6 +313,36 @@ export function useGitWorkflow({
     pullCurrentBranch,
     pushCurrentBranch,
     submitReview,
-    closeReview
-  }
+    closeReview,
+    mergePullRequest,
+    markPullRequestReady
+  }), [
+    actionKey,
+    checkoutPullRequest,
+    closeReview,
+    fetchRemote,
+    inbox,
+    integration,
+    loadIntegration,
+    loadingInbox,
+    loadingIntegration,
+    markPullRequestReady,
+    mergePullRequest,
+    openPanel,
+    openBranches,
+    openPullRequestReview,
+    panelOpen,
+    panelTab,
+    pullCurrentBranch,
+    pushCurrentBranch,
+    repositoryReview,
+    reset,
+    reviewCommit,
+    reviewLocalBranch,
+    reviewPullRequest,
+    submissionMessage,
+    submitReview,
+    submittingReview,
+    switchBranch
+  ])
 }

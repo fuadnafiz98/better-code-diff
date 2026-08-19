@@ -1,6 +1,7 @@
 import { memo, useEffect, useState } from 'react'
 
 import type { PerformanceMetrics } from '../../shared/contracts'
+import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
 
 const SAMPLE_INTERVAL_MS = 3_000
 
@@ -17,6 +18,7 @@ function formatMemory(megabytes: number): string {
 
 export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element {
   const [metrics, setMetrics] = useState<PerformanceMetrics | null>(null)
+  const [reviewMetrics, setReviewMetrics] = useState<ReviewMetrics>(getReviewMetrics)
 
   useEffect(() => {
     const repository = window.repository
@@ -37,6 +39,7 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
       } catch {
         if (!disposed) setMetrics(null)
       } finally {
+        if (!disposed) setReviewMetrics(getReviewMetrics())
         scheduleSample()
       }
     }
@@ -62,33 +65,70 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
 
   return (
     <details className="performance-hud">
-      <summary aria-label={description} title="Application performance">
-        <span className="performance-status" aria-hidden="true">
-          <span className={`performance-signal ${metrics?.production ? 'production' : ''}`} />
-        </span>
+      {/* No `title`: the OS tooltip rendered on top of the panel it opens, and the
+          panel already names itself. */}
+      <summary aria-label={description}>
+        <span className={`performance-signal ${metrics?.production ? 'production' : ''}`} aria-hidden="true" />
         <span className="performance-metric"><small>CPU</small><strong>{metrics == null ? '—' : formatPercent(metrics.cpuPercent)}</strong></span>
         <span className="performance-metric"><small>GPU</small><strong>{metrics == null ? '—' : formatPercent(metrics.gpuProcessCpuPercent)}</strong></span>
         <span className="performance-memory"><strong>{metrics == null ? '—' : formatMemory(metrics.workingSetMegabytes)}</strong></span>
       </summary>
       <div className="performance-popover">
-        <header><strong>Application performance</strong><span className="performance-live">Live</span></header>
-        <dl>
-          <div><dt>Build</dt><dd>{metrics?.production ? 'Production' : 'Development'}</dd></div>
-          <div><dt>Processes</dt><dd>{metrics?.processCount ?? '—'}</dd></div>
-          <div><dt>Total app working set</dt><dd>{metrics == null ? '—' : formatMemory(metrics.workingSetMegabytes)}</dd></div>
-          <div><dt>Renderer private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.rendererPrivateMegabytes)}</dd></div>
-          <div><dt>Renderer V8 heap</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererHeapUsedMegabytes)} / ${formatMemory(metrics.rendererHeapTotalMegabytes)}`}</dd></div>
-          <div><dt>Blink allocated</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererBlinkAllocatedMegabytes)} / ${formatMemory(metrics.rendererBlinkTotalMegabytes)}`}</dd></div>
-          <div><dt>DOM nodes</dt><dd>{metrics?.rendererDomNodes.toLocaleString() ?? '—'}</dd></div>
-          <div><dt>Main private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.mainPrivateMegabytes)}</dd></div>
-          {metrics?.memoryByProcessType.map((entry) => (
-            <div key={entry.type}><dt>{entry.type} working set</dt><dd>{formatMemory(entry.megabytes)}</dd></div>
-          ))}
-          <div><dt>Measurement</dt><dd>All Electron processes</dd></div>
-          <div><dt>Last renderer exit</dt><dd>{metrics?.lastRendererTermination == null ? 'None recorded' : `${metrics.lastRendererTermination.reason} (${metrics.lastRendererTermination.exitCode})`}</dd></div>
-          <div><dt>Sample interval</dt><dd>3 seconds</dd></div>
-          <div><dt>When hidden</dt><dd>Paused</dd></div>
-        </dl>
+        <header>
+          <strong>Performance</strong>
+          <span className="performance-live">Live</span>
+        </header>
+
+        {/* The number the panel exists to answer leads, at a size the rows cannot
+            compete with, so the rest reads as its breakdown. */}
+        <div className="performance-headline">
+          <span className="performance-headline-value">
+            {metrics == null ? '—' : formatMemory(metrics.workingSetMegabytes)}
+          </span>
+          <span className="performance-headline-label">
+            Total working set
+            <small>{metrics == null ? 'Sampling…' : `${metrics.processCount} processes · ${metrics.production ? 'production' : 'development'}`}</small>
+          </span>
+        </div>
+
+        <section className="performance-group">
+          <h3>Memory</h3>
+          <dl>
+            <div><dt>Renderer private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.rendererPrivateMegabytes)}</dd></div>
+            <div><dt>Main private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.mainPrivateMegabytes)}</dd></div>
+            <div><dt>V8 heap</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererHeapUsedMegabytes)} / ${formatMemory(metrics.rendererHeapTotalMegabytes)}`}</dd></div>
+            <div><dt>Blink</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererBlinkAllocatedMegabytes)} / ${formatMemory(metrics.rendererBlinkTotalMegabytes)}`}</dd></div>
+          </dl>
+        </section>
+
+        <section className="performance-group">
+          <h3>Review</h3>
+          <dl>
+            <div><dt>Files loaded</dt><dd>{reviewMetrics.loadedItems.toLocaleString()}</dd></div>
+            <div><dt>Files hydrated</dt><dd>{reviewMetrics.hydratedFiles.toLocaleString()}</dd></div>
+            <div><dt>Workspace renders</dt><dd>{reviewMetrics.workspaceRenders.toLocaleString()}</dd></div>
+            <div><dt>Agent stream events</dt><dd>{reviewMetrics.agentStreamEvents.toLocaleString()}</dd></div>
+            <div><dt>DOM nodes</dt><dd>{metrics?.rendererDomNodes.toLocaleString() ?? '—'}</dd></div>
+          </dl>
+        </section>
+
+        {metrics != null && metrics.memoryByProcessType.length > 0 ? (
+          <section className="performance-group">
+            <h3>Processes</h3>
+            <dl>
+              {metrics.memoryByProcessType.map((entry) => (
+                <div key={entry.type}><dt>{entry.type}</dt><dd>{formatMemory(entry.megabytes)}</dd></div>
+              ))}
+            </dl>
+          </section>
+        ) : null}
+
+        <footer className="performance-footnote">
+          Every Electron process, sampled every 3s, paused while hidden.
+          {metrics?.lastRendererTermination == null
+            ? null
+            : ` Last renderer exit: ${metrics.lastRendererTermination.reason} (${metrics.lastRendererTermination.exitCode}).`}
+        </footer>
       </div>
     </details>
   )

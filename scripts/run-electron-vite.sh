@@ -9,9 +9,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 electron_version="$(bun -e 'console.log(require("./node_modules/electron/package.json").version)')"
-cache_base="$HOME/Library/Caches/BetterCodeDiff"
+cache_base="$HOME/Library/Caches/Horus"
 branded_dist="$cache_base/electron-$electron_version-v1"
-brand_marker="$branded_dist/.better-code-diff-brand"
+brand_marker="$branded_dist/.horus-brand"
 
 if [[ ! -f "$brand_marker" ]]; then
   mkdir -p "$cache_base"
@@ -23,14 +23,14 @@ if [[ ! -f "$brand_marker" ]]; then
   info_plist="$app_bundle/Contents/Info.plist"
   plist_buddy=/usr/libexec/PlistBuddy
 
-  "$plist_buddy" -c 'Set :CFBundleName Better Code Diff' "$info_plist"
-  if ! "$plist_buddy" -c 'Set :CFBundleDisplayName Better Code Diff' "$info_plist" 2>/dev/null; then
-    "$plist_buddy" -c 'Add :CFBundleDisplayName string Better Code Diff' "$info_plist"
+  "$plist_buddy" -c 'Set :CFBundleName Horus' "$info_plist"
+  if ! "$plist_buddy" -c 'Set :CFBundleDisplayName Horus' "$info_plist" 2>/dev/null; then
+    "$plist_buddy" -c 'Add :CFBundleDisplayName string Horus' "$info_plist"
   fi
-  "$plist_buddy" -c 'Set :CFBundleIdentifier com.fuadnafiz.bettercodediff.development' "$info_plist"
+  "$plist_buddy" -c 'Set :CFBundleIdentifier com.fuadnafiz.horus.development' "$info_plist"
 
   codesign --force --deep --sign - "$app_bundle" >/dev/null
-  touch "$staging_dir/dist/.better-code-diff-brand"
+  touch "$staging_dir/dist/.horus-brand"
   mv "$staging_dir/dist" "$branded_dist"
   trap - EXIT
   rmdir "$staging_dir"

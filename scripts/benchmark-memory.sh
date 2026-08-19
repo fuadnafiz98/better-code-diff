@@ -2,12 +2,12 @@
 set -euo pipefail
 
 sample_label="${1:-manual}"
-sample_count="${BETTER_CODE_DIFF_PERF_SAMPLES:-5}"
-sample_interval="${BETTER_CODE_DIFF_PERF_INTERVAL:-2}"
-root_pid="$(pgrep -x 'Better Code Diff' | head -n 1 || true)"
+sample_count="${HORUS_PERF_SAMPLES:-5}"
+sample_interval="${HORUS_PERF_INTERVAL:-2}"
+root_pid="$(pgrep -x 'Horus' | head -n 1 || true)"
 
 if [[ -z "$root_pid" ]]; then
-  echo "Better Code Diff is not running." >&2
+  echo "Horus is not running." >&2
   exit 1
 fi
 

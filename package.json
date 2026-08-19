@@ -1,37 +1,40 @@
 {
-  "name": "better-code-diff",
+  "name": "horus",
   "version": "0.1.0",
-  "description": "A diff-first Git explorer for macOS.",
-  "author": "Better Code Diff Contributors",
+  "description": "A diff-first Git explorer for desktop.",
+  "author": "Horus Contributors",
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
     "dev": "bash scripts/run-electron-vite.sh",
-    "dev:background": "BETTER_CODE_DIFF_BACKGROUND=1 bash scripts/run-electron-vite.sh",
+    "dev:background": "HORUS_BACKGROUND=1 bash scripts/run-electron-vite.sh",
     "build": "electron-vite build",
-    "icon:mac": "bash scripts/generate-macos-icon.sh",
-    "dist:mac": "bun run icon:mac && bun run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64",
+    "icon": "bash scripts/generate-macos-icon.sh && node scripts/generate-windows-icon.mjs",
+    "icon:mac": "bun run icon",
+    "dist:mac": "bun run icon && bun run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --arm64",
+    "dist:win": "bun run icon && bun run build && electron-builder --win nsis",
+    "dist:linux": "bun run icon && bun run build && electron-builder --linux AppImage deb",
     "install:mac": "bash scripts/install-macos-app.sh",
     "update:mac": "bun run dist:mac && bun run install:mac",
-    "open:mac": "open -a \"Better Code Diff\"",
+    "open:mac": "open -a \"Horus\"",
     "update:mac:open": "bun run update:mac && bun run open:mac",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "bun test",
     "perf:snapshot": "bash scripts/benchmark-memory.sh"
   },
+  "comment:dependencies": "electron-builder packs `dependencies` into the app verbatim. Only packages the main process resolves at runtime belong here: @vscode/ripgrep (spawned binary) and effect (dynamically imported when validating an agent request). Everything the renderer uses is bundled by Vite into out/renderer, so shipping it again would be dead weight — measured at ~35 MB.",
   "dependencies": {
+    "@vscode/ripgrep": "1.18.0",
+    "effect": "4.0.0-rc.110"
+  },
+  "devDependencies": {
     "@fontsource-variable/fira-code": "^5.3.0",
     "@fontsource-variable/inter": "^5.3.0",
     "@pierre/diffs": "1.3.5",
     "@pierre/icons": "0.7.1",
     "@pierre/theme": "1.1.0",
     "@pierre/trees": "1.0.0-beta.6",
-    "@vscode/ripgrep": "1.18.0",
-    "react": "19.2.8",
-    "react-dom": "19.2.8"
-  },
-  "devDependencies": {
     "@types/bun": "^1.3.14",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.0",
@@ -40,6 +43,8 @@
     "electron": "43.3.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "5.0.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "typescript": "^5.9.3",
     "vite": "7.3.6"
   },
@@ -50,8 +55,8 @@
     "esbuild"
   ],
   "build": {
-    "appId": "com.fuadnafiz.bettercodediff",
-    "productName": "Better Code Diff",
+    "appId": "com.fuadnafiz.horus",
+    "productName": "Horus",
     "directories": {
       "output": "release"
     },
@@ -71,9 +76,22 @@
         "zip"
       ]
     },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "icon": "build/icons",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
     "dmg": {
-      "title": "Better Code Diff ${version}",
-      "artifactName": "Better-Code-Diff-${version}-${arch}.${ext}"
+      "title": "Horus ${version}",
+      "artifactName": "Horus-${version}-${arch}.${ext}"
     }
   },
   "workspaces": [

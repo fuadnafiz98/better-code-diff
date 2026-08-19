@@ -16,8 +16,10 @@ export function formatReviewCommentsForAgent(entries: readonly ReviewSummaryEntr
   return `Please address these code review comments:\n\n${comments.join('\n\n')}`
 }
 
-export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntry[] }): React.JSX.Element {
+export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntry[] }): React.JSX.Element | null {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+
+  if (entries.length === 0) return null
 
   const copyComments = async (): Promise<void> => {
     try {
@@ -30,29 +32,27 @@ export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntr
   }
 
   return (
-    <section className={`review-summary ${entries.length === 0 ? 'empty' : ''}`} aria-label="Review comments summary">
+    <section className="review-summary" aria-label="Review comments summary">
       <header>
-        <div><IconCodeComments /><strong>Review comments</strong><span>{entries.length}</span></div>
-        {entries.length > 0 ? (
-          <button type="button" onClick={() => void copyComments()}>
-            {copyState === 'copied' ? <IconCheck /> : <IconCopy />}
+        <div><IconCodeComments /><strong>Review notes</strong><span>{entries.length}</span></div>
+        <button type="button" onClick={() => void copyComments()}>
+          <span className="icon-swap copy-icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
+            <IconCopy /><IconCheck />
+          </span>
+          <span className="review-copy-label">
             {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy for agent'}
-          </button>
-        ) : null}
+          </span>
+        </button>
       </header>
-      {entries.length === 0 ? (
-        <p>Select one or more lines, or use the gutter plus button, to add a comment.</p>
-      ) : (
-        <ol>
-          {entries.map(({ path, thread }) => (
-            <li key={thread.id}>
-              <div><code>{path}</code><span>{formatSelectedRange(thread.range)}</span>{thread.resolved ? <em>Resolved</em> : null}</div>
-              <p>{thread.body}</p>
-              {thread.replies.map((reply) => <blockquote key={reply.id}>{reply.body}</blockquote>)}
-            </li>
-          ))}
-        </ol>
-      )}
+      <ol>
+        {entries.map(({ path, thread }) => (
+          <li key={thread.id}>
+            <div><code>{path}</code><span>{formatSelectedRange(thread.range)}</span>{thread.resolved ? <em>Resolved</em> : null}</div>
+            <p>{thread.body}</p>
+            {thread.replies.map((reply) => <blockquote key={reply.id}>{reply.body}</blockquote>)}
+          </li>
+        ))}
+      </ol>
     </section>
   )
 }

@@ -15,12 +15,12 @@ mkdir -p "$project_dir/build"
 rm -rf "$iconset_dir"
 mkdir -p "$iconset_dir"
 
-xcrun swift "$project_dir/scripts/render-macos-icon.swift" "$source_icon" "$rendered_icon"
+cp "$source_icon" "$rendered_icon"
 
 for size in 16 32 128 256 512; do
   double_size=$((size * 2))
-  sips -z "$size" "$size" "$rendered_icon" --out "$iconset_dir/icon_${size}x${size}.png" >/dev/null
-  sips -z "$double_size" "$double_size" "$rendered_icon" --out "$iconset_dir/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$size" "$size" "$source_icon" --out "$iconset_dir/icon_${size}x${size}.png" >/dev/null
+  sips -z "$double_size" "$double_size" "$source_icon" --out "$iconset_dir/icon_${size}x${size}@2x.png" >/dev/null
 done
 
 iconutil --convert icns --output "$project_dir/build/icon.icns" "$iconset_dir"

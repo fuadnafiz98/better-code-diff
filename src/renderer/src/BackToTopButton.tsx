@@ -15,7 +15,6 @@ export function BackToTopButton({ visible, onClick }: BackToTopButtonProps): Rea
       onClick={onClick}
       aria-hidden={!visible}
       tabIndex={visible ? 0 : -1}
-      title="Back to top"
     >
       <IconChevron aria-hidden="true" />
       <span>Back to top</span>

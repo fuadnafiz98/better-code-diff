@@ -33,13 +33,46 @@ export const KEYBINDING_COMMANDS: ReadonlyArray<{
   { command: 'toggleWordWrap', label: 'Toggle word wrap', description: 'Wrap or scroll long code lines.' },
   { command: 'toggleFoldUnchanged', label: 'Toggle context folding', description: 'Fold or expand unchanged diff regions.' },
   { command: 'toggleMultiFile', label: 'Toggle review view', description: 'Switch between file and multi-file review.' },
-  { command: 'goToFile', label: 'Go to file', description: 'Focus file search.' },
-  { command: 'searchContent', label: 'Search contents', description: 'Focus repository content search.' },
+  { command: 'goToFile', label: 'Search repository', description: 'Search file names and repository content together.' },
+  { command: 'searchContent', label: 'Search repository (alternate)', description: 'Open the same unified search with the code-search shortcut.' },
   { command: 'openFolder', label: 'Open folder', description: 'Open the macOS folder picker.' },
   { command: 'openSettings', label: 'Open settings', description: 'Open application settings.' }
 ]
 
 const MODIFIER_CODES = new Set(['AltLeft', 'AltRight', 'ControlLeft', 'ControlRight', 'MetaLeft', 'MetaRight', 'ShiftLeft', 'ShiftRight'])
+
+export type ReviewCommand = 'nextReviewFile' | 'previousReviewFile' | 'toggleReviewViewed' | 'toggleReviewCollapsed'
+
+export const REVIEW_KEYBINDINGS: ReadonlyArray<{ code: string; command: ReviewCommand; key: string; label: string }> = [
+  { code: 'BracketRight', command: 'nextReviewFile', key: ']', label: 'Next file in review' },
+  { code: 'BracketLeft', command: 'previousReviewFile', key: '[', label: 'Previous file in review' },
+  { code: 'KeyV', command: 'toggleReviewViewed', key: 'V', label: 'Toggle viewed on the current file' },
+  { code: 'KeyC', command: 'toggleReviewCollapsed', key: 'C', label: 'Collapse or expand the current file' }
+]
+
+const TYPING_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT'])
+
+export function isTypingElement(element: Element | null): boolean {
+  if (element == null) return false
+  if (TYPING_TAGS.has(element.tagName)) return true
+  return (element as HTMLElement).isContentEditable === true
+}
+
+// Review comment fields live inside the diff shadow roots, so the focused element
+// has to be resolved through every nested root before the guard can trust it.
+export function deepActiveElement(root: DocumentOrShadowRoot): Element | null {
+  let active = root.activeElement
+  while (active?.shadowRoot?.activeElement != null) {
+    active = active.shadowRoot.activeElement
+  }
+  return active
+}
+
+export function reviewCommandFromEvent(event: KeyboardEvent, activeElement: Element | null): ReviewCommand | null {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return null
+  if (isTypingElement(activeElement)) return null
+  return REVIEW_KEYBINDINGS.find((binding) => binding.code === event.code)?.command ?? null
+}
 
 export function keybindingFromEvent(event: KeyboardEvent): string | null {
   if (MODIFIER_CODES.has(event.code)) return null

@@ -1,8 +1,8 @@
 import {
   forwardRef,
   memo,
-  useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState
 } from 'react'
@@ -48,10 +48,16 @@ function CommandPalette({
 }: CommandPaletteProps): React.JSX.Element {
   const [query, setQuery] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const selector = parsePullRequestSelector(query)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current
+    if (dialog != null && !dialog.open) dialog.showModal()
     inputRef.current?.focus()
+    return () => {
+      if (dialog?.open) dialog.close()
+    }
   }, [])
 
   const displayPullRequest = (): void => {
@@ -61,7 +67,15 @@ function CommandPalette({
   }
 
   return (
-    <dialog className="command-palette-layer" open aria-labelledby="command-palette-title">
+    <dialog
+      ref={dialogRef}
+      className="command-palette-layer"
+      aria-labelledby="command-palette-title"
+      onCancel={(event) => {
+        event.preventDefault()
+        onClose()
+      }}
+    >
       <section className="command-palette">
         <form onSubmit={(event) => {
           event.preventDefault()
@@ -124,10 +138,21 @@ export const CommandPaletteController = memo(forwardRef<CommandPaletteHandle, Co
   function CommandPaletteController(props, ref): React.JSX.Element | null {
     const [open, setOpen] = useState(false)
     const openRef = useRef(false)
+    const focusReturnRef = useRef<HTMLElement | null>(null)
 
     const setVisibility = (visible: boolean): void => {
+      if (visible && !openRef.current) {
+        focusReturnRef.current = document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null
+      }
       openRef.current = visible
       setOpen(visible)
+      if (!visible) {
+        const focusTarget = focusReturnRef.current
+        focusReturnRef.current = null
+        window.requestAnimationFrame(() => focusTarget?.focus())
+      }
     }
 
     useImperativeHandle(ref, () => ({

@@ -1,6 +1,30 @@
 {
   "version": 1,
   "skills": {
+    "animate": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/animate/SKILL.md",
+      "computedHash": "609e30351bf518b21a8cfe87cd1111554855527075d6563605bafe61963252f7"
+    },
+    "animate-expo": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/animate-expo/SKILL.md",
+      "computedHash": "c9eaf6603b97ca61b05c7561e1045b2f58b6d84cdf8d67565bff23a9ff94ce8a"
+    },
+    "animation-vocabulary": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/animation-vocabulary/SKILL.md",
+      "computedHash": "39319fc9a33c15be08666b3685f58666f042ff36bb902b7814c0834a5ba99df4"
+    },
+    "apple-design": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/apple-design/SKILL.md",
+      "computedHash": "8b94db67cb9edaad5f1501010804caa610131f1d2dfda0a27664b2e858deade3"
+    },
     "better-colors": {
       "source": "jakubkrehel/skills",
       "sourceType": "github",
@@ -37,6 +61,12 @@
       "skillPath": "skills/clean-code/SKILL.md",
       "computedHash": "325b30e3f9143cb51e09d5b33f2d8cbf44e8bfe75cf0dcb11b5cb733c9ce1e12"
     },
+    "deslop": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/deslop/SKILL.md",
+      "computedHash": "9764a64c05365175b61ea024add957b6dd871bef3331c9f4cd7b366fffa11b94"
+    },
     "electron-best-practices": {
       "source": "jwynia/agent-skills",
       "ref": "main",
@@ -44,11 +74,47 @@
       "skillPath": "skills/tech/development/tooling/electron-best-practices/SKILL.md",
       "computedHash": "e692cde3f6d9c4695a5c3d12ecddd69f407def5fdc5611ea8ee7b14215f7ab5a"
     },
+    "emil-design-eng": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/emil-design-eng/SKILL.md",
+      "computedHash": "41b0a4dc1a27164fe297845a6c6850a39e9242c42c9be999967fcee9df2c5974"
+    },
+    "find-animation-opportunities": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/find-animation-opportunities/SKILL.md",
+      "computedHash": "8fb8492eb8fbed1313cb430b5831d925d9b8964ca24f3c41a6244cbd1fd98732"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",
       "skillPath": "skills/find-skills/SKILL.md",
       "computedHash": "b146008599c31057cef1c145774cea5d5afb30e8f43fa802e47a4b461419aaaf"
+    },
+    "improve": {
+      "source": "shadcn/improve",
+      "sourceType": "github",
+      "skillPath": "skills/improve/SKILL.md",
+      "computedHash": "39a9358732dcff385e9e4d3e60b4547856f834e54a58b35e455aa9bd49928c13"
+    },
+    "improve-animations": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/improve-animations/SKILL.md",
+      "computedHash": "eeb219a407e325b687af88db25771cc3018e3148245604112f5ac6990b6fd79c"
+    },
+    "improve-react": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": "skills/improve-react/SKILL.md",
+      "computedHash": "ee6095448a511e2507528caae7ba91c5dc462464b603196c5b1931d4924a371a"
+    },
+    "improve-threejs": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": "skills/improve-threejs/SKILL.md",
+      "computedHash": "8649e0889daf3468b425a1ec843db02f68ea2d82165bc5bc9a8fcaa3daafa9f1"
     },
     "interface-review": {
       "source": "jakubkrehel/skills",
@@ -56,11 +122,35 @@
       "skillPath": "skills/interface-review/SKILL.md",
       "computedHash": "f495eafe40a20f8d051c8d50c8f60fe73c915871eddc118af3a4a63a317fec4b"
     },
+    "performance": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": "skills/performance/SKILL.md",
+      "computedHash": "e0d8128dd24c2c719ad48ae89becddabecf9a6d9c5ae9ee70cd5269fcd5a00e7"
+    },
+    "product-thinking": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/product-thinking/SKILL.md",
+      "computedHash": "6cc4fd3f6b820a0acb755fb341c07002e6bdc5850058aba2e475486ae50d6113"
+    },
+    "react-doctor": {
+      "source": "millionco/react-doctor",
+      "sourceType": "github",
+      "skillPath": "skills/react-doctor/SKILL.md",
+      "computedHash": "2a003f397a4a94fc032019bc7fd97e938b4e2fae995c96df8603790db168dcc7"
+    },
     "rethink-solution": {
       "source": "fuadnafiz98/skills",
       "sourceType": "github",
       "skillPath": "skills/rethink-solution/SKILL.md",
       "computedHash": "2c89efcfb881800a74c2152b2f865a9a88e1c47b2502c3b7956a9a049407aca9"
+    },
+    "review-animations": {
+      "source": "emilkowalski/skills",
+      "sourceType": "github",
+      "skillPath": "skills/review-animations/SKILL.md",
+      "computedHash": "b9f669af5ae280c19a592a94611520335a81de25c88f225bf60ae4b2d66c8c7c"
     },
     "review-comments": {
       "source": "fuadnafiz98/skills",

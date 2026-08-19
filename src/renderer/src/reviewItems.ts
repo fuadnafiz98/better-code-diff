@@ -1,4 +1,42 @@
-import type { CodeViewItem } from '@pierre/diffs'
+import { parseDiffFromFile, parsePatchFiles, type CodeViewItem } from '@pierre/diffs'
+
+import type { FileComparison } from '../../shared/contracts'
+
+export function reviewItemId(path: string): string {
+  return `review:${path}`
+}
+
+export function pathFromReviewItemId(id: string): string {
+  return id.startsWith('review:') ? id.slice('review:'.length) : id
+}
+
+export function createReviewItem<Metadata>(comparison: FileComparison): CodeViewItem<Metadata> | null {
+  if (comparison.binary || comparison.oversized) return null
+
+  if (comparison.mode === 'file' && comparison.newFile != null) {
+    return { id: reviewItemId(comparison.path), type: 'file', file: comparison.newFile }
+  }
+
+  if (comparison.oldFile == null && comparison.newFile == null) return null
+  return {
+    id: reviewItemId(comparison.path),
+    type: 'diff',
+    fileDiff: parseDiffFromFile(comparison.oldFile, comparison.newFile)
+  }
+}
+
+export function createPatchReviewItems<Metadata>(patch: string, version: string): CodeViewItem<Metadata>[] {
+  const seenPaths = new Set<string>()
+  const items: CodeViewItem<Metadata>[] = []
+  for (const parsedPatch of parsePatchFiles(patch, version)) {
+    for (const fileDiff of parsedPatch.files) {
+      if (seenPaths.has(fileDiff.name)) continue
+      seenPaths.add(fileDiff.name)
+      items.push({ id: reviewItemId(fileDiff.name), type: 'diff', fileDiff })
+    }
+  }
+  return items
+}
 
 export function mergeReviewItems<Metadata>(
   currentItems: readonly CodeViewItem<Metadata>[],
@@ -7,6 +45,20 @@ export function mergeReviewItems<Metadata>(
   const itemsById = new Map(currentItems.map((item) => [item.id, item]))
   for (const item of incomingItems) itemsById.set(item.id, item)
   return [...itemsById.values()]
+}
+
+export function orderReviewItems<Metadata>(
+  items: readonly CodeViewItem<Metadata>[],
+  orderedPaths: readonly string[]
+): CodeViewItem<Metadata>[] {
+  const itemsByPath = new Map(items.map((item) => [pathFromReviewItemId(item.id), item]))
+  const orderedItems = orderedPaths.flatMap((path) => {
+    const item = itemsByPath.get(path)
+    if (item == null) return []
+    itemsByPath.delete(path)
+    return [item]
+  })
+  return [...orderedItems, ...itemsByPath.values()]
 }
 
 export interface ReviewItemPosition {

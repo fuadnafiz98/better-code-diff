@@ -1,6 +1,6 @@
-# Better Code Diff
+# Horus
 
-Better Code Diff is a local-first macOS desktop application for exploring projects and reviewing code changes. Open a folder, browse its file tree, and inspect files in a focused diff surface. When the folder is a Git repository, the app compares the working tree with `HEAD` and shows Git status for each changed file.
+Horus is a local-first desktop application for exploring projects and reviewing code changes. Open a folder, browse its file tree, and inspect files in a focused diff surface. When the folder is a Git repository, the app compares the working tree with `HEAD` and shows Git status for each changed file.
 
 ## Features
 
@@ -30,7 +30,7 @@ Clone the repository, install dependencies, and start the development app:
 
 ```sh
 git clone <repository-url>
-cd better-code-diff
+cd horus
 bun install
 bun run dev
 ```
@@ -64,6 +64,10 @@ bun run typecheck && bun test && bun run build
 | `Command+O` | Open a folder |
 | `Command+P` | Go to file |
 | `Command+Shift+F` | Search file contents |
+| `]` | Next file in multi-file review |
+| `[` | Previous file in multi-file review |
+| `V` | Toggle viewed on the current review file |
+| `C` | Collapse or expand the current review file |
 
 ## Project structure
 

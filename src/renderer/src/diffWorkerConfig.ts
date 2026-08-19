@@ -1,4 +1,8 @@
-export const DIFF_WORKER_COUNT = 1
+// Measured: shrinking the pool did not reduce resident memory (grammars load per
+// language in use, not per worker), so the pool is sized for highlight latency.
+export const DIFF_WORKER_COUNT = Math.min(4, Math.max(2, (navigator.hardwareConcurrency ?? 4) - 2))
+
+export const COMPARISON_FETCH_CONCURRENCY = 4
 
 export const DIFF_WORKER_POOL_OPTIONS = {
   poolSize: DIFF_WORKER_COUNT,

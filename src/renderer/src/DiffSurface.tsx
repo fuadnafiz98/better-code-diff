@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
 import type { DiffLineAnnotation, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
 import { File, MultiFileDiff, useVirtualizer, Virtualizer } from '@pierre/diffs/react'
 import {
@@ -11,7 +11,10 @@ import {
 
 import type { FileComparison } from '../../shared/contracts'
 import type { DiffStyle } from './AppView'
+import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
 import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
+import { SPLIT_DIFF_RESIZE_CSS, syncSplitDiffResizeLifecycle } from './splitDiffResize'
+import { createDiffAnnotation, createFileAnnotation } from './reviewAnnotations'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -39,16 +42,16 @@ const INTERACTION_CSS = `
 
   button {
     touch-action: manipulation;
-    transition: transform 100ms cubic-bezier(0.23, 1, 0.32, 1);
+    transition: transform 100ms cubic-bezier(0.23, 1, 0.32, 1), background-color 100ms cubic-bezier(0.23, 1, 0.32, 1);
   }
 
   button:active:not(:disabled) {
-    transform: scale(0.97);
+    transform: scale(0.96);
   }
 
   [data-separator="line-info-basic"] {
-    border-block: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgba(255, 255, 255, 0.035);
+    border-block: 1px solid var(--border);
+    background: var(--control-fill);
   }
 
   [data-separator-wrapper] {
@@ -60,27 +63,31 @@ const INTERACTION_CSS = `
     corner-shape: squircle !important;
     clip-path: polygon(18% 0, 82% 0, 91% 3%, 97% 9%, 100% 18%, 100% 82%, 97% 91%, 91% 97%, 82% 100%, 18% 100%, 9% 97%, 3% 91%, 0 82%, 0 18%, 3% 9%, 9% 3%) !important;
     cursor: pointer;
-    color: rgba(231, 232, 235, 0.72);
+    color: var(--text-secondary);
   }
 
   [data-expand-button]:hover {
-    background: rgba(120, 169, 255, 0.14);
-    color: #a9c9ff;
+    background: var(--accent-soft);
+    color: var(--path-text);
   }
 
   [data-unmodified-lines] {
-    color: rgba(179, 182, 189, 0.78);
+    color: var(--muted);
     font-family: var(--diffs-header-font-family);
     font-size: 11px;
   }
 
   ${DRAG_SELECTION_CSS}
+  ${CENTERED_COLLAPSED_SEPARATOR_CSS}
+  ${SPLIT_DIFF_RESIZE_CSS}
 `
 interface DiffSurfaceProps {
   comparison: FileComparison | null
   loading: boolean
   diffStyle: DiffStyle
   preferences: AppPreferences
+  threadsByPath: Record<string, ReviewThread[]>
+  setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>
 }
 
 function VirtualizedBackToTop(): React.JSX.Element {
@@ -106,13 +113,12 @@ function VirtualizedBackToTop(): React.JSX.Element {
   )
 }
 
-function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfaceProps): React.JSX.Element {
+function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPath, setThreadsByPath }: DiffSurfaceProps): React.JSX.Element {
   const [reviewCursor, setReviewCursor] = useState<{
     path: string | undefined
     selectedLines: SelectedLineRange | null
     draftRange: SelectedLineRange | null
   }>({ path: undefined, selectedLines: null, draftRange: null })
-  const [threadsByPath, setThreadsByPath] = useState<Record<string, ReviewThread[]>>({})
 
   const comparisonPath = comparison?.path
   const selectedLines = reviewCursor.path === comparisonPath ? reviewCursor.selectedLines : null
@@ -149,7 +155,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
       [comparisonPath]: [...(current[comparisonPath] ?? []), thread]
     }))
     setReviewCursor({ path: comparisonPath, selectedLines: null, draftRange: null })
-  }, [comparisonPath, draftRange])
+  }, [comparisonPath, draftRange, setThreadsByPath])
 
   const updateThread = useCallback((threadId: string, update: (thread: ReviewThread) => ReviewThread | null) => {
     if (comparisonPath == null) return
@@ -161,7 +167,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
         return nextThread == null ? [] : [nextThread]
       })
     }))
-  }, [comparisonPath])
+  }, [comparisonPath, setThreadsByPath])
 
   const renderReviewAnnotation = useCallback((metadata: ReviewAnnotationMetadata): React.JSX.Element => {
     if (metadata.kind === 'draft') {
@@ -173,6 +179,9 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
         />
       )
     }
+    // The single-file view keeps its direct comment flow, so no selection action
+    // bar is produced here; remote threads belong to the multi-file review.
+    if (metadata.kind === 'remote' || metadata.kind === 'selection') return <></>
     const { thread } = metadata
     return (
       <ReviewThreadCard
@@ -193,19 +202,15 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
     ...(draftRange == null ? [] : [{ kind: 'draft' as const, range: draftRange }])
   ], [draftRange, threads])
 
-  const fileAnnotations = useMemo<LineAnnotation<ReviewAnnotationMetadata>[]>(() =>
-    reviewMetadata.flatMap((metadata): LineAnnotation<ReviewAnnotationMetadata>[] =>
-      metadata.kind === 'draft'
-        ? [{ lineNumber: metadata.range.start, metadata }]
-        : [{ lineNumber: metadata.thread.lineNumber, metadata }]
-    ), [reviewMetadata])
+  const fileAnnotations = useMemo<LineAnnotation<ReviewAnnotationMetadata>[]>(
+    () => reviewMetadata.map(createFileAnnotation),
+    [reviewMetadata]
+  )
 
-  const diffAnnotations = useMemo<DiffLineAnnotation<ReviewAnnotationMetadata>[]>(() =>
-    reviewMetadata.flatMap((metadata): DiffLineAnnotation<ReviewAnnotationMetadata>[] =>
-      metadata.kind === 'draft'
-        ? [{ lineNumber: metadata.range.start, side: metadata.range.side ?? 'additions', metadata }]
-        : [{ lineNumber: metadata.thread.lineNumber, side: metadata.thread.side ?? 'additions', metadata }]
-    ), [reviewMetadata])
+  const diffAnnotations = useMemo<DiffLineAnnotation<ReviewAnnotationMetadata>[]>(
+    () => reviewMetadata.map(createDiffAnnotation),
+    [reviewMetadata]
+  )
 
   const interactionOptions = useMemo(() => ({
     enableLineSelection: DIFF_OPTIONS.enableLineSelection,
@@ -221,6 +226,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
     onGutterUtilityClick: beginComment,
     onPostRender: (node: HTMLElement, _instance: unknown, phase: string) => {
       syncDragGuideLifecycle(node, phase, beginComment)
+      syncSplitDiffResizeLifecycle(node, phase)
     }
   }), [beginComment, comparisonPath])
 
@@ -301,6 +307,22 @@ function DiffContents({ comparison, loading, diffStyle, preferences }: DiffSurfa
 const MemoizedDiffContents = memo(DiffContents)
 
 const DiffSurface = memo(function DiffSurface(props: DiffSurfaceProps): React.JSX.Element {
+  const [staleComparison, setStaleComparison] = useState<FileComparison | null>(null)
+  if (props.comparison != null && props.comparison !== staleComparison) {
+    setStaleComparison(props.comparison)
+  }
+  // Keep the previous file rendered and dimmed while the next one loads, so
+  // file-to-file navigation never flashes to a blank spinner.
+  if (props.loading && staleComparison != null) {
+    return (
+      <div className="diff-stale-host">
+        <div className="diff-loading-bar" aria-hidden="true" />
+        <div className="diff-stale">
+          <MemoizedDiffContents {...props} comparison={staleComparison} loading={false} />
+        </div>
+      </div>
+    )
+  }
   return <MemoizedDiffContents {...props} />
 })
 

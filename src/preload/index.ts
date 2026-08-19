@@ -1,6 +1,12 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-import type { FindInPageResult, PerformanceMetrics, RepositoryApi, RepositoryChangeEvent } from '../shared/contracts.js'
+import type {
+  AgentStreamEvent,
+  FindInPageResult,
+  PerformanceMetrics,
+  RepositoryApi,
+  RepositoryChangeEvent
+} from '../shared/contracts.js'
 import { IPC_CHANNELS } from '../shared/contracts.js'
 
 const repositoryApi: RepositoryApi = {
@@ -11,7 +17,17 @@ const repositoryApi: RepositoryApi = {
   getComparison: (path) => ipcRenderer.invoke(IPC_CHANNELS.getComparison, path),
   getWorkingTreePatch: (paths) => ipcRenderer.invoke(IPC_CHANNELS.getWorkingTreePatch, paths),
   searchContent: (query) => ipcRenderer.invoke(IPC_CHANNELS.searchContent, query),
+  cancelContentSearch: () => ipcRenderer.send(IPC_CHANNELS.cancelContentSearch),
   getGitIntegration: () => ipcRenderer.invoke(IPC_CHANNELS.getGitIntegration),
+  getPullRequestInbox: () => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestInbox),
+  getPullRequestConversation: (selector: number | string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.getPullRequestConversation, selector),
+  replyToPullRequestThread: (threadId: string, body: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.replyToPullRequestThread, threadId, body),
+  setPullRequestThreadResolved: (threadId: string, resolved: boolean) =>
+    ipcRenderer.invoke(IPC_CHANNELS.setPullRequestThreadResolved, threadId, resolved),
+  mergePullRequest: (selector, strategy) => ipcRenderer.invoke(IPC_CHANNELS.mergePullRequest, selector, strategy),
+  markPullRequestReady: (selector) => ipcRenderer.invoke(IPC_CHANNELS.markPullRequestReady, selector),
   switchBranch: (name) => ipcRenderer.invoke(IPC_CHANNELS.switchBranch, name),
   getLocalBranchReview: (baseRef, headRef) => ipcRenderer.invoke(IPC_CHANNELS.getLocalBranchReview, baseRef, headRef),
   getCommitReview: (oid) => ipcRenderer.invoke(IPC_CHANNELS.getCommitReview, oid),
@@ -21,6 +37,15 @@ const repositoryApi: RepositoryApi = {
   getPullRequestReview: (selector) => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestReview, selector),
   checkoutPullRequest: (number) => ipcRenderer.invoke(IPC_CHANNELS.checkoutPullRequest, number),
   submitPullRequestReview: (selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, commitId, event, body, comments),
+  askAgent: (request) => ipcRenderer.invoke(IPC_CHANNELS.askAgent, request),
+  cancelAgent: (id) => ipcRenderer.invoke(IPC_CHANNELS.cancelAgent, id),
+  onAgentEvent: (listener) => {
+    const handler = (_event: unknown, agentEvent: AgentStreamEvent): void => listener(agentEvent)
+    ipcRenderer.on(IPC_CHANNELS.agentEvent, handler)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.agentEvent, handler)
+    }
+  },
   getPerformanceMetrics: async () => {
     const [mainMetrics, rendererMemory] = await Promise.all([
       ipcRenderer.invoke(IPC_CHANNELS.getPerformanceMetrics) as Promise<Omit<PerformanceMetrics,

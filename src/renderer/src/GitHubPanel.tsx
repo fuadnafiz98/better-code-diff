@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   IconBraces,
   IconBranch,
+  IconApproved,
   IconBrandGithub,
   IconCodeFolder,
   IconInReview,
+  IconMerged,
   IconRefresh,
   IconSwitch,
   IconX
@@ -12,18 +14,24 @@ import {
 
 import type {
   GitIntegrationSnapshot,
+  PullRequestMergeStrategy,
+  PullRequestInboxSnapshot,
   PullRequestSummary
 } from '../../shared/contracts'
 import { parsePullRequestSelector } from './pullRequestSelector'
+import { SelectControl } from './SelectControl'
+import type { RepositoryPanelTab } from './useGitWorkflow'
 
 const shortDateFormatter = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
 
 interface RepositoryPanelProps {
+  initialTab: RepositoryPanelTab
   integration: GitIntegrationSnapshot | null
   loading: boolean
+  inbox: PullRequestInboxSnapshot | null
+  loadingInbox: boolean
   actionKey: string | null
   onClose(): void
-  onReload(): void
   onSwitchBranch(name: string): void
   onReviewLocalBranch(baseRef: string, headRef: string): void
   onReviewCommit(oid: string): void
@@ -31,11 +39,11 @@ interface RepositoryPanelProps {
   onPull(): void
   onPush(): void
   onReview(pullRequest: PullRequestSummary): void
+  onMerge(pullRequest: PullRequestSummary, strategy: PullRequestMergeStrategy): void
+  onMarkReady(pullRequest: PullRequestSummary): void
   onOpenPullRequest(selector: number | string): void
   onCheckout(pullRequest: PullRequestSummary): void
 }
-
-type PanelTab = 'history' | 'branches' | 'remotes' | 'pull-requests'
 
 function formatRelativeDate(value: string): string {
   const timestamp = Date.parse(value)
@@ -47,17 +55,19 @@ function formatRelativeDate(value: string): string {
   return shortDateFormatter.format(timestamp)
 }
 
-function formatDecision(decision: string | null): string | null {
-  if (decision == null || decision === '') return null
-  return decision.toLowerCase().replaceAll('_', ' ')
+function ActionIcon({ busy, children }: { busy: boolean; children?: React.ReactNode }): React.JSX.Element | null {
+  const icon = busy ? <IconRefresh className="spin" /> : children
+  return icon == null ? null : <span className="action-icon-slot">{icon}</span>
 }
 
 export function RepositoryPanel({
+  initialTab,
   integration,
   loading,
+  inbox,
+  loadingInbox,
   actionKey,
   onClose,
-  onReload,
   onSwitchBranch,
   onReviewLocalBranch,
   onReviewCommit,
@@ -65,15 +75,28 @@ export function RepositoryPanel({
   onPull,
   onPush,
   onReview,
+  onMerge,
+  onMarkReady,
   onOpenPullRequest,
   onCheckout
 }: RepositoryPanelProps): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement>(null)
-  const [tab, setTab] = useState<PanelTab>('history')
+  const [tab, setTab] = useState<RepositoryPanelTab>(initialTab)
   const [selectedBaseBranch, setSelectedBaseBranch] = useState('')
   const [pullRequestQuery, setPullRequestQuery] = useState('')
   const [pullRequestQueryError, setPullRequestQueryError] = useState<string | null>(null)
   const currentBranch = integration?.branches.find((branch) => branch.current)?.name ?? null
+  const populatedInboxSections = inbox?.available
+    ? inbox.sections.filter((section) => section.pullRequests.length > 0)
+    : []
+  const inboxPullRequests = populatedInboxSections.flatMap((section) => section.pullRequests)
+  const visiblePullRequests = inbox?.available && inboxPullRequests.length > 0
+    ? inboxPullRequests
+    : integration?.pullRequests ?? []
+  const pullRequestsByNumber = useMemo(
+    () => new Map(integration?.pullRequests.map((pullRequest) => [pullRequest.number, pullRequest]) ?? []),
+    [integration?.pullRequests]
+  )
   const baseBranch = selectedBaseBranch || integration?.defaultBranch || currentBranch || ''
 
   useEffect(() => {
@@ -93,10 +116,22 @@ export function RepositoryPanel({
   }
 
   return (
-    <dialog ref={dialogRef} className="git-panel-layer" aria-labelledby="git-panel-title" onCancel={(event) => {
-      event.preventDefault()
-      onClose()
-    }}>
+    <dialog
+      ref={dialogRef}
+      className="git-panel-layer"
+      aria-labelledby="git-panel-title"
+      onCancel={(event) => {
+        event.preventDefault()
+        onClose()
+      }}
+    >
+      <button
+        className="git-panel-dismiss-area"
+        type="button"
+        tabIndex={-1}
+        aria-label="Close repository panel"
+        onClick={onClose}
+      />
       <aside className="git-panel">
         <header className="git-panel-header">
           <div>
@@ -104,9 +139,6 @@ export function RepositoryPanel({
             <span><strong id="git-panel-title">Repository</strong><small>Local Git · GitHub optional</small></span>
           </div>
           <div>
-            <button type="button" onClick={onReload} disabled={loading} aria-label="Reload Git data" title="Reload Git Data">
-              <IconRefresh className={loading ? 'spin' : undefined} />
-            </button>
             <button type="button" onClick={onClose} aria-label="Close repository panel" title="Close Repository Panel"><IconX /></button>
           </div>
         </header>
@@ -115,9 +147,9 @@ export function RepositoryPanel({
           <span>{integration?.behind ?? 0} behind</span>
           <span>{integration?.ahead ?? 0} ahead</span>
           <div>
-            <button type="button" onClick={onFetch} disabled={actionKey != null}>{actionKey === 'sync:fetch' ? <IconRefresh className="spin" /> : null}Fetch</button>
-            <button type="button" onClick={onPull} disabled={actionKey != null}>{actionKey === 'sync:pull' ? <IconRefresh className="spin" /> : null}Pull</button>
-            <button type="button" onClick={onPush} disabled={actionKey != null}>{actionKey === 'sync:push' ? <IconRefresh className="spin" /> : null}Push</button>
+            <button type="button" onClick={onFetch} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:fetch'} />Fetch</button>
+            <button type="button" onClick={onPull} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:pull'} />Pull</button>
+            <button type="button" onClick={onPush} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:push'} />Push</button>
           </div>
         </div>
 
@@ -132,7 +164,7 @@ export function RepositoryPanel({
             <IconCodeFolder />Remotes <span>{integration?.remotes.length ?? 0}</span>
           </button>
           <button type="button" role="tab" aria-selected={tab === 'pull-requests'} className={tab === 'pull-requests' ? 'active' : undefined} onClick={() => setTab('pull-requests')}>
-            <IconBrandGithub />Pull requests <span>{integration?.pullRequests.length ?? 0}</span>
+            <IconBrandGithub />Pull requests <span>{visiblePullRequests.length}</span>
           </button>
         </div>
 
@@ -185,50 +217,72 @@ export function RepositoryPanel({
                 </div>
                 {pullRequestQueryError != null ? <span id="pr-open-error" role="alert">{pullRequestQueryError}</span> : null}
               </form>
-              {integration?.githubAvailable === false ? (
-                <div className="git-panel-notice"><strong>GitHub is unavailable</strong><span>{integration.githubMessage}</span></div>
-              ) : integration?.pullRequests.length === 0 ? (
-                <div className="git-panel-state"><strong>No pull requests found</strong><span>Enter a PR number or URL above to open one directly.</span></div>
-              ) : integration?.pullRequests.map((pullRequest) => {
-                const reviewKey = `review:${pullRequest.number}`
-                const checkoutKey = `checkout:${pullRequest.number}`
-                const decision = formatDecision(pullRequest.reviewDecision)
-                return (
-                  <article className="pr-row" key={pullRequest.number}>
-                    <div className="pr-row-title">
-                      <span>#{pullRequest.number}</span>
-                      <strong>{pullRequest.title}</strong>
-                      <em className={`pr-state state-${pullRequest.state.toLowerCase()}`}>{pullRequest.state}</em>
-                      {pullRequest.isDraft ? <em>Draft</em> : null}
-                    </div>
-                    <div className="pr-row-meta">
-                      <span>{pullRequest.author.login}</span>
-                      <span>{pullRequest.headRefName} → {pullRequest.baseRefName}</span>
-                      <span>{formatRelativeDate(pullRequest.updatedAt)}</span>
-                    </div>
-                    <div className="pr-row-footer">
-                      <span className="diff-stat"><b>+{pullRequest.additions}</b><i>−{pullRequest.deletions}</i><span>{pullRequest.changedFiles} files</span></span>
-                      {decision != null ? <span className={`review-decision decision-${pullRequest.reviewDecision?.toLowerCase()}`}>{decision}</span> : null}
+              <div className="pr-inbox" aria-label="Pull requests">
+                <div className="pr-inbox-heading">
+                  <strong>{inbox?.available && inboxPullRequests.length > 0 ? 'Inbox' : 'Repository pull requests'}</strong>
+                  <span>{visiblePullRequests.length}</span>
+                  {loadingInbox ? <IconRefresh className="spin" /> : null}
+                </div>
+                {visiblePullRequests.length === 0 && loadingInbox ? null : visiblePullRequests.length === 0 ? (
+                  <div className="git-panel-state"><strong>Inbox zero</strong><span>Nothing needs your review right now.</span></div>
+                ) : visiblePullRequests.map((pullRequest) => {
+                  const details = pullRequestsByNumber.get(pullRequest.number)
+                  const reviewKey = `review:${pullRequest.number}`
+                  return (
+                    <article className="pr-row compact" key={pullRequest.number}>
+                      <div className="pr-row-title">
+                        <span>#{pullRequest.number}</span>
+                        <strong>{pullRequest.title}</strong>
+                        {pullRequest.state.toLowerCase() === 'open' ? null : (
+                          <em className={`pr-state state-${pullRequest.state.toLowerCase()}`}>{pullRequest.state}</em>
+                        )}
+                        {pullRequest.isDraft ? <em>Draft</em> : null}
+                      </div>
+                      <div className="pr-row-meta">
+                        <span>{pullRequest.author.login}</span>
+                        {details != null ? <span>{details.headRefName} → {details.baseRefName}</span> : null}
+                        <span>{formatRelativeDate(pullRequest.updatedAt)}</span>
+                      </div>
                       <div className="pr-row-actions">
-                        <button type="button" onClick={() => onCheckout(pullRequest)} disabled={actionKey != null}>
-                          {actionKey === checkoutKey ? <IconRefresh className="spin" /> : <IconBranch />}Checkout
-                        </button>
-                        <button className="primary" type="button" onClick={() => onReview(pullRequest)} disabled={actionKey != null}>
-                          {actionKey === reviewKey ? <IconRefresh className="spin" /> : <IconInReview />}Review Changes
+                        {details != null ? <button type="button" onClick={() => onCheckout(details)} disabled={actionKey != null}
+                          aria-label={`Checkout pull request ${pullRequest.number}`} title="Checkout">
+                          <ActionIcon busy={actionKey === `checkout:${pullRequest.number}`}><IconBranch /></ActionIcon>
+                        </button> : null}
+                        {details?.isDraft && details.state.toLowerCase() === 'open' ? (
+                          <button type="button" onClick={() => onMarkReady(details)} disabled={actionKey != null}
+                            aria-label={`Mark pull request ${pullRequest.number} ready`} title="Mark ready">
+                            <ActionIcon busy={actionKey === `ready:${pullRequest.number}`}><IconApproved /></ActionIcon>
+                          </button>
+                        ) : null}
+                        {details?.state.toLowerCase() === 'open' && !details.isDraft ? (
+                          <button type="button" onClick={() => onMerge(details, 'squash')} disabled={actionKey != null}
+                            aria-label={`Squash and merge pull request ${pullRequest.number}`} title="Squash and merge">
+                            <ActionIcon busy={actionKey === `merge:${pullRequest.number}`}><IconMerged /></ActionIcon>
+                          </button>
+                        ) : null}
+                        <button className="primary" type="button"
+                          onClick={() => details == null ? onOpenPullRequest(pullRequest.number) : onReview(details)}
+                          disabled={actionKey != null} aria-label={`Review pull request ${pullRequest.number}`} title="Review changes">
+                          {actionKey === reviewKey ? <IconRefresh className="spin" /> : <IconInReview />}
                         </button>
                       </div>
-                    </div>
-                  </article>
-                )
-              })}
+                    </article>
+                  )
+                })}
+              </div>
+              {integration?.githubAvailable === false ? (
+                <div className="git-panel-notice"><strong>GitHub is unavailable</strong><span>{integration.githubMessage}</span></div>
+              ) : null}
             </section>
           ) : tab === 'branches' ? (
             <section className="branch-list" aria-label="Local branches">
               <div className="branch-compare-base">
                 <label htmlFor="branch-base">Comparison base</label>
-                <select id="branch-base" value={baseBranch} onChange={(event) => setSelectedBaseBranch(event.target.value)}>
-                  {integration?.branches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}</option>)}
-                </select>
+                <SelectControl>
+                  <select id="branch-base" value={baseBranch} onChange={(event) => setSelectedBaseBranch(event.target.value)}>
+                    {integration?.branches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}</option>)}
+                  </select>
+                </SelectControl>
               </div>
               {integration?.branches.map((branch) => {
                 const branchKey = `branch:${branch.name}`
@@ -240,7 +294,7 @@ export function RepositoryPanel({
                     {branch.current ? <em>Current</em> : null}
                     <div>
                       {branch.name !== baseBranch ? <button type="button" onClick={() => onReviewLocalBranch(baseBranch, branch.name)} disabled={actionKey != null}>{actionKey === compareKey ? <IconRefresh className="spin" /> : <IconInReview />}Compare</button> : null}
-                      {!branch.current ? <button type="button" onClick={() => onSwitchBranch(branch.name)} disabled={actionKey != null}>{actionKey === branchKey ? <IconRefresh className="spin" /> : null}Switch</button> : null}
+                      {!branch.current ? <button type="button" onClick={() => onSwitchBranch(branch.name)} disabled={actionKey != null}><ActionIcon busy={actionKey === branchKey} />Switch</button> : null}
                     </div>
                   </article>
                 )

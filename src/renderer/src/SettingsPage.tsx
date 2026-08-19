@@ -1,6 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type CSSProperties } from 'react'
 import { flushSync } from 'react-dom'
 import { IconBraces, IconFileCode, IconGear, IconReload, IconX } from '@pierre/icons'
+
+import { SelectControl } from './SelectControl'
 
 import {
   CODE_FONTS,
@@ -74,7 +76,7 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
           <div className="settings-heading">
             <h1>{activeSection === 'appearance' ? 'Appearance' : activeSection === 'editor' ? 'Editor' : 'Keyboard'}</h1>
             <p>{activeSection === 'appearance'
-              ? 'Choose how Better Code Diff looks.'
+              ? 'Choose how Horus looks.'
               : activeSection === 'editor'
                 ? 'Configure code rendering and comparison behavior.'
                 : 'Customize shortcuts for frequent actions.'}</p>
@@ -101,9 +103,11 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
               <section className="settings-block settings-list-block">
                 <div className="settings-block-heading"><h2>Interface</h2></div>
                 <SettingRow label="Interface font" description="Used by the title bar, explorer, settings, and controls.">
-                  <select name="interface-font" aria-label="Interface font" value={preferences.interfaceFont} onChange={(event) => update('interfaceFont', event.target.value as InterfaceFont)}>
-                    {Object.entries(INTERFACE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
-                  </select>
+                  <SelectControl>
+                    <select name="interface-font" aria-label="Interface font" value={preferences.interfaceFont} onChange={(event) => update('interfaceFont', event.target.value as InterfaceFont)}>
+                      {Object.entries(INTERFACE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
+                    </select>
+                  </SelectControl>
                 </SettingRow>
               </section>
             </div>
@@ -118,16 +122,20 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
               <section className="settings-block settings-list-block">
                 <div className="settings-block-heading"><h2>Typography</h2></div>
                 <SettingRow label="Code font" description="Fira Code is bundled with the app and does not depend on a system installation.">
-                  <select name="code-font" aria-label="Code font" value={preferences.codeFont} onChange={(event) => update('codeFont', event.target.value as CodeFont)}>
-                    {Object.entries(CODE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
-                  </select>
+                  <SelectControl>
+                    <select name="code-font" aria-label="Code font" value={preferences.codeFont} onChange={(event) => update('codeFont', event.target.value as CodeFont)}>
+                      {Object.entries(CODE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
+                    </select>
+                  </SelectControl>
                 </SettingRow>
                 <SettingRow label="Font size" description={`${preferences.codeFontSize} pixels`}>
-                  <input name="code-font-size" aria-label="Code font size" type="range" min="10" max="20" step="1" value={preferences.codeFontSize} onChange={(event) => update('codeFontSize', Number(event.target.value))} />
+                  <RangeControl name="code-font-size" label="Code font size" min={10} max={20}
+                    value={preferences.codeFontSize} onChange={(value) => update('codeFontSize', value)} />
                   <output>{preferences.codeFontSize}</output>
                 </SettingRow>
                 <SettingRow label="Line height" description={`${preferences.codeLineHeight} pixels`}>
-                  <input name="code-line-height" aria-label="Code line height" type="range" min="16" max="32" step="1" value={preferences.codeLineHeight} onChange={(event) => update('codeLineHeight', Number(event.target.value))} />
+                  <RangeControl name="code-line-height" label="Code line height" min={16} max={32}
+                    value={preferences.codeLineHeight} onChange={(value) => update('codeLineHeight', value)} />
                   <output>{preferences.codeLineHeight}</output>
                 </SettingRow>
               </section>
@@ -233,6 +241,33 @@ function KeybindingRecorder({
         Reset
       </button>
     </div>
+  )
+}
+
+// Clearing the native appearance is what lets the thumb be a squircle, and it
+// also removes the platform fill, so the filled portion is handed to CSS as a
+// percentage instead.
+function RangeControl({ name, label, min, max, value, onChange }: {
+  name: string
+  label: string
+  min: number
+  max: number
+  value: number
+  onChange(value: number): void
+}): React.JSX.Element {
+  return (
+    <input
+      className="range-control"
+      name={name}
+      aria-label={label}
+      type="range"
+      min={min}
+      max={max}
+      step={1}
+      value={value}
+      style={{ '--range-progress': `${((value - min) / (max - min)) * 100}%` } as CSSProperties}
+      onChange={(event) => onChange(Number(event.target.value))}
+    />
   )
 }
 
