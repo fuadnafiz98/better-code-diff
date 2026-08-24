@@ -296,8 +296,12 @@ function registerIpcHandlers(): void {
     repository.pullCurrentBranch().then(trackSnapshot)
   )
   ipcMain.handle(IPC_CHANNELS.pushCurrentBranch, () => repository.pushCurrentBranch())
-  ipcMain.handle(IPC_CHANNELS.getPullRequestReview, (_event, selector: number | string) =>
-    repository.getPullRequestReview(selector)
+  ipcMain.handle(IPC_CHANNELS.getPullRequestReview, (event, selector: number | string) =>
+    // Streamed back page by page: a review of a few thousand files takes long
+    // enough to fetch that waiting for all of it reads as a hang.
+    repository.getPullRequestReview(selector, (progress) => {
+      if (!event.sender.isDestroyed()) event.sender.send(IPC_CHANNELS.pullRequestReviewProgress, progress)
+    })
   )
   ipcMain.handle(IPC_CHANNELS.checkoutPullRequest, (_event, number: number) =>
     repository.checkoutPullRequest(number).then(trackSnapshot)

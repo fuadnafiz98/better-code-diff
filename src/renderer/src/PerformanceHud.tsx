@@ -1,9 +1,22 @@
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 
 import type { PerformanceMetrics } from '../../shared/contracts'
 import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
+import {
+  buildMemorySparkline,
+  formatSpan,
+  formatTrendPerHour,
+  memoryTrendPerHour,
+  recordMemorySample,
+  type MemorySample
+} from './performanceHistory'
 
 const SAMPLE_INTERVAL_MS = 3_000
+const CHART_WIDTH = 252
+const CHART_HEIGHT = 46
+// A leak is a sustained climb, not a spike from opening one big review, so the
+// warning tone waits for a rate that would add a gigabyte over a working day.
+const LEAK_WARNING_MEGABYTES_PER_HOUR = 120
 
 function formatPercent(value: number | null): string {
   if (value == null || !Number.isFinite(value)) return '—'
@@ -19,6 +32,7 @@ function formatMemory(megabytes: number): string {
 export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element {
   const [metrics, setMetrics] = useState<PerformanceMetrics | null>(null)
   const [reviewMetrics, setReviewMetrics] = useState<ReviewMetrics>(getReviewMetrics)
+  const [history, setHistory] = useState<readonly MemorySample[]>([])
 
   useEffect(() => {
     const repository = window.repository
@@ -35,7 +49,14 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
       if (disposed || document.hidden) return
       try {
         const nextMetrics = await repository.getPerformanceMetrics()
-        if (!disposed) setMetrics(nextMetrics)
+        if (!disposed) {
+          setMetrics(nextMetrics)
+          setHistory([...recordMemorySample({
+            atMs: Date.now(),
+            workingSetMegabytes: nextMetrics.workingSetMegabytes,
+            rendererPrivateMegabytes: nextMetrics.rendererPrivateMegabytes
+          })])
+        }
       } catch {
         if (!disposed) setMetrics(null)
       } finally {
@@ -58,6 +79,11 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [])
+
+  const trendPerHour = useMemo(() => memoryTrendPerHour(history), [history])
+  const sparkline = useMemo(() => buildMemorySparkline(history, CHART_WIDTH, CHART_HEIGHT), [history])
+  const sessionSpanMs = (history[history.length - 1]?.atMs ?? 0) - (history[0]?.atMs ?? 0)
+  const leaking = trendPerHour != null && trendPerHour >= LEAK_WARNING_MEGABYTES_PER_HOUR
 
   const description = metrics == null
     ? 'Collecting application performance metrics'
@@ -90,6 +116,28 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
             <small>{metrics == null ? 'Sampling…' : `${metrics.processCount} processes · ${metrics.production ? 'production' : 'development'}`}</small>
           </span>
         </div>
+
+        {/* Working set over the session: the shape answers "is this leaking?",
+            which no single reading can. */}
+        <section className="performance-group performance-chart">
+          <h3>Memory over time<span className={`performance-trend ${leaking ? 'warning' : ''}`}>{formatTrendPerHour(trendPerHour)}</span></h3>
+          {sparkline == null ? (
+            <p className="performance-chart-empty">Sampling — the trend appears after a few minutes.</p>
+          ) : (
+            <>
+              <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} preserveAspectRatio="none" role="img"
+                aria-label={`Working set from ${formatMemory(sparkline.low)} to ${formatMemory(sparkline.high)} over ${formatSpan(sessionSpanMs)}, trending ${formatTrendPerHour(trendPerHour)}`}>
+                <path className="performance-chart-area" d={sparkline.area} />
+                <path className="performance-chart-line" d={sparkline.line} />
+              </svg>
+              <div className="performance-chart-axis">
+                <span>{formatMemory(sparkline.low)} low</span>
+                <span>{formatSpan(sessionSpanMs)}</span>
+                <span>{formatMemory(sparkline.high)} peak</span>
+              </div>
+            </>
+          )}
+        </section>
 
         <section className="performance-group">
           <h3>Memory</h3>

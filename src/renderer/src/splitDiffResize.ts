@@ -5,10 +5,6 @@ const KEYBOARD_STEP = 2
 const LARGE_KEYBOARD_STEP = 10
 
 export const SPLIT_DIFF_RESIZE_CSS = `
-  [data-diff-type="split"] {
-    position: relative;
-  }
-
   [data-diff-type="split"][data-overflow="scroll"] {
     grid-template-columns:
       minmax(0, var(--horus-split-before, 50fr))
@@ -24,17 +20,27 @@ export const SPLIT_DIFF_RESIZE_CSS = `
       minmax(0, var(--horus-split-after, 50fr));
   }
 
-  /* The handle rides the split grid itself, never the rendered code inside it:
-     mutating a pane's content subtree between the viewer's layout and measure
-     passes made its height accounting oscillate and scrolling snap backwards.
-     Placing it in a column with no row placement keeps the grid track for the
-     inline axis and the container's padding box for the block axis. */
+  /* Anchors, because the handle has nowhere legal to live inside the diff: the
+     viewer asserts the <pre> has exactly two code children and that each pane's
+     gutter and content have matching child counts, and it throws out of line
+     selection when either is off by one. So the handle sits beside the <pre> in
+     the shadow root and is anchored to the new pane's line-number column, whose
+     leading edge is the split boundary in both wrap and scroll mode. */
+  [data-diff-type="split"] {
+    position: relative;
+    anchor-name: --horus-split-pre;
+  }
+
+  [data-diff-type="split"] [data-code][data-additions] > [data-gutter] {
+    anchor-name: --horus-split-edge;
+  }
+
   [data-split-resize-handle] {
     position: absolute;
-    grid-column: 2;
-    z-index: 8;
-    inset-block: 0;
-    inset-inline-start: -6px;
+    z-index: 10;
+    top: anchor(--horus-split-pre top);
+    bottom: anchor(--horus-split-pre bottom);
+    left: calc(anchor(--horus-split-edge left) - 6px);
     width: 12px;
     min-height: 24px;
     padding: 0;
@@ -44,11 +50,6 @@ export const SPLIT_DIFF_RESIZE_CSS = `
     cursor: col-resize;
     touch-action: none;
     user-select: none;
-  }
-
-  [data-diff-type="split"][data-overflow="wrap"] > [data-split-resize-handle],
-  [data-dehydrated][data-diff-type="split"] > [data-split-resize-handle] {
-    grid-column: 3;
   }
 
   [data-split-resize-handle]::after {
@@ -108,12 +109,13 @@ function applySplitPercentage(surface: HTMLElement, value: number): number {
 }
 
 function createHandle(root: ShadowRoot, percentage: number): HTMLElement | null {
-  const split = root.querySelector<HTMLElement>('[data-diff-type="split"]')
-  if (split == null) return null
+  if (root.querySelector('[data-diff-type="split"]') == null) return null
 
-  const existing = split.querySelector<HTMLElement>('[data-split-resize-handle]')
+  const existing = root.querySelector<HTMLElement>('[data-split-resize-handle]')
   if (existing != null) {
-    if (existing.parentElement !== split) split.append(existing)
+    // A re-render can move the handle back inside the diff; the anchors only
+    // resolve while it is a sibling of the <pre>.
+    if (existing.parentNode !== root) root.append(existing)
     return existing
   }
 
@@ -127,7 +129,7 @@ function createHandle(root: ShadowRoot, percentage: number): HTMLElement | null 
   handle.setAttribute('aria-valuenow', String(Math.round(percentage)))
   handle.setAttribute('title', 'Drag to resize · Double-click to reset')
   handle.tabIndex = 0
-  split.append(handle)
+  root.append(handle)
   return handle
 }
 

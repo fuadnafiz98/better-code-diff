@@ -194,7 +194,25 @@ export interface PullRequestReview {
   files: PullRequestFile[]
   patch: string
   omittedFiles: OmittedDiffFile[]
+  // What GitHub says the pull request touches. A streamed review arrives a page at
+  // a time, so `files` climbs towards this rather than matching it immediately.
+  expectedFileCount: number
 }
+
+/**
+ * A pull request big enough to need the paged files API takes minutes to fetch in
+ * full, so the review is streamed: metadata first, then one event per page of
+ * files, each carrying only its own slice of the patch.
+ */
+export type PullRequestReviewProgress =
+  | { kind: 'metadata'; selector: string; review: PullRequestReview }
+  | {
+      kind: 'files'
+      selector: string
+      patch: string
+      files: PullRequestFile[]
+      omittedFiles: OmittedDiffFile[]
+    }
 
 export interface LocalBranchReview {
   kind: 'local'
@@ -316,6 +334,7 @@ export interface RepositoryApi {
   stopFindInPage(): Promise<void>
   onFoundInPage(listener: (result: FindInPageResult) => void): () => void
   onDidChange(listener: (event: RepositoryChangeEvent) => void): () => void
+  onPullRequestReviewProgress(listener: (progress: PullRequestReviewProgress) => void): () => void
 }
 
 export const IPC_CHANNELS = {
@@ -351,5 +370,6 @@ export const IPC_CHANNELS = {
   findInPage: 'app:find-in-page',
   stopFindInPage: 'app:stop-find-in-page',
   foundInPage: 'app:found-in-page',
-  didChange: 'repository:did-change'
+  didChange: 'repository:did-change',
+  pullRequestReviewProgress: 'repository:pull-request-review-progress'
 } as const

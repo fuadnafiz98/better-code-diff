@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resolve Conflicts"
+  short_description: "Resolve active Git conflicts safely"
+  default_prompt: "Use $resolve-conflicts to resolve the active Git rebase or merge conflicts on the verified target branch."

@@ -23,6 +23,7 @@ import type { RemoteReviewThread, RepositoryChangeEvent, RepositoryReview } from
 import type { DiffStyle } from './AppView'
 import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
 import { markReviewFileHydrated } from './reviewMetrics'
+import { COPY_FILE_PATH_CSS, reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
 import { SPLIT_DIFF_RESIZE_CSS, syncSplitDiffResizeLifecycle } from './splitDiffResize'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
@@ -57,6 +58,7 @@ import {
   type UpdateReviewThread
 } from './useReviewThreads'
 import { BackToTopButton, BACK_TO_TOP_THRESHOLD } from './BackToTopButton'
+import { showToast } from './toast'
 import type { ReviewCommand } from './keybindings'
 import {
   dropChangedViewedFiles,
@@ -78,18 +80,10 @@ const CODE_VIEW_CSS = `
   [data-collapse-chevron] { width: 11px !important; height: 16px !important; z-index: 1; pointer-events: none; transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
   [data-review-collapse-button][aria-expanded="false"] [data-collapse-chevron] { transform: rotate(-90deg); }
   [data-separator="line-info-basic"] { border-block: 1px solid var(--border); background: var(--control-fill); }
-  .review-remote-thread { border-color: color-mix(in srgb, var(--accent) 34%, transparent) !important; }
-  .review-remote-thread > header svg:first-child { width: 11px; height: 11px; opacity: 0.75; }
-  .review-remote-comment { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px 0; }
-  .review-remote-comment span { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 9px; }
-  .review-remote-comment span strong { color: var(--text); font-size: 10px; }
-  .review-remote-comment p { margin: 0; color: var(--text-secondary); font-size: 11px; white-space: pre-wrap; }
-  .review-remote-reply { margin: 6px 10px 9px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-strong); border-radius: 7px; padding: 3px 8px; background: transparent; color: var(--text-secondary); font-size: 10px; cursor: pointer; }
-  .review-remote-reply svg { width: 10px; height: 10px; }
-  .review-remote-reply:hover:not(:disabled) { background: var(--control-fill-hover); color: var(--text); }
   ${DRAG_SELECTION_CSS}
   ${CENTERED_COLLAPSED_SEPARATOR_CSS}
   ${SPLIT_DIFF_RESIZE_CSS}
+  ${COPY_FILE_PATH_CSS}
 `
 
 const ACTIVE_PATH_SETTLE_MS = 80
@@ -457,6 +451,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
     onPostRender: (node, _instance, phase, context) => {
       syncDragGuideLifecycle(node, phase, (range) => onSelectLines({ id: context.item.id, range }))
       syncSplitDiffResizeLifecycle(node, phase)
+      syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
     },
     lineHoverHighlight: 'number', hunkSeparators: 'line-info-basic', expandUnchanged: !preferences.foldUnchanged,
     collapsedContextThreshold: 4, stickyHeaders: true, layout: { paddingTop: 16, paddingBottom: 48, gap: 12 },
@@ -639,18 +634,26 @@ const MultiFileReview = memo(function MultiFileReview({
 
   useEffect(() => {
     if (navigationRevision === handledNavigationRevisionRef.current || navigationPath == null) return
-    if (!loadState.loadedPaths.has(navigationPath)) return
     const viewer = viewerRef.current
     const id = itemId(navigationPath)
-    if (viewer?.getItem(id) == null) return
+    const item = viewer?.getItem(id)
+    if (item == null) {
+      // A file that belongs to the review but has not loaded yet will navigate on
+      // a later pass, so leave the request pending. A file outside the comparison
+      // never will — say so, because a ⌘P result that does nothing reads as broken.
+      if (paths.includes(navigationPath)) return
+      handledNavigationRevisionRef.current = navigationRevision
+      showToast(`${navigationPath.split('/').at(-1) ?? navigationPath} has no changes in this review`)
+      return
+    }
     handledNavigationRevisionRef.current = navigationRevision
-    viewer.scrollTo({
+    viewer?.scrollTo({
       type: 'item',
       id,
       align: 'start',
       behavior: 'smooth-auto'
     })
-  }, [loadState.loadedPaths, navigationPath, navigationRevision])
+  }, [loadState.loadedPaths, navigationPath, navigationRevision, paths])
 
   // Only the position this view carried in at mount is ever restored. Reading the
   // live prop instead let a later parent render (a conversation poll, a saved

@@ -23,6 +23,7 @@ import type {
   PullRequestInboxSnapshot,
   PullRequestConversation,
   PullRequestReview,
+  PullRequestReviewProgress,
   PullRequestReviewComment,
   PullRequestReviewEvent,
   PullRequestSummary,
@@ -45,6 +46,13 @@ const MAX_HEAD_CACHE_BYTES = 16 * 1024 * 1024
 const MAX_PATCH_COMMAND_CONCURRENCY = 4
 const MAX_PULL_REQUEST_REVIEW_COMMENTS = 100
 const MAX_PULL_REQUEST_INBOX_RESULTS = 30
+// `gh pr diff` asks GitHub for one diff document, and GitHub refuses past 300
+// files. The files API pages instead, up to its own ceiling of 3000.
+const PULL_REQUEST_FILES_PAGE_SIZE = 100
+const MAX_PULL_REQUEST_FILES = 3_000
+// Each page is one `gh` process and one GitHub round trip, ~5s for a large pull
+// request. Fetched one after another a 3000-file review took nearly two minutes.
+const PULL_REQUEST_FILES_PAGE_CONCURRENCY = 8
 const MAX_REVIEW_BODY_LENGTH = 65_536
 // `gh search prs --json` only exposes these pull request fields; richer fields need `gh pr view`.
 const PULL_REQUEST_LIST_FIELDS = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles'
@@ -691,6 +699,83 @@ export function createNewFilePatch(path: string, contents: string, binary = fals
   const body = lines.map((line) => `+${line}`).join('\n')
   const incompleteLastLine = endsWithNewline ? '' : '\\ No newline at end of file\n'
   return `${header}--- /dev/null\n+++ ${formatPatchPath('b', path)}\n${hunkHeader}\n${body}\n${incompleteLastLine}`
+}
+
+/**
+ * One wave of file pages to request together. GitHub gives no reliable total —
+ * its own file count can exceed what the API serves, and a page carrying large
+ * patches comes back short without meaning the end — so pages are read in waves
+ * until a whole wave comes back empty, capped at the 3000 files the API answers.
+ */
+export function pullRequestFilePageWave(startPage: number): number[] {
+  const maxPages = MAX_PULL_REQUEST_FILES / PULL_REQUEST_FILES_PAGE_SIZE
+  const first = Math.max(1, Math.floor(startPage))
+  const last = Math.min(maxPages, first + PULL_REQUEST_FILES_PAGE_CONCURRENCY - 1)
+  if (first > maxPages) return []
+  return Array.from({ length: last - first + 1 }, (_unused, index) => first + index)
+}
+
+export interface RawPullRequestFile {
+  filename: string
+  previous_filename?: string
+  status?: string
+  additions?: number
+  deletions?: number
+  patch?: string
+}
+
+/**
+ * GitHub answers `gh pr diff` with HTTP 406 once a pull request touches more than
+ * 300 files, and `gh` surfaces that verbatim. Recognising it lets the review fall
+ * back to the paged files API instead of failing to open at all.
+ */
+export function isPullRequestDiffTooLargeError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /HTTP 406|too_large|exceeded the maximum number of files/i.test(message)
+}
+
+/**
+ * Rebuilds a git-style patch from the files API, which returns each file's hunks
+ * without the `diff --git` headers the diff parser keys on. Files GitHub declines
+ * to diff (binary, or too large for its own limit) arrive without a patch and are
+ * reported as omitted rather than dropped silently.
+ */
+export function buildPullRequestPatchFromFiles(rawFiles: readonly RawPullRequestFile[]): {
+  patch: string
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+} {
+  const sections: string[] = []
+  const files: PullRequestFile[] = []
+  const omittedFiles: OmittedDiffFile[] = []
+  for (const rawFile of rawFiles) {
+    const path = typeof rawFile.filename === 'string' ? rawFile.filename : ''
+    if (path === '' || isExcludedPath(path)) continue
+    const additions = Number.isFinite(rawFile.additions) ? Number(rawFile.additions) : 0
+    const deletions = Number.isFinite(rawFile.deletions) ? Number(rawFile.deletions) : 0
+    files.push({ path, additions, deletions })
+    if (typeof rawFile.patch !== 'string' || rawFile.patch === '') {
+      omittedFiles.push({ path, reason: 'too-large', additions, deletions })
+      continue
+    }
+
+    const previousPath = typeof rawFile.previous_filename === 'string' && rawFile.previous_filename !== ''
+      ? rawFile.previous_filename
+      : path
+    const header = [`${GIT_DIFF_SECTION_PREFIX}${formatPatchPath('a', previousPath)} ${formatPatchPath('b', path)}`]
+    if (rawFile.status === 'added') header.push('new file mode 100644')
+    if (rawFile.status === 'removed') header.push('deleted file mode 100644')
+    if (rawFile.status === 'renamed' && previousPath !== path) {
+      header.push(`rename from ${previousPath}`, `rename to ${path}`)
+    }
+    header.push(
+      rawFile.status === 'added' ? '--- /dev/null' : `--- ${formatPatchPath('a', previousPath)}`,
+      rawFile.status === 'removed' ? '+++ /dev/null' : `+++ ${formatPatchPath('b', path)}`
+    )
+    const body = rawFile.patch.endsWith('\n') ? rawFile.patch : `${rawFile.patch}\n`
+    sections.push(`${header.join('\n')}\n${body}`)
+  }
+  return { patch: sections.join(''), files, omittedFiles }
 }
 
 function findPatchSectionStarts(patch: string): number[] {
@@ -1798,33 +1883,131 @@ export class RepositoryService {
     return this.getGitIntegration()
   }
 
-  async getPullRequestReview(selector: number | string): Promise<PullRequestReview> {
+  async getPullRequestReview(
+    selector: number | string,
+    onProgress?: (progress: PullRequestReviewProgress) => void
+  ): Promise<PullRequestReview> {
     this.#requireGitRepository()
     const normalizedSelector = normalizePullRequestSelector(selector)
     const ghExecutable = await getGhExecutable()
-    const [detailsResult, diffResult, viewerLogin] = await Promise.all([
+    // Metadata resolves in a second or two while the diff can take minutes, so it
+    // is awaited on its own: the review header and file tree can open on it alone.
+    const [detailsResult, viewerLogin] = await Promise.all([
       runPullRequestJsonCommand(
         ghExecutable,
         ['pr', 'view', normalizedSelector],
         PULL_REQUEST_REVIEW_FIELDS,
         this.#requireRoot()
       ),
-      runGitHubReadCommand(ghExecutable, ['pr', 'diff', normalizedSelector, '--color', 'never'], this.#requireRoot()),
       this.#getGitHubViewerLogin(ghExecutable)
     ])
     const details = parseJson<RawPullRequestSummary & { files: PullRequestReview['files']; headRefOid: string }>(detailsResult, 'GitHub CLI')
     const { files, headRefOid, ...rest } = details
     const pullRequest = toPullRequestSummary(rest)
-    const limited = limitPatchFileSize(diffResult.stdout.toString('utf8'), MAX_DIFF_FILE_BYTES)
-    return {
+    // The files API stops answering at 3000 files however many GitHub reports, so a
+    // review of a bigger pull request is climbing towards the ceiling, not the count.
+    const expectedFileCount = Math.min(
+      MAX_PULL_REQUEST_FILES,
+      Math.max(
+        Number.isFinite(pullRequest.changedFiles) ? Number(pullRequest.changedFiles) : 0,
+        files?.length ?? 0
+      )
+    )
+    const base: PullRequestReview = {
       kind: 'github',
       selector: normalizedSelector,
       commitId: headRefOid,
       viewerCanSubmitDecision: !isSameGitHubLogin(viewerLogin, pullRequest.author.login),
       pullRequest,
-      files,
-      patch: limited.patch,
-      omittedFiles: limited.omittedFiles
+      files: [],
+      patch: '',
+      omittedFiles: [],
+      expectedFileCount
+    }
+    onProgress?.({ kind: 'metadata', selector: normalizedSelector, review: base })
+
+    const collectedFiles: PullRequestFile[] = []
+    const collectedOmitted: OmittedDiffFile[] = []
+    const patchParts: string[] = []
+    const emit = (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }): void => {
+      const limited = limitPatchFileSize(page.patch, MAX_DIFF_FILE_BYTES)
+      patchParts.push(limited.patch)
+      collectedFiles.push(...page.files)
+      collectedOmitted.push(...page.omittedFiles, ...limited.omittedFiles)
+      onProgress?.({
+        kind: 'files',
+        selector: normalizedSelector,
+        patch: limited.patch,
+        files: page.files,
+        omittedFiles: [...page.omittedFiles, ...limited.omittedFiles]
+      })
+    }
+
+    await this.#collectPullRequestPatch(ghExecutable, normalizedSelector, files ?? [], emit)
+    return {
+      ...base,
+      files: collectedFiles,
+      patch: patchParts.join(''),
+      omittedFiles: collectedOmitted
+    }
+  }
+
+  /**
+   * One diff document is the fast path; a pull request too big for GitHub to render
+   * as a single diff is rebuilt from the paged files API instead of failing to open.
+   */
+  async #collectPullRequestPatch(
+    ghExecutable: string,
+    selector: string,
+    detailFiles: readonly PullRequestFile[],
+    emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
+  ): Promise<void> {
+    try {
+      const diffResult = await runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'diff', selector, '--color', 'never'],
+        this.#requireRoot()
+      )
+      emit({
+        patch: diffResult.stdout.toString('utf8'),
+        files: [...detailFiles],
+        omittedFiles: []
+      })
+      return
+    } catch (error) {
+      if (!isPullRequestDiffTooLargeError(error)) throw error
+    }
+    await this.#collectPullRequestPatchFromFilesApi(ghExecutable, selector, emit)
+  }
+
+  async #collectPullRequestPatchFromFilesApi(
+    ghExecutable: string,
+    selector: string,
+    emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
+  ): Promise<void> {
+    const { owner, name, number } = await this.#resolvePullRequestIdentity(ghExecutable, selector)
+    const readPage = async (page: number): Promise<RawPullRequestFile[]> => {
+      const result = await runGitHubReadCommand(
+        ghExecutable,
+        [
+          'api',
+          `repos/${owner}/${name}/pulls/${number}/files?per_page=${PULL_REQUEST_FILES_PAGE_SIZE}&page=${page}`
+        ],
+        this.#requireRoot()
+      )
+      const pageFiles = parseJson<RawPullRequestFile[]>(result, 'GitHub')
+      return Array.isArray(pageFiles) ? pageFiles : []
+    }
+
+    for (let wave = pullRequestFilePageWave(1); wave.length > 0; wave = pullRequestFilePageWave(wave[wave.length - 1]! + 1)) {
+      const pages = await Promise.all(wave.map(readPage))
+      let filesInWave = 0
+      for (const pageFiles of pages) {
+        if (pageFiles.length === 0) continue
+        filesInWave += pageFiles.length
+        emit(buildPullRequestPatchFromFiles(pageFiles))
+      }
+      if (filesInWave === 0) return
     }
   }
 

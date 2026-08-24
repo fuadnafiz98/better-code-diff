@@ -4,6 +4,7 @@ import type {
   AgentStreamEvent,
   FindInPageResult,
   PerformanceMetrics,
+  PullRequestReviewProgress,
   RepositoryApi,
   RepositoryChangeEvent
 } from '../shared/contracts.js'
@@ -84,6 +85,13 @@ const repositoryApi: RepositoryApi = {
     const handleChange = (_event: Electron.IpcRendererEvent, change: RepositoryChangeEvent): void => listener(change)
     ipcRenderer.on(IPC_CHANNELS.didChange, handleChange)
     return () => ipcRenderer.removeListener(IPC_CHANNELS.didChange, handleChange)
+  },
+  onPullRequestReviewProgress: (listener) => {
+    const handleProgress = (_event: Electron.IpcRendererEvent, progress: PullRequestReviewProgress): void => {
+      listener(progress)
+    }
+    ipcRenderer.on(IPC_CHANNELS.pullRequestReviewProgress, handleProgress)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.pullRequestReviewProgress, handleProgress)
   }
 }
 

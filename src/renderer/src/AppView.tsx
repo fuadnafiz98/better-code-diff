@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState, type KeyboardEvent, type RefObject } from 'react'
 import {
+  IconArrowLeftBar,
   IconBraces,
   IconBranch,
   IconCodeFolder,
@@ -434,6 +435,14 @@ export function DiffToolbar({
 
   return (
     <div className="diff-toolbar">
+      {/* Leaving a pull request belongs beside its title, not in the group of view
+          toggles on the right where it read as another display mode. */}
+      {onCloseExternalReview != null ? (
+        <button className="review-exit-button" type="button" onClick={onCloseExternalReview}
+          title="Close this review and go back to the working tree">
+          <IconArrowLeftBar />Working tree
+        </button>
+      ) : null}
       <div className="diff-toolbar-context">
         <div className="diff-file-title" title={selectedPath ?? undefined}>
           <IconFileCode />
@@ -459,9 +468,6 @@ export function DiffToolbar({
             </button>
           ) : null}
         </div>
-        {onCloseExternalReview != null ? (
-          <button className="review-return-button" type="button" onClick={onCloseExternalReview}><IconBranch />Working Tree</button>
-        ) : null}
         {onCloseExternalReview == null ? (
           <div className="segmented-control workspace-view-control" role="group" aria-label="Review view">
             <button type="button" aria-pressed={workspaceView === 'file'} className={workspaceView === 'file' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('file')}>

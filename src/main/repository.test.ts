@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import { describe, expect, it } from 'bun:test'
 
 import {
+  buildPullRequestPatchFromFiles,
   classifySearchCompletion,
   createNewFilePatch,
   createPullRequestReviewPayload,
@@ -14,6 +15,7 @@ import {
   githubRepoSlugFromRemoteUrl,
   readGitObject,
   isPathWithinApprovedRoots,
+  isPullRequestDiffTooLargeError,
   isSameGitHubLogin,
   limitPatchFileSize,
   mapGitStatus,
@@ -23,6 +25,7 @@ import {
   parsePullRequestInboxResponse,
   parsePorcelainV2Status,
   parsePullRequestConversation,
+  pullRequestFilePageWave,
   pullRequestTargetsRemotes,
   RepositoryService,
   resolvePackagedExecutablePath,
@@ -386,6 +389,100 @@ describe('diffFilesFromChurn', () => {
       { path: 'README.md', additions: 4, deletions: 0 },
       { path: 'src/value.ts', additions: 2, deletions: 1 }
     ])
+  })
+})
+
+describe('pullRequestFilePageWave', () => {
+  it('reads a wave of pages at a time', () => {
+    expect(pullRequestFilePageWave(1)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect(pullRequestFilePageWave(9)).toEqual([9, 10, 11, 12, 13, 14, 15, 16])
+  })
+
+  it('stops at the ceiling the files API answers', () => {
+    expect(pullRequestFilePageWave(25)).toEqual([25, 26, 27, 28, 29, 30])
+    expect(pullRequestFilePageWave(31)).toEqual([])
+  })
+
+  it('treats a nonsense start page as the first one', () => {
+    expect(pullRequestFilePageWave(0)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+  })
+})
+
+describe('isPullRequestDiffTooLargeError', () => {
+  it('recognises the 406 GitHub returns for pull requests it will not diff', () => {
+    expect(isPullRequestDiffTooLargeError(new Error(
+      "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of files (300). "
+      + '(https://api.github.com/repos/microsoft/TypeScript/pulls/63763) PullRequest.diff too_large'
+    ))).toBe(true)
+  })
+
+  it('leaves every other failure alone', () => {
+    expect(isPullRequestDiffTooLargeError(new Error('HTTP 404: Not Found'))).toBe(false)
+    expect(isPullRequestDiffTooLargeError(new Error('gh: command not found'))).toBe(false)
+  })
+})
+
+describe('buildPullRequestPatchFromFiles', () => {
+  it('adds the git headers the files API leaves out', () => {
+    const built = buildPullRequestPatchFromFiles([{
+      filename: 'src/app.ts',
+      status: 'modified',
+      additions: 1,
+      deletions: 1,
+      patch: '@@ -1 +1 @@\n-old\n+new'
+    }])
+    expect(built.patch).toBe(
+      'diff --git a/src/app.ts b/src/app.ts\n'
+      + '--- a/src/app.ts\n'
+      + '+++ b/src/app.ts\n'
+      + '@@ -1 +1 @@\n-old\n+new\n'
+    )
+    expect(built.files).toEqual([{ path: 'src/app.ts', additions: 1, deletions: 1 }])
+    expect(built.omittedFiles).toEqual([])
+  })
+
+  it('marks added, removed and renamed files the way git does', () => {
+    const built = buildPullRequestPatchFromFiles([
+      { filename: 'added.ts', status: 'added', additions: 1, deletions: 0, patch: '@@ -0,0 +1 @@\n+one\n' },
+      { filename: 'gone.ts', status: 'removed', additions: 0, deletions: 1, patch: '@@ -1 +0,0 @@\n-one\n' },
+      {
+        filename: 'new-name.ts',
+        previous_filename: 'old-name.ts',
+        status: 'renamed',
+        additions: 1,
+        deletions: 1,
+        patch: '@@ -1 +1 @@\n-old\n+new\n'
+      }
+    ])
+    expect(built.patch).toContain('diff --git a/added.ts b/added.ts\nnew file mode 100644\n--- /dev/null\n+++ b/added.ts\n')
+    expect(built.patch).toContain('diff --git a/gone.ts b/gone.ts\ndeleted file mode 100644\n--- a/gone.ts\n+++ /dev/null\n')
+    expect(built.patch).toContain(
+      'diff --git a/old-name.ts b/new-name.ts\n'
+      + 'rename from old-name.ts\nrename to new-name.ts\n'
+      + '--- a/old-name.ts\n+++ b/new-name.ts\n'
+    )
+  })
+
+  it('reports files GitHub sent without a patch instead of dropping them', () => {
+    const built = buildPullRequestPatchFromFiles([
+      { filename: 'logo.png', status: 'modified', additions: 0, deletions: 0 },
+      { filename: 'huge.json', status: 'modified', additions: 900, deletions: 5, patch: '' }
+    ])
+    expect(built.patch).toBe('')
+    expect(built.files.map((file) => file.path)).toEqual(['logo.png', 'huge.json'])
+    expect(built.omittedFiles).toEqual([
+      { path: 'logo.png', reason: 'too-large', additions: 0, deletions: 0 },
+      { path: 'huge.json', reason: 'too-large', additions: 900, deletions: 5 }
+    ])
+  })
+
+  it('skips the directories the rest of the app hides', () => {
+    const built = buildPullRequestPatchFromFiles([
+      { filename: 'node_modules/left-pad/index.js', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-a\n+b\n' },
+      { filename: 'src/app.ts', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-a\n+b\n' }
+    ])
+    expect(built.files.map((file) => file.path)).toEqual(['src/app.ts'])
+    expect(built.patch).not.toContain('left-pad')
   })
 })
 

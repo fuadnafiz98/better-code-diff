@@ -7,7 +7,8 @@ import {
   formatAgentAttachment,
   type AgentAttachment
 } from './agentAttachments'
-import { keyForBlock, keyForInline, type MarkdownBlock, type MarkdownInline } from './markdown'
+import type { MarkdownBlock } from './markdown'
+import { MarkdownContent } from './MarkdownContent'
 
 interface AgentPanelProps {
   blocks: MarkdownBlock[]
@@ -31,53 +32,6 @@ const QUICK_PROMPTS = [
   { label: 'Risks', prompt: 'Review this change for bugs, edge cases, and risky behaviour. Be specific and cite file names.' },
   { label: 'Tests', prompt: 'What tests would meaningfully cover this change? List concrete cases.' }
 ] as const
-
-function InlineRun({ inline }: { inline: MarkdownInline }): React.JSX.Element {
-  if (inline.kind === 'code') return <code>{inline.text}</code>
-  if (inline.kind === 'strong') return <strong>{inline.text}</strong>
-  if (inline.kind === 'emphasis') return <em>{inline.text}</em>
-  return <>{inline.text}</>
-}
-
-function InlineContent({ content }: { content: MarkdownInline[] }): React.JSX.Element {
-  const seen = new Map<string, number>()
-  return <>{content.map((inline) => <InlineRun key={keyForInline(inline, seen)} inline={inline} />)}</>
-}
-
-const AnswerMarkdown = memo(function AnswerMarkdown({ blocks }: { blocks: MarkdownBlock[] }): React.JSX.Element {
-  const keyed = useMemo(() => {
-    const seen = new Map<string, number>()
-    return blocks.map((block) => ({ block, key: keyForBlock(block, seen) }))
-  }, [blocks])
-  return (
-    <div className="agent-answer">
-      {keyed.map(({ block, key }) => {
-        if (block.kind === 'code') {
-          return (
-            <pre key={key}>
-              {block.language == null ? null : <span className="agent-code-language">{block.language}</span>}
-              <code>{block.text}</code>
-            </pre>
-          )
-        }
-        if (block.kind === 'heading') {
-          const Heading = `h${Math.min(block.level + 2, 6)}` as 'h3' | 'h4' | 'h5' | 'h6'
-          return <Heading key={key}><InlineContent content={block.content} /></Heading>
-        }
-        if (block.kind === 'quote') {
-          return <blockquote key={key}><InlineContent content={block.content} /></blockquote>
-        }
-        if (block.kind === 'list') {
-          const itemKeys = new Map<string, number>()
-          return block.ordered
-            ? <ol key={key}>{block.items.map((item) => <li key={keyForInline(item[0] ?? { kind: 'text', text: '' }, itemKeys)}><InlineContent content={item} /></li>)}</ol>
-            : <ul key={key}>{block.items.map((item) => <li key={keyForInline(item[0] ?? { kind: 'text', text: '' }, itemKeys)}><InlineContent content={item} /></li>)}</ul>
-        }
-        return <p key={key}><InlineContent content={block.content} /></p>
-      })}
-    </div>
-  )
-})
 
 export const AgentPanel = memo(function AgentPanel({
   blocks,
@@ -168,7 +122,7 @@ export const AgentPanel = memo(function AgentPanel({
         ) : null}
 
         {error != null ? <div className="agent-dock-error" role="alert">{error}</div> : null}
-        {blocks.length > 0 ? <AnswerMarkdown blocks={blocks} /> : null}
+        {blocks.length > 0 ? <MarkdownContent blocks={blocks} className="agent-answer" /> : null}
         {streaming && blocks.length === 0 && activity.length === 0 ? (
           <div className="agent-streaming" role="status"><span /><span /><span /></div>
         ) : null}

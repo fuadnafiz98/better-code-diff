@@ -61,22 +61,46 @@ export function useReviewLoadState({
   const [loadState, setLoadState] = useState<ReviewLoadState>(EMPTY_LOAD_STATE)
   const [pagination, setPagination] = useState({ key: '', limit: FOLDER_REVIEW_PAGE_SIZE })
   const loadLimit = pagination.key === pathsKey ? pagination.limit : FOLDER_REVIEW_PAGE_SIZE
-  const targetPathCount = loadState.paged
-    ? Math.min(loadLimit, stablePaths.length)
-    : stablePaths.length
-  const loading = repositoryReview == null && loadState.loadedPaths.size < targetPathCount
+  // A streamed pull request review knows how many files to expect before it has
+  // them, so the count it is climbing towards is GitHub's, not what has arrived.
+  const streamingFileCount = repositoryReview?.kind === 'github'
+    ? repositoryReview.expectedFileCount
+    : null
+  const targetPathCount = streamingFileCount != null
+    ? Math.max(streamingFileCount, stablePaths.length)
+    : loadState.paged
+      ? Math.min(loadLimit, stablePaths.length)
+      : stablePaths.length
+  const loading = repositoryReview == null
+    ? loadState.loadedPaths.size < targetPathCount
+    : streamingFileCount != null && repositoryReview.files.length < streamingFileCount
   const loadMoreFiles = useCallback(() => {
     setPagination({ key: pathsKey, limit: loadLimit + FOLDER_REVIEW_PAGE_SIZE })
   }, [loadLimit, pathsKey])
 
+  // Streaming appends to the patch, so only the new tail is parsed. Re-parsing the
+  // whole document on every page turned a 13 MB review into quadratic work.
+  const parsedPatchRef = useRef<{
+    key: string
+    length: number
+    items: CodeViewItem<ReviewAnnotationMetadata>[]
+  }>({ key: '', length: 0, items: [] })
   const externalReviewItems = useMemo<CodeViewItem<ReviewAnnotationMetadata>[] | null>(() => {
     if (repositoryReview == null) return null
-    return orderReviewItems(createPatchReviewItems(
-      repositoryReview.patch,
-      repositoryReview.kind === 'github'
-        ? `pr-${repositoryReview.pullRequest.number}-${repositoryReview.pullRequest.updatedAt}`
-        : repositoryReview.id
-    ), stablePaths)
+    const key = repositoryReview.kind === 'github'
+      ? `pr-${repositoryReview.pullRequest.number}-${repositoryReview.pullRequest.updatedAt}`
+      : repositoryReview.id
+    const parsed = parsedPatchRef.current
+    const appended = parsed.key === key && repositoryReview.patch.length >= parsed.length
+    const pending = appended ? repositoryReview.patch.slice(parsed.length) : repositoryReview.patch
+    const pendingItems = pending === ''
+      ? []
+      : createPatchReviewItems<ReviewAnnotationMetadata>(pending, key)
+    // Merging by id keeps this idempotent, so a repeated render cannot duplicate a
+    // file or lose one.
+    const items = appended ? mergeReviewItems(parsed.items, pendingItems) : pendingItems
+    parsedPatchRef.current = { key, length: repositoryReview.patch.length, items }
+    return orderReviewItems(items, stablePaths)
   }, [repositoryReview, stablePaths])
 
   useEffect(() => {
@@ -87,7 +111,12 @@ export function useReviewLoadState({
         loadedPaths: new Set(stablePaths),
         omittedFiles: repositoryReview?.omittedFiles ?? [],
         failedCount: 0,
-        skippedCount: Math.max(0, stablePaths.length - externalReviewItems.length),
+        // Omitted files are already counted as omitted; without this they were also
+        // reported as skipped, so the progress pill showed the same number twice.
+        skippedCount: Math.max(
+          0,
+          stablePaths.length - externalReviewItems.length - (repositoryReview?.omittedFiles.length ?? 0)
+        ),
         paged: false
       })
       return

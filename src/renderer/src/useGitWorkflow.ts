@@ -140,8 +140,51 @@ export function useGitWorkflow({
   const openPullRequestReview = useCallback(async (selector: number | string) => {
     setActionKey(`review:${selector}`)
     onError(null)
+    // A large review is streamed: its metadata opens the view, then each page of
+    // files is appended. Waiting for the whole fetch left the app on a spinner for
+    // minutes on pull requests with thousands of files.
+    let streamed = false
+    const stopListening = requireRepositoryApi().onPullRequestReviewProgress((progress) => {
+      if (progress.kind === 'metadata') {
+        streamed = true
+        setRepositoryReview(progress.review)
+        setSubmissionMessage(null)
+        onWorkspaceViewChange('multi')
+        setPanelOpen(false)
+        setActionKey(null)
+        return
+      }
+      let firstPath: string | null = null
+      setRepositoryReview((current) => {
+        if (current == null || current.kind !== 'github' || current.selector !== progress.selector) return current
+        if (current.files.length === 0) firstPath = progress.files[0]?.path ?? null
+        return {
+          ...current,
+          files: [...current.files, ...progress.files],
+          patch: `${current.patch}${progress.patch}`,
+          omittedFiles: [...current.omittedFiles, ...progress.omittedFiles]
+        }
+      })
+      // Selecting on the first page rather than at the end keeps the review from
+      // jumping back to file one once the last page lands.
+      if (firstPath != null) onSelectPath(firstPath)
+    })
     try {
       const review = await requireRepositoryApi().getPullRequestReview(selector)
+      if (streamed) {
+        // The resolved review is authoritative: progress events and the reply to
+        // this call are separate IPC messages, so a late page can land after the
+        // listener is gone. Its patch shares the streamed prefix, so adopting it
+        // only costs parsing whatever tail was missed. The expected count becomes
+        // what actually arrived — GitHub's own number can exceed what its files API
+        // will serve, and nothing is still loading once the fetch has finished.
+        setRepositoryReview((current) => current != null
+          && current.kind === 'github'
+          && current.selector === review.selector
+          ? { ...review, expectedFileCount: review.files.length }
+          : current)
+        return
+      }
       setRepositoryReview(review)
       setSubmissionMessage(null)
       onSelectPath(review.files[0]?.path ?? null)
@@ -150,6 +193,7 @@ export function useGitWorkflow({
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
+      stopListening()
       setActionKey(null)
     }
   }, [onError, onSelectPath, onWorkspaceViewChange])

@@ -365,14 +365,38 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     () => getDirectoryPaths(treeStatuses.map((status) => status.path)),
     [treeStatuses]
   )
-  const handleTreeSelection = useCallback((paths: readonly string[]) => {
-    const path = paths.at(-1)
-    if (path === visibleMultiFilePathRef.current) return
-    if (path == null || !pathSet.has(path)) return
+  // A click on a tree row is always a request to go to that file, whether or not
+  // the row was already selected. Scroll-follow keeps moving the selection onto
+  // the file being read, so the row a reader clicks is very often the selected
+  // one — and the tree only reports selection *changes*.
+  const activateTreeRow = useCallback((path: string) => {
+    if (!pathSet.has(path)) return
     markInstantTreeFollowTarget(path)
     onSelectPath(path)
     if (workspaceView === 'multi') setMultiFileNavigationRevision((revision) => revision + 1)
   }, [markInstantTreeFollowTarget, onSelectPath, pathSet, workspaceView])
+
+  // ⌘P search, review shortcuts and the tree all change the selected path; in the
+  // multi-file review that has to move the viewer, or picking a result looks like
+  // it did nothing at all.
+  const navigatedSelectionRef = useRef(selectedPath)
+  useEffect(() => {
+    const previous = navigatedSelectionRef.current
+    navigatedSelectionRef.current = selectedPath
+    if (selectedPath == null || selectedPath === previous) return
+    if (workspaceView !== 'multi' || selectedPath === visibleMultiFilePathRef.current) return
+    if (!pathSet.has(selectedPath)) return
+    markInstantTreeFollowTarget(selectedPath)
+    setMultiFileNavigationRevision((revision) => revision + 1)
+  }, [markInstantTreeFollowTarget, pathSet, selectedPath, workspaceView])
+
+  const handleTreeSelection = useCallback((paths: readonly string[]) => {
+    const path = paths.at(-1)
+    // Follow moves the selection itself; re-navigating from that would fight the
+    // scroll it came from.
+    if (path == null || path === visibleMultiFilePathRef.current) return
+    activateTreeRow(path)
+  }, [activateTreeRow])
 
   // useFileTree captures its options once at model creation, so the selection
   // callback must be delegated through a ref to see current view state.
@@ -461,7 +485,8 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
 
   return (
     <>
-      <Explorer filePaths={treePaths} model={model} themeType={getEditorThemeType(preferences.editorTheme)} />
+      <Explorer filePaths={treePaths} model={model} themeType={getEditorThemeType(preferences.editorTheme)}
+        onRowActivate={activateTreeRow} />
       <SidebarResizer />
       <section ref={codeZoom.surfaceRef} className={`diff-panel ${isFilePreview ? 'file-preview-mode' : 'diff-mode'}`} id="repository-diff">
         <RepositoryReviewHeader

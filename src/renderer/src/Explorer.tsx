@@ -13,9 +13,10 @@ interface ExplorerProps {
   filePaths: readonly string[]
   model: FileTreeModel
   themeType: EditorThemeType
+  onRowActivate(path: string): void
 }
 
-export const Explorer = memo(function Explorer({ filePaths, model, themeType }: ExplorerProps) {
+export const Explorer = memo(function Explorer({ filePaths, model, themeType, onRowActivate }: ExplorerProps) {
   const search = useFileTreeSearch(model)
   const directoryPaths = useMemo(() => getDirectoryPaths(filePaths), [filePaths])
   const visibleFileCount = search.value.length > 0 ? search.matchingPaths.length : filePaths.length
@@ -40,8 +41,20 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType }: 
     }
   }, [directoryPaths, model])
 
+  // The tree reports selection *changes*, so clicking the row that is already
+  // selected reports nothing. Rows are read straight off the click instead, which
+  // makes every click a navigation request.
+  const activateClickedRow = useCallback((event: React.MouseEvent<HTMLElement>) => {
+    const row = event.nativeEvent.composedPath().find(
+      (node): node is HTMLElement => node instanceof HTMLElement && node.hasAttribute('data-item-path')
+    )
+    const path = row?.getAttribute('data-item-path')
+    if (path == null || row?.getAttribute('data-item-type') !== 'file') return
+    onRowActivate(path)
+  }, [onRowActivate])
+
   return (
-    <aside className="sidebar" id="repository-explorer">
+    <aside className="sidebar" id="repository-explorer" onClick={activateClickedRow}>
       <div className="sidebar-heading">
         <strong>Explorer</strong>
         <div className="sidebar-heading-actions">

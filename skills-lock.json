@@ -25,6 +25,12 @@
       "skillPath": "skills/apple-design/SKILL.md",
       "computedHash": "8b94db67cb9edaad5f1501010804caa610131f1d2dfda0a27664b2e858deade3"
     },
+    "batch-dependency-bumps": {
+      "source": "fuadnafiz98/skills",
+      "sourceType": "github",
+      "skillPath": "skills/batch-dependency-bumps/SKILL.md",
+      "computedHash": "22baeeb3112d811914afdfd40c55414ed2e2b06ae9d18adc43f5c493f8c4a9f0"
+    },
     "better-colors": {
       "source": "jakubkrehel/skills",
       "sourceType": "github",
@@ -122,6 +128,12 @@
       "skillPath": "skills/interface-review/SKILL.md",
       "computedHash": "f495eafe40a20f8d051c8d50c8f60fe73c915871eddc118af3a4a63a317fec4b"
     },
+    "output": {
+      "source": "fuadnafiz98/skills",
+      "sourceType": "github",
+      "skillPath": "skills/output/SKILL.md",
+      "computedHash": "2452781ba8ac0c37864f1757a5facbf104920b91d040688a70593de02d19fc33"
+    },
     "performance": {
       "source": "millionco/react-doctor",
       "sourceType": "github",
@@ -139,6 +151,12 @@
       "sourceType": "github",
       "skillPath": "skills/react-doctor/SKILL.md",
       "computedHash": "2a003f397a4a94fc032019bc7fd97e938b4e2fae995c96df8603790db168dcc7"
+    },
+    "resolve-conflicts": {
+      "source": "fuadnafiz98/skills",
+      "sourceType": "github",
+      "skillPath": "skills/resolve-conflicts/SKILL.md",
+      "computedHash": "0b67365dfab039f7131149dc25c2914c760fa546d368a07c50d0f9ac967b5fec"
     },
     "rethink-solution": {
       "source": "fuadnafiz98/skills",

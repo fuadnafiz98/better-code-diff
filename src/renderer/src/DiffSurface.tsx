@@ -12,6 +12,7 @@ import {
 import type { FileComparison } from '../../shared/contracts'
 import type { DiffStyle } from './AppView'
 import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
+import { COPY_FILE_PATH_CSS, reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
 import { SPLIT_DIFF_RESIZE_CSS, syncSplitDiffResizeLifecycle } from './splitDiffResize'
 import { createDiffAnnotation, createFileAnnotation } from './reviewAnnotations'
@@ -80,6 +81,7 @@ const INTERACTION_CSS = `
   ${DRAG_SELECTION_CSS}
   ${CENTERED_COLLAPSED_SEPARATOR_CSS}
   ${SPLIT_DIFF_RESIZE_CSS}
+  ${COPY_FILE_PATH_CSS}
 `
 interface DiffSurfaceProps {
   comparison: FileComparison | null
@@ -227,6 +229,7 @@ function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPa
     onPostRender: (node: HTMLElement, _instance: unknown, phase: string) => {
       syncDragGuideLifecycle(node, phase, beginComment)
       syncSplitDiffResizeLifecycle(node, phase)
+      syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
     }
   }), [beginComment, comparisonPath])
 

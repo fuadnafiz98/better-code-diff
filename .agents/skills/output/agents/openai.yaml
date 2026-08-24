@@ -1,0 +1,4 @@
+interface:
+  display_name: "Output Width"
+  short_description: "Hard-wrap replies to 80 columns, flush left"
+  default_prompt: "Use $output to hard-wrap your replies at 80 columns for the rest of this session."
