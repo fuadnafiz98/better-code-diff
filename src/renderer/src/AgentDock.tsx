@@ -17,14 +17,36 @@ export function AgentDock({ session, contextLabel }: AgentDockProps): React.JSX.
     <Suspense fallback={<aside className="agent-dock" />}>
       <AgentPanel
         blocks={session.answer.blocks}
+        answer={session.answer.answer}
         streaming={session.answer.streaming}
         error={session.answer.error}
         question={session.answer.question}
         activity={session.answer.activity}
+        approvals={session.answer.approvals}
+        usage={session.answer.usage}
+        history={session.answer.history}
+        startedAt={session.answer.startedAt}
+        completedAt={session.answer.completedAt}
         provider={session.provider}
+        model={session.model}
+        effort={session.effort}
+        accessMode={session.accessMode}
+        models={session.models}
+        efforts={session.efforts}
+        loadingModels={session.loadingModels}
+        statuses={session.statuses}
+        loadingStatuses={session.loadingStatuses}
+        authenticatingProvider={session.authenticatingProvider}
+        statusError={session.statusError}
         attachments={session.attachments}
         contextLabel={contextLabel}
         onProviderChange={session.setProvider}
+        onModelChange={session.setModel}
+        onEffortChange={session.setEffort}
+        onAccessModeChange={session.setAccessMode}
+        onRefreshStatuses={session.refreshStatuses}
+        onLogin={session.login}
+        onApprovalDecision={session.answer.respondToApproval}
         onRemoveAttachment={session.removeAttachment}
         onAsk={session.ask}
         onCancel={session.answer.cancel}

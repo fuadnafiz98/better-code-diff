@@ -2,6 +2,8 @@ export interface MemorySample {
   atMs: number
   workingSetMegabytes: number
   rendererPrivateMegabytes: number
+  cpuPercent?: number
+  gpuProcessCpuPercent?: number | null
 }
 
 // 3s sampling, so this is an hour of history — long enough to see a leak trend
@@ -71,11 +73,126 @@ export function formatSpan(milliseconds: number): string {
   return remainder === 0 ? `${hours} h` : `${hours} h ${remainder} min`
 }
 
+export function formatPerformancePercent(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  return `${value < 10 ? value.toFixed(1) : value.toFixed(0)}%`
+}
+
+export function formatPerformanceMemory(megabytes: number): string {
+  return megabytes >= 1_024
+    ? `${(megabytes / 1_024).toFixed(1)} GB`
+    : `${Math.round(megabytes)} MB`
+}
+
 export interface SparklineGeometry {
   line: string
   area: string
   low: number
   high: number
+}
+
+export type PerformanceChartMetric = 'memory' | 'cpu'
+
+export interface ChartPoint {
+  x: number
+  y: number
+}
+
+export interface PerformanceChartGeometry {
+  primary: {
+    path: string
+    points: ChartPoint[]
+  }
+  secondary: {
+    path: string
+    points: ChartPoint[]
+  }
+  domainLow: number
+  domainHigh: number
+  gridValues: number[]
+  plotLeft: number
+  plotRight: number
+  plotTop: number
+  plotBottom: number
+}
+
+function chartDomain(values: readonly number[], metric: PerformanceChartMetric): [number, number] {
+  const low = Math.min(...values)
+  const high = Math.max(...values)
+  if (metric === 'cpu') {
+    const domainHigh = Math.max(10, Math.ceil((high * 1.15) / 10) * 10)
+    return [0, domainHigh]
+  }
+
+  const range = high - low
+  const padding = Math.max(16, range * 0.18)
+  return [
+    Math.max(0, Math.floor((low - padding) / 25) * 25),
+    Math.ceil((high + padding) / 25) * 25
+  ]
+}
+
+export function buildPerformanceChart(
+  history: readonly MemorySample[],
+  metric: PerformanceChartMetric,
+  width: number,
+  height: number
+): PerformanceChartGeometry | null {
+  if (history.length < 2) return null
+  const first = history[0]
+  const last = history[history.length - 1]
+  if (first == null || last == null || last.atMs <= first.atMs) return null
+
+  const plotLeft = 38
+  const plotRight = width - 8
+  const plotTop = 8
+  const plotBottom = height - 22
+  const primaryValues = history.map((sample) => metric === 'memory'
+    ? sample.workingSetMegabytes
+    : sample.cpuPercent ?? 0)
+  const secondaryValues = history.map((sample) => metric === 'memory'
+    ? sample.rendererPrivateMegabytes
+    : sample.gpuProcessCpuPercent ?? 0)
+  const [domainLow, domainHigh] = chartDomain([...primaryValues, ...secondaryValues], metric)
+  const domainRange = Math.max(1, domainHigh - domainLow)
+  const timeSpan = last.atMs - first.atMs
+
+  const pointsFor = (values: readonly number[]): ChartPoint[] => values.map((value, index) => ({
+    x: plotLeft + ((history[index]!.atMs - first.atMs) / timeSpan) * (plotRight - plotLeft),
+    y: plotBottom - ((value - domainLow) / domainRange) * (plotBottom - plotTop)
+  }))
+  const primaryPoints = pointsFor(primaryValues)
+  const secondaryPoints = pointsFor(secondaryValues)
+  const toPath = (points: readonly ChartPoint[]): string => points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+    .join('')
+
+  return {
+    primary: { path: toPath(primaryPoints), points: primaryPoints },
+    secondary: { path: toPath(secondaryPoints), points: secondaryPoints },
+    domainLow,
+    domainHigh,
+    gridValues: [domainHigh, domainLow + domainRange / 2, domainLow],
+    plotLeft,
+    plotRight,
+    plotTop,
+    plotBottom
+  }
+}
+
+export function findNearestSampleIndex(history: readonly MemorySample[], atMs: number): number {
+  if (history.length === 0) return -1
+  let low = 0
+  let high = history.length - 1
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if ((history[middle]?.atMs ?? 0) < atMs) low = middle + 1
+    else high = middle
+  }
+  if (low === 0) return 0
+  const before = history[low - 1]!
+  const after = history[low]!
+  return atMs - before.atMs <= after.atMs - atMs ? low - 1 : low
 }
 
 /**

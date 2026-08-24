@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -748,6 +748,38 @@ describe('RepositoryService', () => {
       ])
     } finally {
       await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('saves an editable file and rejects a stale draft without overwriting disk changes', async () => {
+    const folderPath = await mkdtemp(join(tmpdir(), 'better-code-diff-save-test-'))
+    const filePath = join(folderPath, 'value.ts')
+
+    try {
+      await writeFile(filePath, 'export const value = 1\n', 'utf8')
+      const repository = new RepositoryService()
+      await repository.open(folderPath)
+      const firstComparison = await repository.getComparison('value.ts')
+
+      const savedComparison = await repository.saveWorkingFile({
+        path: 'value.ts',
+        contents: 'export const value = 2\n',
+        expectedCacheKey: firstComparison.newFile!.cacheKey
+      })
+
+      expect(await readFile(filePath, 'utf8')).toBe('export const value = 2\n')
+      expect(savedComparison.newFile?.contents).toBe('export const value = 2\n')
+      expect(savedComparison.newFile?.cacheKey).not.toBe(firstComparison.newFile?.cacheKey)
+
+      await writeFile(filePath, 'export const value = 3\n', 'utf8')
+      await expect(repository.saveWorkingFile({
+        path: 'value.ts',
+        contents: 'export const value = 4\n',
+        expectedCacheKey: savedComparison.newFile!.cacheKey
+      })).rejects.toThrow('The file changed on disk')
+      expect(await readFile(filePath, 'utf8')).toBe('export const value = 3\n')
+    } finally {
+      await rm(folderPath, { recursive: true, force: true })
     }
   })
 

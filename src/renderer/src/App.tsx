@@ -7,12 +7,14 @@ import {
   useEffect,
   useEffectEvent,
   useRef,
-  useState
+  useState,
+  type CSSProperties
 } from 'react'
 
 import type {
   FileComparison,
   RepositoryChangeEvent,
+  RepositoryReview,
   RepositorySnapshot
 } from '../../shared/contracts'
 import {
@@ -27,7 +29,7 @@ import {
   CommandPaletteController,
   type CommandPaletteHandle
 } from './CommandPalette'
-import { commandFromEvent } from './keybindings'
+import { commandFromEvent, formatTerminalToggleShortcut, isTerminalToggleShortcut } from './keybindings'
 import {
   CODE_FONTS,
   getEditorThemeType,
@@ -49,8 +51,11 @@ import { useGitWorkflow } from './useGitWorkflow'
 import { useAgentSession } from './useAgentSession'
 import { useRepositorySearch, type RepositorySearchController } from './useRepositorySearch'
 import { AgentDock } from './AgentDock'
+import type { TerminalDockHandle } from './TerminalDock'
+import { clampTerminalHeight, DEFAULT_TERMINAL_HEIGHT } from './terminalPanel'
 
 const RepositoryWorkspace = lazy(() => import('./RepositoryWorkspace'))
+const TerminalDock = lazy(() => import('./TerminalDock'))
 const RepositoryPanel = lazy(async () => ({
   default: (await import('./GitHubPanel')).RepositoryPanel
 }))
@@ -95,20 +100,31 @@ interface AppLayoutProps {
   sidebarVisible: boolean
   diffStyle: DiffStyle
   workspaceView: WorkspaceView
+  terminalOpen: boolean
+  terminalMounted: boolean
+  terminalHeight: number
+  terminalResizing: boolean
   preferences: AppPreferences
   settingsOpen: boolean
   recentFolders: RecentFolder[]
   search: RepositorySearchController
   commandPaletteRef: React.RefObject<CommandPaletteHandle | null>
+  terminalDockRef: React.RefObject<TerminalDockHandle | null>
   gitWorkflow: ReturnType<typeof useGitWorkflow>
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>
   setError: React.Dispatch<React.SetStateAction<string | null>>
   setRecentFolders: React.Dispatch<React.SetStateAction<RecentFolder[]>>
   setPreferences: React.Dispatch<React.SetStateAction<AppPreferences>>
   setSelectedPath: React.Dispatch<React.SetStateAction<string | null>>
+  setComparison: React.Dispatch<React.SetStateAction<FileComparison | null>>
   setDiffStyle: React.Dispatch<React.SetStateAction<DiffStyle>>
   setWorkspaceView: React.Dispatch<React.SetStateAction<WorkspaceView>>
+  setTerminalHeight: React.Dispatch<React.SetStateAction<number>>
+  setTerminalResizing: React.Dispatch<React.SetStateAction<boolean>>
   toggleSidebar(): void
+  toggleTerminal(): void
+  closeTerminal(): void
+  commitTerminalHeight(height: number): void
   openFolder(): Promise<void>
   openRecentFolder(folder: RecentFolder): Promise<void>
   openPullRequestFromPalette(selector: number | string): void
@@ -119,9 +135,9 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
   const { gitWorkflow } = view
   const { search } = view
   const agent = useAgentSession({
-    context: gitWorkflow.repositoryReview?.patch ?? ''
+    context: formatAgentReviewContext(gitWorkflow.repositoryReview)
   })
-  return <main className="app-shell" data-theme-type={getEditorThemeType(view.preferences.editorTheme)}>
+  return <>
     <Titlebar snapshot={view.snapshot} sidebarVisible={view.sidebarVisible}
       searchQuery={search.query} searchInputRef={search.inputRef} searchingContent={search.searchingContent}
       activeSearchResultId={search.activeResultIndex >= 0
@@ -131,7 +147,8 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
       onSearchQueryChange={search.changeQuery} onSearchKeyDown={search.handleKeyDown} onOpen={view.openFolder}
       onSettingsOpen={view.openSettings} onGitOpen={gitWorkflow.openPanel}
       onBranchesOpen={gitWorkflow.openBranches}
-      agentOpen={agent.open} onAgentToggle={agent.toggle} />
+      agentOpen={agent.open} onAgentToggle={agent.toggle}
+      terminalOpen={view.terminalOpen} onTerminalToggle={view.toggleTerminal} />
 
     {gitWorkflow.actionKey?.startsWith('review:') ? <PullRequestLoadingIndicator /> : null}
     {gitWorkflow.panelOpen && view.snapshot?.kind === 'git' ? <Suspense fallback={null}>
@@ -151,8 +168,10 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
     </Suspense> : null}
 
     <CommandPaletteController ref={view.commandPaletteRef} gitRepositoryOpen={view.snapshot?.kind === 'git'}
+      projectOpen={view.snapshot != null}
       keybindings={view.preferences.keybindings} onOpenPullRequest={view.openPullRequestFromPalette}
-      onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettings} />
+      onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettings}
+      onToggleTerminal={view.toggleTerminal} />
     {view.settingsOpen ? <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
       onClose={() => view.setSettingsOpen(false)} /> : null}
     {!view.settingsOpen && search.isOpen ? <SearchResults query={search.query}
@@ -178,15 +197,34 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
               onSelectPath={view.setSelectedPath} onDiffStyleChange={view.setDiffStyle}
               onWorkspaceViewChange={view.setWorkspaceView} onClosePullRequestReview={gitWorkflow.closeReview}
               submittingPullRequestReview={gitWorkflow.submittingReview} pullRequestReviewMessage={gitWorkflow.submissionMessage}
-              onSubmitPullRequestReview={gitWorkflow.submitReview} onError={view.setError} />
+              onSubmitPullRequestReview={gitWorkflow.submitReview} onComparisonSaved={view.setComparison}
+              onError={view.setError} />
           </Suspense>
           <AgentDock session={agent}
             contextLabel={gitWorkflow.repositoryReview == null ? 'your working tree' : 'this review'} />
         </div>
       </div>
     )}
-  </main>
+  </>
 })
+
+function formatAgentReviewContext(review: RepositoryReview | null): string {
+  if (review == null) return ''
+  const identity = review.kind === 'github'
+    ? [
+        `GitHub pull request: #${review.pullRequest.number} ${review.pullRequest.title}`,
+        `URL: ${review.pullRequest.url}`,
+        `Branches: ${review.pullRequest.baseRefName} ← ${review.pullRequest.headRefName}`
+      ]
+    : [
+        `Local review: ${review.title}`,
+        `Branches: ${review.baseRefName} ← ${review.headRefName}`
+      ]
+  const omitted = review.omittedFiles.length === 0
+    ? []
+    : [`Files omitted from the inline patch: ${review.omittedFiles.map((file) => file.path).join(', ')}`]
+  return [...identity, ...omitted, '', review.patch].join('\n')
+}
 
 const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Element {
   const repositoryReview = view.gitWorkflow.repositoryReview
@@ -194,8 +232,56 @@ const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Eleme
     ? 'welcome'
     : `${view.snapshot.root}:${repositoryReview == null ? 'working-tree'
       : repositoryReview.kind === 'github' ? repositoryReview.pullRequest.url : repositoryReview.id}`
-  return <AgentSessionLayout key={agentSessionKey} {...view} />
+  const shellStyle = {
+    '--terminal-panel-height': `${view.terminalHeight}px`,
+    '--terminal-dock-offset': view.terminalOpen ? `${view.terminalHeight}px` : '0px'
+  } as CSSProperties
+  return <main
+    className={`app-shell ${view.terminalOpen ? 'terminal-open' : ''} ${view.terminalResizing ? 'terminal-resizing' : ''}`}
+    data-theme-type={getEditorThemeType(view.preferences.editorTheme)}
+    style={shellStyle}
+  >
+    <AgentSessionLayout key={agentSessionKey} {...view} />
+    {view.snapshot != null && view.terminalMounted ? <Suspense fallback={null}>
+      <TerminalDock
+        key={view.snapshot.root}
+        ref={view.terminalDockRef}
+        open={view.terminalOpen}
+        projectName={view.snapshot.name}
+        projectRoot={view.snapshot.root}
+        height={view.terminalHeight}
+        fontFamily={CODE_FONTS[view.preferences.codeFont].fontFamily}
+        fontSize={view.preferences.codeFontSize}
+        lineHeight={Math.min(1.8, Math.max(1, view.preferences.codeLineHeight / view.preferences.codeFontSize))}
+        themeType={getEditorThemeType(view.preferences.editorTheme)}
+        shortcutLabel={formatTerminalToggleShortcut()}
+        onClose={view.closeTerminal}
+        onHeightChange={view.setTerminalHeight}
+        onHeightCommit={view.commitTerminalHeight}
+        onResizingChange={view.setTerminalResizing}
+      />
+    </Suspense> : null}
+  </main>
 })
+
+const TERMINAL_HEIGHT_STORAGE_KEY = 'horus:terminal-height:v1'
+
+function loadTerminalHeight(): number {
+  try {
+    const stored = Number(localStorage.getItem(TERMINAL_HEIGHT_STORAGE_KEY))
+    return clampTerminalHeight(stored || DEFAULT_TERMINAL_HEIGHT, window.innerHeight)
+  } catch {
+    return clampTerminalHeight(DEFAULT_TERMINAL_HEIGHT, window.innerHeight)
+  }
+}
+
+function saveTerminalHeight(height: number): void {
+  try {
+    localStorage.setItem(TERMINAL_HEIGHT_STORAGE_KEY, String(height))
+  } catch {
+    // The current height remains active when storage is unavailable.
+  }
+}
 
 export function App(): React.JSX.Element {
   useWindowVisibilitySync()
@@ -209,6 +295,10 @@ export function App(): React.JSX.Element {
   const [sidebarVisible, setSidebarVisible] = useState(true)
   const [diffStyle, setDiffStyle] = useState<DiffStyle>('split')
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('file')
+  const [terminalOpen, setTerminalOpen] = useState(false)
+  const [terminalMounted, setTerminalMounted] = useState(false)
+  const [terminalHeight, setTerminalHeight] = useState(loadTerminalHeight)
+  const [terminalResizing, setTerminalResizing] = useState(false)
   const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [recentFolders, setRecentFolders] = useState<RecentFolder[]>(loadRecentFolders)
@@ -217,6 +307,9 @@ export function App(): React.JSX.Element {
   const comparisonRequestRef = useRef(0)
   const lastComparisonPathRef = useRef<string | null>(null)
   const commandPaletteRef = useRef<CommandPaletteHandle>(null)
+  const terminalDockRef = useRef<TerminalDockHandle>(null)
+  const terminalOpenRef = useRef(false)
+  const terminalFocusReturnRef = useRef<HTMLElement | null>(null)
   const search = useRepositorySearch(snapshot, setSelectedPath, setError)
 
   const applySnapshot = useCallback(
@@ -252,6 +345,41 @@ export function App(): React.JSX.Element {
 
   const toggleSidebar = useCallback(() => {
     setSidebarVisible((visible) => !visible)
+  }, [])
+
+  const setTerminalVisibility = useCallback((visible: boolean) => {
+    if (terminalOpenRef.current === visible) return
+    terminalOpenRef.current = visible
+    if (visible) {
+      terminalFocusReturnRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+      commandPaletteRef.current?.close()
+      setSettingsOpen(false)
+      setTerminalMounted(true)
+      setTerminalOpen(true)
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => terminalDockRef.current?.focus())
+      })
+      return
+    }
+    setTerminalOpen(false)
+    setTerminalResizing(false)
+    const focusTarget = terminalFocusReturnRef.current
+    terminalFocusReturnRef.current = null
+    window.requestAnimationFrame(() => focusTarget?.focus())
+  }, [])
+
+  const toggleTerminal = useCallback(() => {
+    if (snapshot != null) setTerminalVisibility(!terminalOpenRef.current)
+  }, [setTerminalVisibility, snapshot])
+
+  const closeTerminal = useCallback(() => setTerminalVisibility(false), [setTerminalVisibility])
+
+  const commitTerminalHeight = useCallback((height: number) => {
+    const nextHeight = clampTerminalHeight(height, window.innerHeight)
+    setTerminalHeight(nextHeight)
+    saveTerminalHeight(nextHeight)
   }, [])
 
   const openFolder = useCallback(async () => {
@@ -350,6 +478,37 @@ export function App(): React.JSX.Element {
     saveRecentFolders(recentFolders)
   }, [recentFolders])
 
+  useEffect(() => {
+    const clampHeight = (): void => {
+      setTerminalHeight((current) => clampTerminalHeight(current, window.innerHeight))
+    }
+    window.addEventListener('resize', clampHeight)
+    return () => window.removeEventListener('resize', clampHeight)
+  }, [])
+
+  useEffect(() => {
+    if (snapshot != null) return
+    terminalOpenRef.current = false
+    setTerminalOpen(false)
+    setTerminalMounted(false)
+    setTerminalResizing(false)
+  }, [snapshot])
+
+  const handleTerminalShortcut = useEffectEvent((event: KeyboardEvent): void => {
+    if (event.repeat || snapshot == null) return
+    const target = event.target instanceof Element ? event.target : null
+    if (target?.closest('.keybinding-recorder .recording') != null) return
+    if (!isTerminalToggleShortcut(event, preferences.keybindings)) return
+    event.preventDefault()
+    event.stopPropagation()
+    toggleTerminal()
+  })
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleTerminalShortcut, true)
+    return () => window.removeEventListener('keydown', handleTerminalShortcut, true)
+  }, [])
+
   const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
     if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
       event.preventDefault()
@@ -388,6 +547,8 @@ export function App(): React.JSX.Element {
       setPreferences((current) => ({ ...current, foldUnchanged: !current.foldUnchanged }))
     } else if (command === 'toggleMultiFile' && snapshot != null) {
       setWorkspaceView((view) => view === 'file' ? 'multi' : 'file')
+    } else if (command === 'toggleTerminal' && snapshot != null) {
+      toggleTerminal()
     }
   })
 
@@ -398,10 +559,12 @@ export function App(): React.JSX.Element {
 
   const view: AppLayoutProps = {
     snapshot, selectedPath, comparison, repositoryChange, opening, openingRecentPath,
-    loadingDiff, error, sidebarVisible, diffStyle, workspaceView, preferences, settingsOpen,
-    recentFolders, search, commandPaletteRef, gitWorkflow,
-    setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath,
-    setDiffStyle, setWorkspaceView, toggleSidebar, openFolder,
+    loadingDiff, error, sidebarVisible, diffStyle, workspaceView, terminalOpen, terminalMounted,
+    terminalHeight, terminalResizing, preferences, settingsOpen,
+    recentFolders, search, commandPaletteRef, terminalDockRef, gitWorkflow,
+    setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath, setComparison,
+    setDiffStyle, setWorkspaceView, setTerminalHeight, setTerminalResizing,
+    toggleSidebar, toggleTerminal, closeTerminal, commitTerminalHeight, openFolder,
     openRecentFolder, openPullRequestFromPalette, openSettings
   }
   return <AppLayout {...view} />

@@ -1,6 +1,12 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import type { AgentProvider } from '../../shared/contracts'
+import type {
+  AgentAccessMode,
+  AgentModelCatalog,
+  AgentModelOption,
+  AgentProvider,
+  AgentProviderStatuses
+} from '../../shared/contracts'
 import {
   agentAttachmentId,
   describeAgentAttachments,
@@ -8,6 +14,7 @@ import {
   type AgentAttachment
 } from './agentAttachments'
 import { useAgentAnswer, type AgentAnswerApi } from './useAgentAnswer'
+import { getErrorMessage } from './repositoryApi'
 
 interface AgentSessionOptions {
   /** Sent alongside the question so the agent sees the change under review. */
@@ -20,8 +27,23 @@ export interface AgentSessionApi {
   answer: AgentAnswerApi
   open: boolean
   provider: AgentProvider
+  model: string
+  effort: string
+  accessMode: AgentAccessMode
+  models: readonly AgentModelOption[]
+  efforts: readonly string[]
+  loadingModels: boolean
+  statuses: AgentProviderStatuses
+  loadingStatuses: boolean
+  authenticatingProvider: AgentProvider | null
+  statusError: string | null
   attachments: readonly AgentAttachment[]
   setProvider(provider: AgentProvider): void
+  setModel(model: string): void
+  setEffort(effort: string): void
+  setAccessMode(accessMode: AgentAccessMode): void
+  refreshStatuses(): void
+  login(provider: AgentProvider): void
   attach(attachment: AgentAttachment): void
   removeAttachment(id: string): void
   ask(prompt: string): void
@@ -29,11 +51,180 @@ export interface AgentSessionApi {
   close(): void
 }
 
+interface ProviderSelection {
+  model: string
+  effort: string
+}
+
+const DEFAULT_CATALOG: AgentModelCatalog = {
+  claude: [{
+    id: 'sonnet',
+    label: 'Claude Sonnet',
+    description: 'Uses the latest Sonnet model available to Claude Code.',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    defaultEffort: 'high',
+    default: true
+  }],
+  codex: [{
+    id: 'default',
+    label: 'Codex default',
+    description: 'Uses the default model in your Codex configuration.',
+    efforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultEffort: 'high',
+    default: true
+  }]
+}
+
+const AGENT_SETTINGS_KEY = 'horus:agent-settings:v2'
+const DEFAULT_STATUSES: AgentProviderStatuses = {
+  claude: {
+    provider: 'claude',
+    installed: true,
+    authenticated: false,
+    label: 'Checking connection',
+    detail: 'Checking Claude Code.'
+  },
+  codex: {
+    provider: 'codex',
+    installed: true,
+    authenticated: false,
+    label: 'Checking connection',
+    detail: 'Checking Codex.'
+  }
+}
+
+function loadAgentSettings(): {
+  provider: AgentProvider
+  accessMode: AgentAccessMode
+  selections: Record<AgentProvider, ProviderSelection>
+} {
+  const fallback = {
+    provider: 'claude' as AgentProvider,
+    accessMode: 'auto' as AgentAccessMode,
+    selections: {
+      claude: { model: 'sonnet', effort: 'high' },
+      codex: { model: 'default', effort: 'high' }
+    }
+  }
+  try {
+    const value = JSON.parse(localStorage.getItem(AGENT_SETTINGS_KEY) ?? '') as Partial<typeof fallback>
+    return {
+      provider: value.provider === 'codex' ? 'codex' : 'claude',
+      accessMode: value.accessMode === 'review' ? 'review' : 'auto',
+      selections: {
+        claude: value.selections?.claude ?? fallback.selections.claude,
+        codex: value.selections?.codex ?? fallback.selections.codex
+      }
+    }
+  } catch {
+    return fallback
+  }
+}
+
 export function useAgentSession({ context }: AgentSessionOptions): AgentSessionApi {
   const answer = useAgentAnswer()
+  const initialSettings = useMemo(loadAgentSettings, [])
   const [open, setOpen] = useState(false)
-  const [provider, setProvider] = useState<AgentProvider>('claude')
+  const [provider, setProvider] = useState<AgentProvider>(initialSettings.provider)
+  const [accessMode, setAccessMode] = useState<AgentAccessMode>(initialSettings.accessMode)
+  const [selections, setSelections] = useState(initialSettings.selections)
+  const [catalog, setCatalog] = useState<AgentModelCatalog>(DEFAULT_CATALOG)
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [statuses, setStatuses] = useState<AgentProviderStatuses>(DEFAULT_STATUSES)
+  const [loadingStatuses, setLoadingStatuses] = useState(false)
+  const [authenticatingProvider, setAuthenticatingProvider] = useState<AgentProvider | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
   const [attachments, setAttachments] = useState<readonly AgentAttachment[]>([])
+
+  const models = catalog[provider]
+  const selected = selections[provider]
+  const selectedModel = models.find((model) => model.id === selected.model) ??
+    models.find((model) => model.default === true) ?? models[0]!
+  const model = selectedModel.id
+  const efforts = selectedModel.efforts
+  const effort = efforts.includes(selected.effort) ? selected.effort : selectedModel.defaultEffort
+
+  useEffect(() => {
+    try {
+      const persistedAccessMode = accessMode === 'full-access' ? 'auto' : accessMode
+      localStorage.setItem(AGENT_SETTINGS_KEY, JSON.stringify({
+        provider,
+        accessMode: persistedAccessMode,
+        selections
+      }))
+    } catch {
+      // The settings are optional when storage is blocked or full.
+    }
+  }, [accessMode, provider, selections])
+
+  useEffect(() => {
+    if (!open || window.repository == null) return
+    let active = true
+    setLoadingModels(true)
+    void window.repository.getAgentModels()
+      .then((models) => {
+        if (active) setCatalog(models)
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setLoadingModels(false)
+      })
+    return () => { active = false }
+  }, [open])
+
+  const refreshStatuses = useCallback(() => {
+    const repository = window.repository
+    if (repository == null) return
+    setLoadingStatuses(true)
+    setStatusError(null)
+    void repository.getAgentStatuses()
+      .then((next) => {
+        setStatuses(next)
+        if (authenticatingProvider != null && next[authenticatingProvider].authenticated) {
+          setAuthenticatingProvider(null)
+        }
+      })
+      .catch((error: unknown) => setStatusError(getErrorMessage(error)))
+      .finally(() => setLoadingStatuses(false))
+  }, [authenticatingProvider])
+
+  useEffect(() => {
+    if (!open) return
+    refreshStatuses()
+  }, [open, refreshStatuses])
+
+  useEffect(() => {
+    if (!open || authenticatingProvider == null) return
+    const timer = window.setInterval(refreshStatuses, 2_000)
+    return () => window.clearInterval(timer)
+  }, [authenticatingProvider, open, refreshStatuses])
+
+  const login = useCallback((nextProvider: AgentProvider) => {
+    const repository = window.repository
+    if (repository == null) return
+    setAuthenticatingProvider(nextProvider)
+    setStatusError(null)
+    void repository.loginAgent(nextProvider).catch((error: unknown) => {
+      setAuthenticatingProvider(null)
+      setStatusError(getErrorMessage(error))
+    })
+  }, [])
+
+  const setModel = useCallback((nextModel: string) => {
+    const option = catalog[provider].find((candidate) => candidate.id === nextModel)
+    if (option == null) return
+    setSelections((current) => ({
+      ...current,
+      [provider]: { model: nextModel, effort: option.defaultEffort }
+    }))
+  }, [catalog, provider])
+
+  const setEffort = useCallback((nextEffort: string) => {
+    setSelections((current) => ({
+      ...current,
+      [provider]: { ...current[provider], effort: nextEffort }
+    }))
+  }, [provider])
 
   const attach = useCallback((attachment: AgentAttachment) => {
     setOpen(true)
@@ -47,12 +238,46 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
   const ask = useCallback((prompt: string) => {
     // The agent reads the repository itself, so the attachment is passed as a
     // file and line reference rather than as a second copy of those lines.
-    answer.ask(provider, describeAgentAttachments(attachments, prompt), context, prompt)
+    answer.ask({
+      provider,
+      model,
+      effort,
+      accessMode,
+      prompt: describeAgentAttachments(attachments, prompt),
+      context,
+      question: prompt
+    })
     setAttachments([])
-  }, [answer, attachments, context, provider])
+  }, [accessMode, answer, attachments, context, effort, model, provider])
 
   const toggle = useCallback(() => setOpen((current) => !current), [])
   const close = useCallback(() => setOpen(false), [])
 
-  return { answer, open, provider, attachments, setProvider, attach, removeAttachment, ask, toggle, close }
+  return {
+    answer,
+    open,
+    provider,
+    model,
+    effort,
+    accessMode,
+    models,
+    efforts,
+    loadingModels,
+    statuses,
+    loadingStatuses,
+    authenticatingProvider,
+    statusError,
+    attachments,
+    setProvider,
+    setModel,
+    setEffort,
+    setAccessMode,
+    refreshStatuses,
+    login,
+    attach,
+    removeAttachment,
+    ask,
+    toggle,
+    close
+  }
 }

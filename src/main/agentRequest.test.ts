@@ -58,7 +58,15 @@ describe('interpretAgentLine', () => {
 })
 
 describe('parseAgentAskRequest', () => {
-  const valid = { id: 'req-1', provider: 'claude' as const, prompt: 'Explain', context: 'diff' }
+  const valid = {
+    id: 'req-1',
+    provider: 'claude' as const,
+    model: 'sonnet',
+    effort: 'high',
+    accessMode: 'auto' as const,
+    prompt: 'Explain',
+    context: 'diff'
+  }
 
   it('accepts a well-formed request', async () => {
     expect(await parseAgentAskRequest(valid)).toEqual(valid)
@@ -75,36 +83,82 @@ describe('parseAgentAskRequest', () => {
   it('rejects a session id that is not an opaque token', async () => {
     await expect(parseAgentAskRequest({ ...valid, resumeSessionId: '../etc/passwd' })).rejects.toThrow()
   })
+
+  it('rejects a model value that can be parsed as another CLI option', async () => {
+    await expect(parseAgentAskRequest({
+      ...valid,
+      model: '--dangerously-skip-permissions'
+    })).rejects.toThrow('selected agent model')
+  })
 })
 
 describe('activity reporting', () => {
   const toolUse = (name: string, input: Record<string, unknown> = {}): string =>
-    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } })
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: `tool-${name}`, name, input }] } })
+
+  const activities = (line: string) => interpretAgentLine(line)?.activities
 
   it('names the file a read touched', () => {
-    expect(interpretAgentLine(toolUse('Read', { file_path: '/repo/src/markdown.ts' })))
-      .toEqual({ kind: 'activity', text: 'Read markdown.ts' })
+    expect(activities(toolUse('Read', { file_path: '/repo/src/markdown.ts' })))
+      .toEqual([{ id: 'tool-Read', kind: 'file', title: 'Read file', detail: '/repo/src/markdown.ts', status: 'running' }])
   })
 
   it('names the pattern a search used', () => {
-    expect(interpretAgentLine(toolUse('Grep', { pattern: 'parseMarkdown' })))
-      .toEqual({ kind: 'activity', text: 'Searched for parseMarkdown' })
+    expect(activities(toolUse('Grep', { pattern: 'parseMarkdown' })))
+      .toEqual([{ id: 'tool-Grep', kind: 'search', title: 'Search code', detail: 'parseMarkdown', status: 'running' }])
   })
 
   // The model can request a tool it was never granted; the request is denied, so
   // the activity line must not read as though it ran.
-  it('marks a tool outside the read-only set as blocked', () => {
-    expect(interpretAgentLine(toolUse('Bash', { command: 'rm -rf /' })))
-      .toEqual({ kind: 'activity', text: 'Blocked Bash (read-only)' })
-    expect(interpretAgentLine(toolUse('Write', { file_path: '/repo/a.ts' })))
-      .toEqual({ kind: 'activity', text: 'Blocked Write (read-only)' })
+  it('allows sandboxed Bash for repository inspection but blocks write tools', () => {
+    expect(activities(toolUse('Bash', { command: 'git diff --stat' })))
+      .toEqual([{ id: 'tool-Bash', kind: 'command', title: 'Run command', detail: 'git diff --stat', status: 'running' }])
+    expect(activities(toolUse('Write', { file_path: '/repo/a.ts' })))
+      .toEqual([{ id: 'tool-Write', kind: 'tool', title: 'Write blocked', detail: 'Review mode is read-only.', status: 'blocked' }])
+  })
+
+  it('reads Claude result usage and cost', () => {
+    const chunk = interpretAgentLine(JSON.stringify({
+      type: 'result',
+      result: 'done',
+      is_error: false,
+      duration_ms: 1200,
+      num_turns: 2,
+      total_cost_usd: 0.0123,
+      usage: { output_tokens_details: { thinking_tokens: 12 } },
+      modelUsage: {
+        'claude-sonnet-5': {
+          inputTokens: 100,
+          outputTokens: 40,
+          cacheReadInputTokens: 60,
+          cacheCreationInputTokens: 10,
+          costUSD: 0.0123,
+          contextWindow: 200000
+        }
+      }
+    }))
+    expect(chunk?.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteInputTokens: 10,
+      reasoningTokens: 12,
+      totalTokens: 210,
+      contextWindow: 200000,
+      costUsd: 0.0123,
+      durationMs: 1200,
+      turns: 2,
+      model: 'claude-sonnet-5'
+    })
   })
 
   it('reports thinking as its own activity line', () => {
     expect(interpretAgentLine(JSON.stringify({
       type: 'assistant',
       message: { content: [{ type: 'thinking', thinking: 'hmm' }] }
-    }))).toEqual({ kind: 'activity', text: 'Thought briefly' })
+    }))?.activities).toEqual([{
+      id: 'claude-reasoning-0', kind: 'reasoning', title: 'Reasoning', detail: 'hmm', status: 'completed'
+    }])
   })
 
   it('reports activity even when the same message also carries text', () => {
@@ -112,7 +166,9 @@ describe('activity reporting', () => {
       type: 'assistant',
       message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'a.ts' } }, { type: 'text', text: 'hi' }] }
     })
-    expect(interpretAgentLine(line)).toEqual({ kind: 'activity', text: 'Read a.ts' })
+    expect(interpretAgentLine(line)?.activities?.[0]).toMatchObject({
+      kind: 'file', title: 'Read file', detail: 'a.ts', status: 'running'
+    })
   })
 })
 
@@ -148,12 +204,14 @@ describe('Codex event stream', () => {
   })
 
   it('reports a command as it starts, unwrapping the bash -lc shell', () => {
-    expect(interpretAgentLine(lines[3]!))
-      .toEqual({ kind: 'activity', text: "Ran sed -n '1,240p' README.md" })
+    expect(interpretAgentLine(lines[3]!)?.activity).toEqual({
+      id: 'item_1', kind: 'command', title: 'Run command',
+      detail: "sed -n '1,240p' README.md", status: 'running'
+    })
   })
 
-  it('does not report the same command again when it completes', () => {
-    expect(interpretAgentLine(lines[4]!)).toBeNull()
+  it('marks the same command completed', () => {
+    expect(interpretAgentLine(lines[4]!)?.activity).toMatchObject({ id: 'item_1', status: 'completed' })
   })
 
   it('ends the turn on turn.completed', () => {
@@ -171,7 +229,7 @@ describe('Codex event stream', () => {
       type: 'item.started',
       item: { type: 'command_execution', command: long, status: 'in_progress' }
     }))
-    expect(chunk?.text?.length).toBeLessThan(80)
-    expect(chunk?.text?.endsWith('…')).toBe(true)
+    expect(chunk?.activity?.detail?.length).toBeLessThan(80)
+    expect(chunk?.activity?.detail?.endsWith('…')).toBe(true)
   })
 })

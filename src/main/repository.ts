@@ -1,9 +1,9 @@
 import { execFile, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants as fileConstants } from 'node:fs'
-import { access, lstat, readFile, readlink, realpath } from 'node:fs/promises'
+import { access, lstat, readFile, readlink, realpath, rename, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { basename, relative, resolve, sep } from 'node:path'
+import { basename, dirname, relative, resolve, sep } from 'node:path'
 
 import type {
   ContentSearchResult,
@@ -34,6 +34,7 @@ import type {
   RepositoryFileStatus,
   RepositorySnapshot,
   RepositoryStatusEntry,
+  WorkingFileSaveRequest,
   WorkingTreePatch
 } from '../shared/contracts.js'
 
@@ -1386,6 +1387,62 @@ export class RepositoryService {
       binary,
       oversized
     }
+  }
+
+  async saveWorkingFile(input: unknown): Promise<FileComparison> {
+    const request = input as Partial<WorkingFileSaveRequest> | null
+    if (
+      request == null
+      || typeof request.path !== 'string'
+      || typeof request.contents !== 'string'
+      || typeof request.expectedCacheKey !== 'string'
+    ) {
+      throw new Error('The file save request is invalid.')
+    }
+
+    const { path, contents, expectedCacheKey } = request
+    const root = this.#requireRoot()
+    if (!this.#pathSet.has(path)) throw new Error('The selected path is not in the repository.')
+    if (Buffer.byteLength(contents, 'utf8') > MAX_DIFF_FILE_BYTES) {
+      throw new Error('Files larger than 2 MB cannot be edited in Horus.')
+    }
+    if (contents.includes('\0')) throw new Error('Binary files cannot be edited in Horus.')
+
+    const currentVersion = await this.#readWorkingFile(path, root)
+    if (
+      currentVersion?.contents == null
+      || currentVersion.binary
+      || currentVersion.oversized
+    ) {
+      throw new Error('This working file is not editable.')
+    }
+    const currentFile = toDiffFile(path, currentVersion.contents, currentVersion.revision)
+    if (currentFile.cacheKey !== expectedCacheKey) {
+      throw new Error('The file changed on disk. Reload it before saving your draft.')
+    }
+    if (currentFile.contents === contents) return this.getComparison(path)
+
+    const candidate = resolve(root, path)
+    if (!isWithinRoot(root, candidate)) throw new Error('The selected path escapes the repository.')
+    const metadata = await lstat(candidate)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error('Symbolic links and non-file paths cannot be edited.')
+    }
+    const resolvedPath = await realpath(candidate)
+    if (!isWithinRoot(root, resolvedPath)) {
+      throw new Error('The selected file resolves outside the repository.')
+    }
+
+    const temporaryPath = resolve(dirname(resolvedPath), `.horus-save-${randomUUID()}`)
+    try {
+      await writeFile(temporaryPath, contents, { encoding: 'utf8', flag: 'wx', mode: metadata.mode })
+      await rename(temporaryPath, resolvedPath)
+    } finally {
+      await unlink(temporaryPath).catch(() => {})
+    }
+
+    await this.refresh()
+    return this.getComparison(path)
   }
 
   async getWorkingTreePatch(pathsValue: unknown): Promise<WorkingTreePatch> {

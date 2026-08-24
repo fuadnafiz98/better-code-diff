@@ -64,6 +64,7 @@ bun run typecheck && bun test && bun run build
 | `Command+O` | Open a folder |
 | `Command+P` | Go to file |
 | `Command+Shift+F` | Search file contents |
+| `Control+J` / `Command+J` | Toggle the project terminal |
 | `]` | Next file in multi-file review |
 | `[` | Previous file in multi-file review |
 | `V` | Toggle viewed on the current review file |

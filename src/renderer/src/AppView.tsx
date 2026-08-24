@@ -5,17 +5,23 @@ import {
   IconBranch,
   IconCodeFolder,
   IconCollapsedRow,
+  IconCheck,
+  IconClockArrow,
   IconDiffSplit,
   IconDiffUnified,
   IconFileCode,
   IconFiles,
+  IconEye,
   IconFolder,
   IconGear,
+  IconPencil,
   IconRefresh,
+  IconRepeat,
   IconSearch,
   IconSidebarLeft,
   IconSidebarLeftOpen,
   IconSparkles,
+  IconTerminalFill,
   IconTypeWord,
   IconWarningOctogonFill,
   IconX
@@ -28,7 +34,7 @@ import type {
 } from '../../shared/contracts'
 import type { RecentFolder } from './recentFolders'
 import { PerformanceHud } from './PerformanceHud'
-import { formatKeybinding, type KeybindingMap } from './keybindings'
+import { formatKeybinding, formatTerminalToggleShortcut, type KeybindingMap } from './keybindings'
 import { tokenizeSearchPreview } from './searchPreview'
 
 export type DiffStyle = 'split' | 'unified'
@@ -61,6 +67,8 @@ interface TitlebarProps {
   onBranchesOpen(): void
   agentOpen: boolean
   onAgentToggle(): void
+  terminalOpen: boolean
+  onTerminalToggle(): void
 }
 
 export const Titlebar = memo(function Titlebar({
@@ -80,7 +88,9 @@ export const Titlebar = memo(function Titlebar({
   onGitOpen,
   onBranchesOpen,
   agentOpen,
-  onAgentToggle
+  onAgentToggle,
+  terminalOpen,
+  onTerminalToggle
 }: TitlebarProps): React.JSX.Element {
   return (
     <header className="titlebar">
@@ -175,16 +185,28 @@ export const Titlebar = memo(function Titlebar({
           <IconGear />
         </button>
         {snapshot != null ? (
-          <button
-            className={`icon-button agent-titlebar-button ${agentOpen ? 'active' : ''}`}
-            type="button"
-            aria-label={agentOpen ? 'Close agent' : 'Ask agent'}
-            aria-pressed={agentOpen}
-            title={agentOpen ? 'Close Agent' : 'Ask Agent'}
-            onClick={onAgentToggle}
-          >
-            <IconSparkles />
-          </button>
+          <>
+            <button
+              className={`icon-button terminal-titlebar-button ${terminalOpen ? 'active' : ''}`}
+              type="button"
+              aria-label={terminalOpen ? 'Hide terminal' : 'Show terminal'}
+              aria-pressed={terminalOpen}
+              title={`Toggle Terminal (${formatTerminalToggleShortcut()})`}
+              onClick={onTerminalToggle}
+            >
+              <IconTerminalFill />
+            </button>
+            <button
+              className={`icon-button agent-titlebar-button ${agentOpen ? 'active' : ''}`}
+              type="button"
+              aria-label={agentOpen ? 'Close agent' : 'Ask agent'}
+              aria-pressed={agentOpen}
+              title={agentOpen ? 'Close Agent' : 'Ask Agent'}
+              onClick={onAgentToggle}
+            >
+              <IconSparkles />
+            </button>
+          </>
         ) : null}
       </div>
     </header>
@@ -378,6 +400,22 @@ export function Welcome({
   )
 }
 
+export interface FileEditControls {
+  available: boolean
+  startLabel: 'Edit' | 'Resume draft'
+  mode: 'read' | 'edit' | 'preview'
+  dirty: boolean
+  saving: boolean
+  canUndo: boolean
+  canRedo: boolean
+  onStart(): void
+  onModeChange(mode: 'edit' | 'preview'): void
+  onUndo(): void
+  onRedo(): void
+  onCancel(): void
+  onSave(): void
+}
+
 interface DiffToolbarProps {
   comparison: FileComparison | null
   selectedPath: string | null
@@ -390,6 +428,7 @@ interface DiffToolbarProps {
   reviewComparison?: string
   wordWrap: boolean
   foldUnchanged: boolean
+  fileEdit: FileEditControls
   onCloseExternalReview?(): void
   onDiffStyleChange(style: DiffStyle): void
   onWorkspaceViewChange(view: WorkspaceView): void
@@ -421,6 +460,7 @@ export function DiffToolbar({
   reviewComparison,
   wordWrap,
   foldUnchanged,
+  fileEdit,
   onCloseExternalReview,
   onDiffStyleChange,
   onWorkspaceViewChange,
@@ -458,6 +498,42 @@ export function DiffToolbar({
         </span>
       </div>
       <div className="diff-controls">
+        {fileEdit.available ? fileEdit.mode === 'read' ? (
+          <button className="file-edit-start" type="button" onClick={fileEdit.onStart}>
+            <IconPencil /><span>{fileEdit.startLabel}</span>
+          </button>
+        ) : (
+          <div className="file-edit-actions" role="group" aria-label="File editing">
+            <span className={`file-edit-state ${fileEdit.dirty ? 'dirty' : ''}`} role="status">
+              {fileEdit.dirty ? 'Unsaved' : 'Saved'}
+            </span>
+            <div className="editor-option-controls file-history-controls" role="group" aria-label="Edit history">
+              <button type="button" aria-label="Undo" title="Undo" disabled={!fileEdit.canUndo || fileEdit.saving} onClick={fileEdit.onUndo}>
+                <IconClockArrow />
+              </button>
+              <button type="button" aria-label="Redo" title="Redo" disabled={!fileEdit.canRedo || fileEdit.saving} onClick={fileEdit.onRedo}>
+                <IconRepeat />
+              </button>
+            </div>
+            <div className="segmented-control file-edit-mode" role="group" aria-label="Draft view">
+              <button type="button" aria-pressed={fileEdit.mode === 'edit'} className={fileEdit.mode === 'edit' ? 'active' : undefined} onClick={() => fileEdit.onModeChange('edit')} disabled={fileEdit.saving}>
+                <IconPencil /><span>Edit</span>
+              </button>
+              <button type="button" aria-pressed={fileEdit.mode === 'preview'} className={fileEdit.mode === 'preview' ? 'active' : undefined} onClick={() => fileEdit.onModeChange('preview')} disabled={fileEdit.saving}>
+                <IconEye /><span>Preview</span>
+              </button>
+            </div>
+            <button className="file-edit-cancel" type="button" onClick={fileEdit.onCancel} disabled={fileEdit.saving}>
+              <IconX /><span>Cancel</span>
+            </button>
+            <button className="file-edit-save" type="button" onClick={fileEdit.onSave}
+              aria-keyshortcuts="Meta+S Control+S" title="Save file (⌘S)"
+              disabled={!fileEdit.dirty || fileEdit.saving}>
+              {fileEdit.saving ? <IconRefresh className="spin" /> : <IconCheck />}
+              <span>{fileEdit.saving ? 'Saving' : 'Save'}</span>
+            </button>
+          </div>
+        ) : null}
         <div className="editor-option-controls" role="group" aria-label="Editor display options">
           <button type="button" aria-label="Toggle word wrap" aria-pressed={wordWrap} className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle} title="Toggle word wrap">
             <IconTypeWord />

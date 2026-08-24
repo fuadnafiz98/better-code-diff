@@ -1,38 +1,27 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
+import type { CSSProperties } from 'react'
 
 import type { PerformanceMetrics } from '../../shared/contracts'
-import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
+import { PerformanceChart } from './PerformanceChart'
 import {
-  buildMemorySparkline,
-  formatSpan,
-  formatTrendPerHour,
-  memoryTrendPerHour,
+  formatPerformanceMemory,
+  formatPerformancePercent,
+  getMemorySamples,
   recordMemorySample,
   type MemorySample
 } from './performanceHistory'
+import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
 
 const SAMPLE_INTERVAL_MS = 3_000
-const CHART_WIDTH = 252
-const CHART_HEIGHT = 46
-// A leak is a sustained climb, not a spike from opening one big review, so the
-// warning tone waits for a rate that would add a gigabyte over a working day.
-const LEAK_WARNING_MEGABYTES_PER_HOUR = 120
 
-function formatPercent(value: number | null): string {
-  if (value == null || !Number.isFinite(value)) return '—'
-  return `${value < 10 ? value.toFixed(1) : value.toFixed(0)}%`
-}
-
-function formatMemory(megabytes: number): string {
-  return megabytes >= 1_024
-    ? `${(megabytes / 1_024).toFixed(1)} GB`
-    : `${Math.round(megabytes)} MB`
+type ProcessStyle = CSSProperties & {
+  '--performance-process-share': number
 }
 
 export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element {
   const [metrics, setMetrics] = useState<PerformanceMetrics | null>(null)
   const [reviewMetrics, setReviewMetrics] = useState<ReviewMetrics>(getReviewMetrics)
-  const [history, setHistory] = useState<readonly MemorySample[]>([])
+  const [history, setHistory] = useState<readonly MemorySample[]>(getMemorySamples)
 
   useEffect(() => {
     const repository = window.repository
@@ -52,9 +41,11 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
         if (!disposed) {
           setMetrics(nextMetrics)
           setHistory([...recordMemorySample({
-            atMs: Date.now(),
+            atMs: nextMetrics.sampledAt,
             workingSetMegabytes: nextMetrics.workingSetMegabytes,
-            rendererPrivateMegabytes: nextMetrics.rendererPrivateMegabytes
+            rendererPrivateMegabytes: nextMetrics.rendererPrivateMegabytes,
+            cpuPercent: nextMetrics.cpuPercent,
+            gpuProcessCpuPercent: nextMetrics.gpuProcessCpuPercent
           })])
         }
       } catch {
@@ -80,103 +71,95 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
     }
   }, [])
 
-  const trendPerHour = useMemo(() => memoryTrendPerHour(history), [history])
-  const sparkline = useMemo(() => buildMemorySparkline(history, CHART_WIDTH, CHART_HEIGHT), [history])
-  const sessionSpanMs = (history[history.length - 1]?.atMs ?? 0) - (history[0]?.atMs ?? 0)
-  const leaking = trendPerHour != null && trendPerHour >= LEAK_WARNING_MEGABYTES_PER_HOUR
-
   const description = metrics == null
-    ? 'Collecting application performance metrics'
-    : `${metrics.production ? 'Production' : 'Development'} build. ${metrics.processCount} processes. CPU ${formatPercent(metrics.cpuPercent)}. Total application working set ${formatMemory(metrics.workingSetMegabytes)}. Renderer private memory ${formatMemory(metrics.rendererPrivateMegabytes)}.`
+    ? 'Collecting application performance metrics.'
+    : `${metrics.production ? 'Production' : 'Development'} build. ${metrics.processCount} processes. CPU ${formatPerformancePercent(metrics.cpuPercent)}. Total application working set ${formatPerformanceMemory(metrics.workingSetMegabytes)}.`
+  const processPeak = Math.max(1, ...(metrics?.memoryByProcessType.map((entry) => entry.megabytes) ?? []))
 
   return (
     <details className="performance-hud">
-      {/* No `title`: the OS tooltip rendered on top of the panel it opens, and the
-          panel already names itself. */}
       <summary aria-label={description}>
         <span className={`performance-signal ${metrics?.production ? 'production' : ''}`} aria-hidden="true" />
-        <span className="performance-metric"><small>CPU</small><strong>{metrics == null ? '—' : formatPercent(metrics.cpuPercent)}</strong></span>
-        <span className="performance-metric"><small>GPU</small><strong>{metrics == null ? '—' : formatPercent(metrics.gpuProcessCpuPercent)}</strong></span>
-        <span className="performance-memory"><strong>{metrics == null ? '—' : formatMemory(metrics.workingSetMegabytes)}</strong></span>
+        <span className="performance-metric"><small>CPU</small><strong>{formatPerformancePercent(metrics?.cpuPercent)}</strong></span>
+        <span className="performance-metric"><small>GPU</small><strong>{formatPerformancePercent(metrics?.gpuProcessCpuPercent)}</strong></span>
+        <span className="performance-memory"><strong>{metrics == null ? '—' : formatPerformanceMemory(metrics.workingSetMegabytes)}</strong></span>
       </summary>
+
       <div className="performance-popover">
-        <header>
-          <strong>Performance</strong>
+        <header className="performance-popover-header">
+          <span>
+            <strong>Performance</strong>
+            <small>{metrics?.production ? 'Production build' : 'Development build'}</small>
+          </span>
           <span className="performance-live">Live</span>
         </header>
 
-        {/* The number the panel exists to answer leads, at a size the rows cannot
-            compete with, so the rest reads as its breakdown. */}
-        <div className="performance-headline">
-          <span className="performance-headline-value">
-            {metrics == null ? '—' : formatMemory(metrics.workingSetMegabytes)}
-          </span>
-          <span className="performance-headline-label">
-            Total working set
-            <small>{metrics == null ? 'Sampling…' : `${metrics.processCount} processes · ${metrics.production ? 'production' : 'development'}`}</small>
-          </span>
-        </div>
+        <div className="performance-popover-body">
+          <dl className="performance-kpis">
+            <div><dt>App CPU</dt><dd>{formatPerformancePercent(metrics?.cpuPercent)}</dd><small>All processes</small></div>
+            <div><dt>GPU</dt><dd>{formatPerformancePercent(metrics?.gpuProcessCpuPercent)}</dd><small>Graphics process</small></div>
+            <div><dt>Working set</dt><dd>{metrics == null ? '—' : formatPerformanceMemory(metrics.workingSetMegabytes)}</dd><small>{metrics == null ? 'Sampling…' : `${metrics.processCount} processes`}</small></div>
+          </dl>
 
-        {/* Working set over the session: the shape answers "is this leaking?",
-            which no single reading can. */}
-        <section className="performance-group performance-chart">
-          <h3>Memory over time<span className={`performance-trend ${leaking ? 'warning' : ''}`}>{formatTrendPerHour(trendPerHour)}</span></h3>
-          {sparkline == null ? (
-            <p className="performance-chart-empty">Sampling — the trend appears after a few minutes.</p>
-          ) : (
-            <>
-              <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} preserveAspectRatio="none" role="img"
-                aria-label={`Working set from ${formatMemory(sparkline.low)} to ${formatMemory(sparkline.high)} over ${formatSpan(sessionSpanMs)}, trending ${formatTrendPerHour(trendPerHour)}`}>
-                <path className="performance-chart-area" d={sparkline.area} />
-                <path className="performance-chart-line" d={sparkline.line} />
-              </svg>
-              <div className="performance-chart-axis">
-                <span>{formatMemory(sparkline.low)} low</span>
-                <span>{formatSpan(sessionSpanMs)}</span>
-                <span>{formatMemory(sparkline.high)} peak</span>
+          <PerformanceChart history={history} />
+
+          <details className="performance-diagnostics">
+            <summary>
+              <span>
+                <strong>Diagnostics</strong>
+                <small>Runtime · Activity · Processes</small>
+              </span>
+            </summary>
+
+            <div className="performance-diagnostics-content">
+              <div className="performance-details-grid">
+                <section className="performance-group">
+                  <h3>Runtime</h3>
+                  <dl>
+                    <div><dt>Renderer private</dt><dd>{metrics == null ? '—' : formatPerformanceMemory(metrics.rendererPrivateMegabytes)}</dd></div>
+                    <div><dt>Main private</dt><dd>{metrics == null ? '—' : formatPerformanceMemory(metrics.mainPrivateMegabytes)}</dd></div>
+                    <div><dt>V8 heap</dt><dd>{metrics == null ? '—' : `${formatPerformanceMemory(metrics.rendererHeapUsedMegabytes)} / ${formatPerformanceMemory(metrics.rendererHeapTotalMegabytes)}`}</dd></div>
+                    <div><dt>DOM nodes</dt><dd>{metrics?.rendererDomNodes.toLocaleString() ?? '—'}</dd></div>
+                  </dl>
+                </section>
+
+                <section className="performance-group">
+                  <h3>Review activity</h3>
+                  <dl>
+                    <div><dt>Files loaded</dt><dd>{reviewMetrics.loadedItems.toLocaleString()}</dd></div>
+                    <div><dt>Files hydrated</dt><dd>{reviewMetrics.hydratedFiles.toLocaleString()}</dd></div>
+                    <div><dt>Workspace renders</dt><dd>{reviewMetrics.workspaceRenders.toLocaleString()}</dd></div>
+                    <div><dt>Agent events</dt><dd>{reviewMetrics.agentStreamEvents.toLocaleString()}</dd></div>
+                  </dl>
+                </section>
               </div>
-            </>
-          )}
-        </section>
 
-        <section className="performance-group">
-          <h3>Memory</h3>
-          <dl>
-            <div><dt>Renderer private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.rendererPrivateMegabytes)}</dd></div>
-            <div><dt>Main private</dt><dd>{metrics == null ? '—' : formatMemory(metrics.mainPrivateMegabytes)}</dd></div>
-            <div><dt>V8 heap</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererHeapUsedMegabytes)} / ${formatMemory(metrics.rendererHeapTotalMegabytes)}`}</dd></div>
-            <div><dt>Blink</dt><dd>{metrics == null ? '—' : `${formatMemory(metrics.rendererBlinkAllocatedMegabytes)} / ${formatMemory(metrics.rendererBlinkTotalMegabytes)}`}</dd></div>
-          </dl>
-        </section>
+              {metrics != null && metrics.memoryByProcessType.length > 0 ? (
+                <section className="performance-processes">
+                  <h3>Working set by process</h3>
+                  <ul role="list">
+                    {metrics.memoryByProcessType.map((entry) => (
+                      <li key={entry.type}>
+                        <span>{entry.type}</span>
+                        <span className="performance-process-track" aria-hidden="true">
+                          <span style={{ '--performance-process-share': entry.megabytes / processPeak } as ProcessStyle} />
+                        </span>
+                        <strong>{formatPerformanceMemory(entry.megabytes)}</strong>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
 
-        <section className="performance-group">
-          <h3>Review</h3>
-          <dl>
-            <div><dt>Files loaded</dt><dd>{reviewMetrics.loadedItems.toLocaleString()}</dd></div>
-            <div><dt>Files hydrated</dt><dd>{reviewMetrics.hydratedFiles.toLocaleString()}</dd></div>
-            <div><dt>Workspace renders</dt><dd>{reviewMetrics.workspaceRenders.toLocaleString()}</dd></div>
-            <div><dt>Agent stream events</dt><dd>{reviewMetrics.agentStreamEvents.toLocaleString()}</dd></div>
-            <div><dt>DOM nodes</dt><dd>{metrics?.rendererDomNodes.toLocaleString() ?? '—'}</dd></div>
-          </dl>
-        </section>
-
-        {metrics != null && metrics.memoryByProcessType.length > 0 ? (
-          <section className="performance-group">
-            <h3>Processes</h3>
-            <dl>
-              {metrics.memoryByProcessType.map((entry) => (
-                <div key={entry.type}><dt>{entry.type}</dt><dd>{formatMemory(entry.megabytes)}</dd></div>
-              ))}
-            </dl>
-          </section>
-        ) : null}
-
-        <footer className="performance-footnote">
-          Every Electron process, sampled every 3s, paused while hidden.
-          {metrics?.lastRendererTermination == null
-            ? null
-            : ` Last renderer exit: ${metrics.lastRendererTermination.reason} (${metrics.lastRendererTermination.exitCode}).`}
-        </footer>
+              <footer className="performance-footnote">
+                Samples every 3 seconds while this window is visible.
+                {metrics?.lastRendererTermination == null
+                  ? null
+                  : ` Last renderer exit: ${metrics.lastRendererTermination.reason} (${metrics.lastRendererTermination.exitCode}).`}
+              </footer>
+            </div>
+          </details>
+        </div>
       </div>
     </details>
   )

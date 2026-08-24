@@ -10,19 +10,22 @@ import {
   IconBranch,
   IconGear,
   IconInReview,
-  IconSearch
+  IconSearch,
+  IconTerminalFill
 } from '@pierre/icons'
 
-import { formatKeybinding, type KeybindingMap } from './keybindings'
+import { formatKeybinding, formatTerminalToggleShortcut, type KeybindingMap } from './keybindings'
 import { parsePullRequestSelector } from './pullRequestSelector'
 
 interface CommandPaletteProps {
   gitRepositoryOpen: boolean
+  projectOpen: boolean
   keybindings: KeybindingMap
   onClose(): void
   onOpenPullRequest(selector: number | string): void
   onOpenRepository(): void
   onOpenSettings(): void
+  onToggleTerminal(): void
 }
 
 export interface CommandPaletteHandle {
@@ -40,11 +43,13 @@ function pullRequestNumber(selector: number | string): number {
 
 function CommandPalette({
   gitRepositoryOpen,
+  projectOpen,
   keybindings,
   onClose,
   onOpenPullRequest,
   onOpenRepository,
-  onOpenSettings
+  onOpenSettings,
+  onToggleTerminal
 }: CommandPaletteProps): React.JSX.Element {
   const [query, setQuery] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
@@ -120,6 +125,11 @@ function CommandPalette({
               <button type="button" onClick={() => { onClose(); onOpenSettings() }}>
                 <span className="command-icon"><IconGear /></span>
                 <span><strong>Open settings</strong><small>Appearance, editor, and keybindings</small></span>
+              </button>
+              <button type="button" onClick={() => { onClose(); onToggleTerminal() }} disabled={!projectOpen}>
+                <span className="command-icon"><IconTerminalFill /></span>
+                <span><strong>Toggle terminal</strong><small>{projectOpen ? 'Open a shell in this project' : 'Open a project first'}</small></span>
+                <kbd>{formatTerminalToggleShortcut()}</kbd>
               </button>
             </>
           )}

@@ -6,7 +6,9 @@ import type {
   PerformanceMetrics,
   PullRequestReviewProgress,
   RepositoryApi,
-  RepositoryChangeEvent
+  RepositoryChangeEvent,
+  TerminalDataEvent,
+  TerminalExitEvent
 } from '../shared/contracts.js'
 import { IPC_CHANNELS } from '../shared/contracts.js'
 
@@ -16,6 +18,7 @@ const repositoryApi: RepositoryApi = {
   openPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPath, path),
   refresh: () => ipcRenderer.invoke(IPC_CHANNELS.refresh),
   getComparison: (path) => ipcRenderer.invoke(IPC_CHANNELS.getComparison, path),
+  saveWorkingFile: (request) => ipcRenderer.invoke(IPC_CHANNELS.saveWorkingFile, request),
   getWorkingTreePatch: (paths) => ipcRenderer.invoke(IPC_CHANNELS.getWorkingTreePatch, paths),
   searchContent: (query) => ipcRenderer.invoke(IPC_CHANNELS.searchContent, query),
   cancelContentSearch: () => ipcRenderer.send(IPC_CHANNELS.cancelContentSearch),
@@ -38,14 +41,45 @@ const repositoryApi: RepositoryApi = {
   getPullRequestReview: (selector) => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestReview, selector),
   checkoutPullRequest: (number) => ipcRenderer.invoke(IPC_CHANNELS.checkoutPullRequest, number),
   submitPullRequestReview: (selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, commitId, event, body, comments),
+  getAgentModels: () => ipcRenderer.invoke(IPC_CHANNELS.getAgentModels),
+  getAgentStatuses: () => ipcRenderer.invoke(IPC_CHANNELS.getAgentStatuses),
+  loginAgent: (provider) => ipcRenderer.invoke(IPC_CHANNELS.loginAgent, provider),
   askAgent: (request) => ipcRenderer.invoke(IPC_CHANNELS.askAgent, request),
   cancelAgent: (id) => ipcRenderer.invoke(IPC_CHANNELS.cancelAgent, id),
+  respondAgentApproval: (requestId, decision) =>
+    ipcRenderer.invoke(IPC_CHANNELS.respondAgentApproval, requestId, decision),
   onAgentEvent: (listener) => {
     const handler = (_event: unknown, agentEvent: AgentStreamEvent): void => listener(agentEvent)
     ipcRenderer.on(IPC_CHANNELS.agentEvent, handler)
     return () => {
       ipcRenderer.removeListener(IPC_CHANNELS.agentEvent, handler)
     }
+  },
+  createTerminal: (columns, rows) => ipcRenderer.invoke(IPC_CHANNELS.createTerminal, columns, rows),
+  readyTerminal: (sessionId) => ipcRenderer.send(IPC_CHANNELS.readyTerminal, sessionId),
+  writeTerminal: (sessionId, data) => {
+    const chunkSize = 64 * 1_024
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      ipcRenderer.send(IPC_CHANNELS.writeTerminal, sessionId, data.slice(offset, offset + chunkSize))
+    }
+  },
+  resizeTerminal: (sessionId, columns, rows) =>
+    ipcRenderer.send(IPC_CHANNELS.resizeTerminal, sessionId, columns, rows),
+  clearTerminal: (sessionId) => ipcRenderer.send(IPC_CHANNELS.clearTerminal, sessionId),
+  killTerminal: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.killTerminal, sessionId),
+  onTerminalData: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, terminalEvent: TerminalDataEvent): void => {
+      listener(terminalEvent)
+    }
+    ipcRenderer.on(IPC_CHANNELS.terminalData, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.terminalData, handler)
+  },
+  onTerminalExit: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, terminalEvent: TerminalExitEvent): void => {
+      listener(terminalEvent)
+    }
+    ipcRenderer.on(IPC_CHANNELS.terminalExit, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.terminalExit, handler)
   },
   getPerformanceMetrics: async () => {
     const [mainMetrics, rendererMemory] = await Promise.all([

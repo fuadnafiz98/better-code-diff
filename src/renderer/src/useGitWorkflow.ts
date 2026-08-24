@@ -144,6 +144,7 @@ export function useGitWorkflow({
     // files is appended. Waiting for the whole fetch left the app on a spinner for
     // minutes on pull requests with thousands of files.
     let streamed = false
+    let selectedFirstStreamedPath = false
     const stopListening = requireRepositoryApi().onPullRequestReviewProgress((progress) => {
       if (progress.kind === 'metadata') {
         streamed = true
@@ -154,10 +155,9 @@ export function useGitWorkflow({
         setActionKey(null)
         return
       }
-      let firstPath: string | null = null
+      const firstPath = selectedFirstStreamedPath ? null : progress.files[0]?.path ?? null
       setRepositoryReview((current) => {
         if (current == null || current.kind !== 'github' || current.selector !== progress.selector) return current
-        if (current.files.length === 0) firstPath = progress.files[0]?.path ?? null
         return {
           ...current,
           files: [...current.files, ...progress.files],
@@ -167,7 +167,10 @@ export function useGitWorkflow({
       })
       // Selecting on the first page rather than at the end keeps the review from
       // jumping back to file one once the last page lands.
-      if (firstPath != null) onSelectPath(firstPath)
+      if (firstPath != null) {
+        selectedFirstStreamedPath = true
+        onSelectPath(firstPath)
+      }
     })
     try {
       const review = await requireRepositoryApi().getPullRequestReview(selector)

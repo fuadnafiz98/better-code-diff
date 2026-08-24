@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
-import type { DiffLineAnnotation, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
+import type { DiffLineAnnotation, FileContents, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
 import { File, MultiFileDiff, useVirtualizer, Virtualizer } from '@pierre/diffs/react'
+import type { Editor, EditorOptions } from '@pierre/diffs/edit'
 import {
   IconCodeSearch,
   IconFile,
@@ -88,6 +89,9 @@ interface DiffSurfaceProps {
   loading: boolean
   diffStyle: DiffStyle
   preferences: AppPreferences
+  editMode: 'read' | 'edit' | 'preview'
+  onDraftFileChange(file: FileContents): void
+  onEditorAttach(editor: Editor<ReviewAnnotationMetadata>): void
   threadsByPath: Record<string, ReviewThread[]>
   setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>
 }
@@ -115,7 +119,17 @@ function VirtualizedBackToTop(): React.JSX.Element {
   )
 }
 
-function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPath, setThreadsByPath }: DiffSurfaceProps): React.JSX.Element {
+function DiffContents({
+  comparison,
+  loading,
+  diffStyle,
+  preferences,
+  editMode,
+  onDraftFileChange,
+  onEditorAttach,
+  threadsByPath,
+  setThreadsByPath
+}: DiffSurfaceProps): React.JSX.Element {
   const [reviewCursor, setReviewCursor] = useState<{
     path: string | undefined
     selectedLines: SelectedLineRange | null
@@ -136,6 +150,15 @@ function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPa
     '--diffs-line-height': `${preferences.codeLineHeight}px`,
     '--diffs-font-features': '"calt" 1, "liga" 1'
   }) as CSSProperties, [preferences])
+  const editorOptions = useMemo<EditorOptions<ReviewAnnotationMetadata>>(() => ({
+    historyMaxEntries: 500,
+    persistState: true,
+    roundedSelection: true,
+    matchBrackets: true,
+    autoSurround: 'default',
+    onAttach: onEditorAttach,
+    onChange: onDraftFileChange
+  }), [onDraftFileChange, onEditorAttach])
 
   const beginComment = useCallback((range: SelectedLineRange) => {
     setReviewCursor({ path: comparisonPath, selectedLines: range, draftRange: range })
@@ -254,6 +277,8 @@ function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPa
         <Virtualizer className="diff-scroll editor-scroll" contentClassName="diff-content editor-content">
           <File<ReviewAnnotationMetadata>
             file={comparison.newFile}
+            edit={editMode === 'edit'}
+            editorOptions={editorOptions}
             options={{
               theme: preferences.editorTheme,
               themeType: getEditorThemeType(preferences.editorTheme),
@@ -292,6 +317,8 @@ function DiffContents({ comparison, loading, diffStyle, preferences, threadsByPa
   }
   const sharedDiffProps = {
     options: diffOptions,
+    edit: editMode === 'edit',
+    editorOptions,
     selectedLines,
     lineAnnotations: diffAnnotations,
     renderAnnotation: (annotation: DiffLineAnnotation<ReviewAnnotationMetadata>) => renderReviewAnnotation(annotation.metadata),

@@ -34,6 +34,17 @@ const EMPTY_LOAD_STATE: ReviewLoadState = {
 
 export const FOLDER_REVIEW_PAGE_SIZE = 50
 
+interface ParsedPatchCache {
+  key: string
+  length: number
+  items: CodeViewItem<ReviewAnnotationMetadata>[]
+}
+
+interface ExternalReviewItems {
+  cache: ParsedPatchCache
+  items: CodeViewItem<ReviewAnnotationMetadata>[]
+}
+
 interface ReviewLoadStateOptions {
   pathsKey: string
   stablePaths: string[]
@@ -80,12 +91,8 @@ export function useReviewLoadState({
 
   // Streaming appends to the patch, so only the new tail is parsed. Re-parsing the
   // whole document on every page turned a 13 MB review into quadratic work.
-  const parsedPatchRef = useRef<{
-    key: string
-    length: number
-    items: CodeViewItem<ReviewAnnotationMetadata>[]
-  }>({ key: '', length: 0, items: [] })
-  const externalReviewItems = useMemo<CodeViewItem<ReviewAnnotationMetadata>[] | null>(() => {
+  const parsedPatchRef = useRef<ParsedPatchCache>({ key: '', length: 0, items: [] })
+  const externalReview = useMemo<ExternalReviewItems | null>(() => {
     if (repositoryReview == null) return null
     const key = repositoryReview.kind === 'github'
       ? `pr-${repositoryReview.pullRequest.number}-${repositoryReview.pullRequest.updatedAt}`
@@ -99,9 +106,16 @@ export function useReviewLoadState({
     // Merging by id keeps this idempotent, so a repeated render cannot duplicate a
     // file or lose one.
     const items = appended ? mergeReviewItems(parsed.items, pendingItems) : pendingItems
-    parsedPatchRef.current = { key, length: repositoryReview.patch.length, items }
-    return orderReviewItems(items, stablePaths)
+    return {
+      cache: { key, length: repositoryReview.patch.length, items },
+      items: orderReviewItems(items, stablePaths)
+    }
   }, [repositoryReview, stablePaths])
+  const externalReviewItems = externalReview?.items ?? null
+
+  useEffect(() => {
+    if (externalReview != null) parsedPatchRef.current = externalReview.cache
+  }, [externalReview])
 
   useEffect(() => {
     let cancelled = false

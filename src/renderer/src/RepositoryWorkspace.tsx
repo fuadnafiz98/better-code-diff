@@ -1,15 +1,15 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { FileTree as FileTreeModel } from '@pierre/trees'
 import { useFileTree } from '@pierre/trees/react'
-import { WorkerPoolContextProvider, useWorkerPool } from '@pierre/diffs/react'
+import { EditProvider, WorkerPoolContextProvider, useWorkerPool } from '@pierre/diffs/react'
 
 import type { AgentProvider, FileComparison, PullRequestReviewComment, PullRequestReviewEvent, RepositoryChangeEvent, RepositoryFileStatus, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
-import { DiffToolbar, type DiffStyle, type WorkspaceView } from './AppView'
+import { DiffToolbar, type DiffStyle, type FileEditControls, type WorkspaceView } from './AppView'
 import { Explorer } from './Explorer'
 import { getEditorThemeType, type AppPreferences } from './preferences'
 import { SidebarResizer } from './SidebarResizer'
 import { PullRequestReviewBar } from './PullRequestReviewBar'
-import type { ReviewThread } from './ReviewComments'
+import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import { createPullRequestReviewComments } from './pullRequestReviewComments'
 import type { AgentAttachment } from './agentAttachments'
 import { usePullRequestConversation } from './usePullRequestConversation'
@@ -26,6 +26,7 @@ import {
 } from './diffWorkerConfig'
 import { markRepositoryWorkspaceRender } from './reviewMetrics'
 import { useCodeZoomGesture } from './useCodeZoomGesture'
+import { createDiffEditor, useFileEditing } from './useFileEditing'
 
 const DiffSurface = lazy(() => import('./DiffSurface'))
 const MultiFileReview = lazy(() => import('./MultiFileReview'))
@@ -139,6 +140,7 @@ interface RepositoryWorkspaceProps {
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
   onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string, comments: PullRequestReviewComment[]): Promise<boolean>
+  onComparisonSaved(comparison: FileComparison): void
   onError(message: string | null): void
 }
 
@@ -153,6 +155,7 @@ interface RepositoryReviewHeaderProps {
   repositoryReview: RepositoryReview | null
   wordWrap: boolean
   foldUnchanged: boolean
+  fileEdit: FileEditControls
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
   inlineCommentCount: number
@@ -176,6 +179,7 @@ function RepositoryReviewHeader({
   repositoryReview,
   wordWrap,
   foldUnchanged,
+  fileEdit,
   submittingPullRequestReview,
   pullRequestReviewMessage,
   inlineCommentCount,
@@ -203,6 +207,7 @@ function RepositoryReviewHeader({
         reviewComparison={repositoryReview == null ? undefined : repositoryReview.kind === 'github' ? `${repositoryReview.pullRequest.baseRefName} → ${repositoryReview.pullRequest.headRefName}` : `${repositoryReview.baseRefName} → ${repositoryReview.headRefName}`}
         wordWrap={wordWrap}
         foldUnchanged={foldUnchanged}
+        fileEdit={fileEdit}
         onCloseExternalReview={repositoryReview == null ? undefined : onClosePullRequestReview}
         onDiffStyleChange={onDiffStyleChange}
         onWorkspaceViewChange={onWorkspaceViewChange}
@@ -239,19 +244,74 @@ function RepositoryReviewHeader({
   )
 }
 
+function useReviewTreeData(
+  snapshot: RepositorySnapshot,
+  repositoryReview: RepositoryReview | null,
+  threadsByPath: Record<string, ReviewThread[]>
+) {
+  const unorderedReviewPaths = useMemo(
+    () => repositoryReview?.files.map((file) => file.path)
+      ?? (snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : snapshot.paths),
+    [repositoryReview, snapshot.kind, snapshot.paths, snapshot.statuses]
+  )
+  const reviewPaths = useMemo(() => orderPathsForTree(unorderedReviewPaths), [unorderedReviewPaths])
+  const rawTreePaths = repositoryReview == null ? snapshot.paths : reviewPaths
+  const treePathsKey = rawTreePaths.join('\0')
+  const treePaths = useMemo(() => treePathsKey === '' ? [] : treePathsKey.split('\0'), [treePathsKey])
+  const treeStatuses = useMemo<Array<{ path: string; status: TreeFileStatus }>>(
+    () => repositoryReview == null
+      ? snapshot.statuses.map((status) => ({ path: status.path, status: toTreeStatus(status.status) }))
+      : repositoryReview.files.map((file) => ({ path: file.path, status: 'modified' as const })),
+    [repositoryReview, snapshot.statuses]
+  )
+  const treeStatusesKey = treeStatuses.map((status) => `${status.status}:${status.path}`).join('\0')
+  const reviewComments = useMemo(
+    () => createPullRequestReviewComments(threadsByPath),
+    [threadsByPath]
+  )
+
+  return { reviewPaths, treePaths, treePathsKey, treeStatuses, treeStatusesKey, reviewComments }
+}
+
+function useViewerConfiguration(
+  preferences: AppPreferences,
+  codeZoom: { codeFontSize: number; codeLineHeight: number },
+  workerTheme: AppPreferences['editorTheme']
+) {
+  const highlighterOptions = useMemo(() => ({
+    langs: DIFF_HIGHLIGHTER_LANGUAGES,
+    theme: preferences.editorTheme,
+    useTokenTransformer: true,
+    ...DIFF_HIGHLIGHTER_LIMITS
+  }), [preferences.editorTheme])
+  const viewerPreferences = useMemo(
+    () => ({
+      ...preferences,
+      codeFontSize: codeZoom.codeFontSize,
+      codeLineHeight: codeZoom.codeLineHeight,
+      editorTheme: workerTheme
+    }),
+    [codeZoom.codeFontSize, codeZoom.codeLineHeight, preferences, workerTheme]
+  )
+  return { highlighterOptions, viewerPreferences }
+}
+
+function repositoryReviewIdentity(repositoryReview: RepositoryReview | null): string {
+  if (repositoryReview == null) return 'working-tree'
+  return repositoryReview.kind === 'github'
+    ? `github:${repositoryReview.pullRequest.url}`
+    : repositoryReview.id
+}
+
 const RepositoryWorkspace = memo(function RepositoryWorkspace({
   snapshot, selectedPath, comparison, loadingDiff, diffStyle, workspaceView,
   preferences, onAttachToAgent, onPreferencesChange, repositoryReview, repositoryChange, onSelectPath,
   onDiffStyleChange, onWorkspaceViewChange, onClosePullRequestReview, submittingPullRequestReview,
-  pullRequestReviewMessage, onSubmitPullRequestReview, onError
+  pullRequestReviewMessage, onSubmitPullRequestReview, onComparisonSaved, onError
 }: RepositoryWorkspaceProps): React.JSX.Element {
   useEffect(markRepositoryWorkspaceRender)
   const isFilePreview = workspaceView === 'file' && comparison?.mode === 'file'
-  const reviewIdentity = repositoryReview == null
-    ? 'working-tree'
-    : repositoryReview.kind === 'github'
-      ? `github:${repositoryReview.pullRequest.url}`
-      : repositoryReview.id
+  const reviewIdentity = repositoryReviewIdentity(repositoryReview)
   const {
     threadsByPath,
     setThreadsByPath,
@@ -274,44 +334,20 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   const instantTreeFollowResetRef = useRef<number | null>(null)
   const multiFileScrollTopRef = useRef(0)
   const [multiFileNavigationRevision, setMultiFileNavigationRevision] = useState(0)
-  const unorderedReviewPaths = useMemo(
-    () => repositoryReview?.files.map((file) => file.path)
-      ?? (snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : snapshot.paths),
-    [repositoryReview, snapshot.kind, snapshot.paths, snapshot.statuses]
-  )
-  const reviewPaths = useMemo(
-    () => orderPathsForTree(unorderedReviewPaths),
-    [unorderedReviewPaths]
-  )
-  const rawTreePaths = repositoryReview == null ? snapshot.paths : reviewPaths
-  const treePathsKey = rawTreePaths.join('\0')
-  const treePaths = useMemo(() => treePathsKey === '' ? [] : treePathsKey.split('\0'), [treePathsKey])
-  const treeStatuses = useMemo<Array<{ path: string; status: TreeFileStatus }>>(
-    () => repositoryReview == null
-      ? snapshot.statuses.map((status) => ({ path: status.path, status: toTreeStatus(status.status) }))
-      : repositoryReview.files.map((file) => ({ path: file.path, status: 'modified' as const })),
-    [repositoryReview, snapshot.statuses]
-  )
-  const treeStatusesKey = treeStatuses.map((status) => `${status.status}:${status.path}`).join('\0')
+  const fileEditing = useFileEditing({
+    comparison,
+    selectedPath,
+    workspaceView,
+    repositoryReview,
+    onWorkspaceViewChange,
+    onSelectPath,
+    onComparisonChange: onComparisonSaved,
+    onError
+  })
+  const { reviewPaths, treePaths, treePathsKey, treeStatuses, treeStatusesKey, reviewComments } =
+    useReviewTreeData(snapshot, repositoryReview, threadsByPath)
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
-  const reviewComments = useMemo<PullRequestReviewComment[]>(
-    () => createPullRequestReviewComments(threadsByPath),
-    [threadsByPath]
-  )
-  const highlighterOptions = useMemo(() => ({
-    langs: DIFF_HIGHLIGHTER_LANGUAGES,
-    theme: preferences.editorTheme,
-    ...DIFF_HIGHLIGHTER_LIMITS
-  }), [preferences.editorTheme])
-  const viewerPreferences = useMemo(
-    () => ({
-      ...preferences,
-      codeFontSize: codeZoom.codeFontSize,
-      codeLineHeight: codeZoom.codeLineHeight,
-      editorTheme: workerTheme
-    }),
-    [codeZoom.codeFontSize, codeZoom.codeLineHeight, preferences, workerTheme]
-  )
+  const { highlighterOptions, viewerPreferences } = useViewerConfiguration(preferences, codeZoom, workerTheme)
 
   const submitPullRequestReview = useCallback(async (event: PullRequestReviewEvent, body: string) => {
     const submitted = await onSubmitPullRequestReview(event, body, reviewComments)
@@ -490,7 +526,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
       <SidebarResizer />
       <section ref={codeZoom.surfaceRef} className={`diff-panel ${isFilePreview ? 'file-preview-mode' : 'diff-mode'}`} id="repository-diff">
         <RepositoryReviewHeader
-          comparison={comparison}
+          comparison={fileEditing.renderedComparison}
           selectedPath={selectedPath}
           isGitRepository={snapshot.kind === 'git'}
           isFilePreview={isFilePreview}
@@ -500,6 +536,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
           repositoryReview={repositoryReview}
           wordWrap={preferences.wordWrap}
           foldUnchanged={preferences.foldUnchanged}
+          fileEdit={fileEditing.controls}
           submittingPullRequestReview={submittingPullRequestReview}
           pullRequestReviewMessage={pullRequestReviewMessage}
           inlineCommentCount={reviewComments.length}
@@ -515,9 +552,10 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         {viewerSuspended ? (
           <div className="diff-state"><span>Viewer paused while the app is hidden.</span></div>
         ) : (
-          <WorkerPoolContextProvider poolOptions={DIFF_WORKER_POOL_OPTIONS} highlighterOptions={highlighterOptions}>
-            <DiffWorkerThemeSync theme={preferences.editorTheme} onThemeReady={setWorkerTheme} />
-            <Suspense key={workerTheme} fallback={<div className="diff-state"><span>Preparing viewer…</span></div>}>
+          <EditProvider<ReviewAnnotationMetadata> createEditor={createDiffEditor}>
+            <WorkerPoolContextProvider poolOptions={DIFF_WORKER_POOL_OPTIONS} highlighterOptions={highlighterOptions}>
+              <DiffWorkerThemeSync theme={preferences.editorTheme} onThemeReady={setWorkerTheme} />
+              <Suspense key={workerTheme} fallback={<div className="diff-state"><span>Preparing viewer…</span></div>}>
               {workspaceView === 'multi' ? (
                 <MultiFileReview
               key={`${reviewIdentity}:${reviewSessionRevision}`}
@@ -544,15 +582,18 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
               reviewCommand={reviewCommand}
                 />
               ) : (
-                <DiffSurface comparison={comparison} loading={loadingDiff} diffStyle={diffStyle} preferences={viewerPreferences}
+                <DiffSurface comparison={fileEditing.renderedComparison} loading={loadingDiff} diffStyle={diffStyle} preferences={viewerPreferences}
+                  editMode={fileEditing.activeSession?.mode ?? 'read'} onDraftFileChange={fileEditing.updateDraftFile}
+                  onEditorAttach={fileEditing.attachEditor}
                   threadsByPath={threadsByPath} setThreadsByPath={setThreadsByPath} />
               )}
-            </Suspense>
-          </WorkerPoolContextProvider>
+              </Suspense>
+            </WorkerPoolContextProvider>
+          </EditProvider>
         )}
-        {isFilePreview ? (
+        {isFilePreview || fileEditing.activeSession != null ? (
           <footer className="editor-statusbar">
-            <span>Read only</span>
+            <span>{fileEditing.activeSession?.mode === 'edit' ? 'Editing' : fileEditing.activeSession?.mode === 'preview' ? 'Draft preview' : 'Read only'}</span>
             <span>UTF-8</span>
             <span>LF</span>
             {fileExtension != null ? <span>{fileExtension}</span> : null}

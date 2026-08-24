@@ -7,6 +7,7 @@ export type AppCommand =
   | 'toggleWordWrap'
   | 'toggleFoldUnchanged'
   | 'toggleMultiFile'
+  | 'toggleTerminal'
   | 'openSettings'
 
 export type KeybindingMap = Record<AppCommand, string>
@@ -20,6 +21,7 @@ export const DEFAULT_KEYBINDINGS: KeybindingMap = {
   toggleWordWrap: 'Alt+KeyZ',
   toggleFoldUnchanged: 'Meta+Alt+KeyF',
   toggleMultiFile: 'Meta+Shift+KeyM',
+  toggleTerminal: 'Meta+KeyJ',
   openSettings: 'Meta+Comma'
 }
 
@@ -33,6 +35,7 @@ export const KEYBINDING_COMMANDS: ReadonlyArray<{
   { command: 'toggleWordWrap', label: 'Toggle word wrap', description: 'Wrap or scroll long code lines.' },
   { command: 'toggleFoldUnchanged', label: 'Toggle context folding', description: 'Fold or expand unchanged diff regions.' },
   { command: 'toggleMultiFile', label: 'Toggle review view', description: 'Switch between file and multi-file review.' },
+  { command: 'toggleTerminal', label: 'Toggle terminal', description: 'Show or hide the project terminal.' },
   { command: 'goToFile', label: 'Search repository', description: 'Search file names and repository content together.' },
   { command: 'searchContent', label: 'Search repository (alternate)', description: 'Open the same unified search with the code-search shortcut.' },
   { command: 'openFolder', label: 'Open folder', description: 'Open the macOS folder picker.' },
@@ -96,6 +99,19 @@ export function commandFromEvent(event: KeyboardEvent, keybindings: KeybindingMa
   return null
 }
 
+/**
+ * The terminal follows the platform convention while also accepting Ctrl+J.
+ * This remains available when a saved custom binding exists from an older build.
+ */
+export function isTerminalToggleShortcut(event: KeyboardEvent, keybindings: KeybindingMap): boolean {
+  const binding = keybindingFromEvent(event)
+  return binding === 'Meta+KeyJ' || binding === 'Control+KeyJ' || binding === keybindings.toggleTerminal
+}
+
+export function formatTerminalToggleShortcut(): string {
+  return '⌃J / ⌘J'
+}
+
 export function formatKeybinding(keybinding: string): string {
   const parts = keybinding.split('+')
   const code = parts.at(-1) ?? ''
@@ -104,6 +120,7 @@ export function formatKeybinding(keybinding: string): string {
       : code === 'Comma' ? ','
         : code === 'Period' ? '.'
           : code === 'Slash' ? '/'
+            : code === 'Backquote' ? '`'
             : code === 'Space' ? 'Space'
               : code
   return `${parts.includes('Control') ? '⌃' : ''}${parts.includes('Alt') ? '⌥' : ''}${parts.includes('Shift') ? '⇧' : ''}${parts.includes('Meta') ? '⌘' : ''}${key}`

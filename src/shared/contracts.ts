@@ -269,6 +269,12 @@ export interface FileComparison {
   oversized: boolean
 }
 
+export interface WorkingFileSaveRequest {
+  path: string
+  contents: string
+  expectedCacheKey: string
+}
+
 export interface ContentSearchResult {
   path: string
   line: number
@@ -278,9 +284,92 @@ export interface ContentSearchResult {
 
 export type AgentProvider = 'claude' | 'codex'
 
+export type AgentAccessMode = 'review' | 'auto' | 'full-access'
+
+export interface AgentModelOption {
+  id: string
+  label: string
+  description: string
+  efforts: string[]
+  defaultEffort: string
+  default?: boolean
+}
+
+export type AgentModelCatalog = Record<AgentProvider, AgentModelOption[]>
+
+export interface AgentProviderStatus {
+  provider: AgentProvider
+  installed: boolean
+  authenticated: boolean
+  label: string
+  detail: string
+  version?: string
+}
+
+export type AgentProviderStatuses = Record<AgentProvider, AgentProviderStatus>
+
+export interface AgentRateLimitWindow {
+  label: string
+  usedPercent: number
+  resetsAt: number | null
+}
+
+export interface AgentUsageUpdate {
+  inputTokens?: number
+  outputTokens?: number
+  cachedInputTokens?: number
+  cacheWriteInputTokens?: number
+  reasoningTokens?: number
+  totalTokens?: number
+  contextWindow?: number
+  costUsd?: number
+  durationMs?: number
+  turns?: number
+  model?: string
+  rateLimits?: AgentRateLimitWindow[]
+}
+
+export type AgentActivityKind =
+  | 'reasoning'
+  | 'command'
+  | 'file'
+  | 'search'
+  | 'tool'
+  | 'plan'
+  | 'status'
+
+export type AgentActivityStatus = 'running' | 'completed' | 'failed' | 'blocked' | 'waiting'
+
+export interface AgentActivityUpdate {
+  id: string
+  kind: AgentActivityKind
+  title: string
+  status: AgentActivityStatus
+  detail?: string
+  output?: string
+  /** Append streamed text to the existing detail or output instead of replacing it. */
+  append?: 'detail' | 'output'
+  startedAt?: number
+  completedAt?: number
+  durationMs?: number
+}
+
+export interface AgentApprovalRequest {
+  requestId: string
+  itemId: string
+  type: 'command' | 'file-change' | 'permissions'
+  title: string
+  detail: string
+}
+
+export type AgentApprovalDecision = 'accept' | 'acceptForSession' | 'decline'
+
 export interface AgentAskInput {
   id: string
   provider: AgentProvider
+  model: string
+  effort: string
+  accessMode: AgentAccessMode
   prompt: string
   context: string
   resumeSessionId?: string
@@ -288,10 +377,30 @@ export interface AgentAskInput {
 
 export interface AgentStreamEvent {
   id: string
-  /** `activity` reports what the agent is doing (a tool call, thinking). */
-  kind: 'text' | 'session' | 'done' | 'error' | 'activity'
+  kind: 'text' | 'session' | 'done' | 'error' | 'activity' | 'approval' | 'usage'
   text?: string
   sessionId?: string
+  activity?: AgentActivityUpdate
+  approval?: AgentApprovalRequest
+  usage?: AgentUsageUpdate
+}
+
+export interface TerminalSession {
+  id: string
+  cwd: string
+  shell: string
+  pid: number
+}
+
+export interface TerminalDataEvent {
+  sessionId: string
+  data: string
+}
+
+export interface TerminalExitEvent {
+  sessionId: string
+  exitCode: number
+  signal?: number
 }
 
 export interface RepositoryApi {
@@ -300,6 +409,7 @@ export interface RepositoryApi {
   openPath(path: string): Promise<RepositorySnapshot>
   refresh(): Promise<RepositorySnapshot>
   getComparison(path: string): Promise<FileComparison>
+  saveWorkingFile(request: WorkingFileSaveRequest): Promise<FileComparison>
   getWorkingTreePatch(paths: string[]): Promise<WorkingTreePatch>
   searchContent(query: string): Promise<ContentSearchResult[]>
   cancelContentSearch(): void
@@ -325,9 +435,21 @@ export interface RepositoryApi {
     body: string,
     comments: PullRequestReviewComment[]
   ): Promise<void>
+  getAgentModels(): Promise<AgentModelCatalog>
+  getAgentStatuses(): Promise<AgentProviderStatuses>
+  loginAgent(provider: AgentProvider): Promise<void>
   askAgent(request: AgentAskInput): Promise<void>
   cancelAgent(id: string): Promise<void>
+  respondAgentApproval(requestId: string, decision: AgentApprovalDecision): Promise<void>
   onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void
+  createTerminal(columns: number, rows: number): Promise<TerminalSession>
+  readyTerminal(sessionId: string): void
+  writeTerminal(sessionId: string, data: string): void
+  resizeTerminal(sessionId: string, columns: number, rows: number): void
+  clearTerminal(sessionId: string): void
+  killTerminal(sessionId: string): Promise<void>
+  onTerminalData(listener: (event: TerminalDataEvent) => void): () => void
+  onTerminalExit(listener: (event: TerminalExitEvent) => void): () => void
   getPerformanceMetrics(): Promise<PerformanceMetrics>
   setVisibility(visible: boolean): Promise<void>
   findInPage(query: string, forward: boolean, findNext: boolean): Promise<number>
@@ -343,6 +465,7 @@ export const IPC_CHANNELS = {
   openPath: 'repository:open-path',
   refresh: 'repository:refresh',
   getComparison: 'repository:get-comparison',
+  saveWorkingFile: 'repository:save-working-file',
   getWorkingTreePatch: 'repository:get-working-tree-patch',
   searchContent: 'repository:search-content',
   cancelContentSearch: 'repository:cancel-content-search',
@@ -362,9 +485,21 @@ export const IPC_CHANNELS = {
   markPullRequestReady: 'repository:mark-pull-request-ready',
   checkoutPullRequest: 'repository:checkout-pull-request',
   submitPullRequestReview: 'repository:submit-pull-request-review',
+  getAgentModels: 'agent:get-models',
+  getAgentStatuses: 'agent:get-statuses',
+  loginAgent: 'agent:login',
   askAgent: 'agent:ask',
   cancelAgent: 'agent:cancel',
+  respondAgentApproval: 'agent:respond-approval',
   agentEvent: 'agent:event',
+  createTerminal: 'terminal:create',
+  readyTerminal: 'terminal:ready',
+  writeTerminal: 'terminal:write',
+  resizeTerminal: 'terminal:resize',
+  clearTerminal: 'terminal:clear',
+  killTerminal: 'terminal:kill',
+  terminalData: 'terminal:data',
+  terminalExit: 'terminal:exit',
   getPerformanceMetrics: 'app:get-performance-metrics',
   setVisibility: 'app:set-visibility',
   findInPage: 'app:find-in-page',

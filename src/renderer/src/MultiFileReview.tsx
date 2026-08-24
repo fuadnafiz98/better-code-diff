@@ -207,6 +207,13 @@ const SCROLL_RESTORE_MAX_FRAMES = 60
 // Any of these means the reader took over; a pending restore must yield to them.
 const SCROLL_TAKEOVER_EVENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
 
+function observeScrollTakeover(container: HTMLElement | null, listener: () => void): () => void {
+  for (const type of SCROLL_TAKEOVER_EVENTS) container?.addEventListener(type, listener, { passive: true })
+  return () => {
+    for (const type of SCROLL_TAKEOVER_EVENTS) container?.removeEventListener(type, listener)
+  }
+}
+
 // The viewer maps its logical scroll offset onto a paged scroll scaffold, so the
 // container's own scrollTop is not the position the viewer reports or accepts.
 function getViewerScrollTop(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): number | null {
@@ -673,8 +680,7 @@ const MultiFileReview = memo(function MultiFileReview({
     const cancel = (): void => {
       cancelled = true
     }
-    const container = scrollContainerRef.current
-    for (const type of SCROLL_TAKEOVER_EVENTS) container?.addEventListener(type, cancel, { passive: true })
+    const stopObservingScrollTakeover = observeScrollTakeover(scrollContainerRef.current, cancel)
     const step = (): void => {
       if (cancelled) return
       const viewer = viewerRef.current
@@ -690,7 +696,7 @@ const MultiFileReview = memo(function MultiFileReview({
     return () => {
       cancelled = true
       window.cancelAnimationFrame(frame)
-      for (const type of SCROLL_TAKEOVER_EVENTS) container?.removeEventListener(type, cancel)
+      stopObservingScrollTakeover()
     }
   }, [loadState.items.length, loading])
 

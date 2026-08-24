@@ -4,6 +4,8 @@ import {
   DEFAULT_KEYBINDINGS,
   commandFromEvent,
   findKeybindingConflicts,
+  formatTerminalToggleShortcut,
+  isTerminalToggleShortcut,
   reviewCommandFromEvent,
   formatKeybinding,
   keybindingFromEvent
@@ -20,6 +22,16 @@ describe('keybindings', () => {
     expect(commandFromEvent(event, DEFAULT_KEYBINDINGS)).toBe('toggleSidebar')
     expect(formatKeybinding('Meta+Shift+KeyF')).toBe('⇧⌘F')
     expect(commandFromEvent(keyboardEvent('KeyK', { metaKey: true }), DEFAULT_KEYBINDINGS)).toBe('openCommandPalette')
+    expect(commandFromEvent(keyboardEvent('KeyJ', { metaKey: true }), DEFAULT_KEYBINDINGS)).toBe('toggleTerminal')
+    expect(isTerminalToggleShortcut(keyboardEvent('KeyJ', { metaKey: true }), DEFAULT_KEYBINDINGS)).toBe(true)
+    expect(isTerminalToggleShortcut(keyboardEvent('KeyJ', { ctrlKey: true }), DEFAULT_KEYBINDINGS)).toBe(true)
+    expect(isTerminalToggleShortcut(keyboardEvent('Backquote', { ctrlKey: true }), DEFAULT_KEYBINDINGS)).toBe(false)
+    expect(formatTerminalToggleShortcut()).toBe('⌃J / ⌘J')
+  })
+
+  test('keeps a custom terminal shortcut available alongside Ctrl+J and Command+J', () => {
+    const keybindings = { ...DEFAULT_KEYBINDINGS, toggleTerminal: 'Alt+KeyT' }
+    expect(isTerminalToggleShortcut(keyboardEvent('KeyT', { altKey: true }), keybindings)).toBe(true)
   })
 
   test('rejects unmodified typing keys', () => {

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 
 import {
+  buildPerformanceChart,
   buildMemorySparkline,
   clearMemorySamples,
+  findNearestSampleIndex,
   formatSpan,
   formatTrendPerHour,
   getMemorySamples,
@@ -81,6 +83,43 @@ describe('buildMemorySparkline', () => {
 
   it('draws a flat series down the middle', () => {
     expect(buildMemorySparkline(series(2, 500, 0), 100, 40)?.line).toBe('M0.0,20.0L100.0,20.0')
+  })
+})
+
+describe('buildPerformanceChart', () => {
+  it('uses a padded memory domain and preserves elapsed sample time', () => {
+    const geometry = buildPerformanceChart(series(3, 500, 10), 'memory', 400, 160)
+    expect(geometry?.domainLow).toBe(200)
+    expect(geometry?.domainHigh).toBe(575)
+    expect(geometry?.primary.points[0]?.x).toBe(38)
+    expect(geometry?.primary.points[1]?.x).toBe(215)
+    expect(geometry?.primary.points[2]?.x).toBe(392)
+  })
+
+  it('starts CPU charts at zero and includes GPU values', () => {
+    const history = series(2, 500, 0).map((sample, index) => ({
+      ...sample,
+      cpuPercent: 16 + index * 4,
+      gpuProcessCpuPercent: 3 + index
+    }))
+    const geometry = buildPerformanceChart(history, 'cpu', 400, 160)
+    expect(geometry?.domainLow).toBe(0)
+    expect(geometry?.domainHigh).toBe(30)
+    expect(geometry?.secondary.points).toHaveLength(2)
+  })
+})
+
+describe('findNearestSampleIndex', () => {
+  it('finds the closest timestamp and resolves ties to the earlier sample', () => {
+    const history = series(3, 500, 1)
+    expect(findNearestSampleIndex(history, -1)).toBe(0)
+    expect(findNearestSampleIndex(history, 1_500)).toBe(0)
+    expect(findNearestSampleIndex(history, 4_900)).toBe(2)
+    expect(findNearestSampleIndex(history, 99_000)).toBe(2)
+  })
+
+  it('returns -1 for empty history', () => {
+    expect(findNearestSampleIndex([], Date.now())).toBe(-1)
   })
 })
 

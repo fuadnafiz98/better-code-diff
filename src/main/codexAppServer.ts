@@ -7,6 +7,12 @@ import {
   type CodexRateLimit
 } from './codexProtocol.js'
 import type { AgentStreamChunk } from './agentRequest.js'
+import type {
+  AgentAccessMode,
+  AgentApprovalDecision,
+  AgentApprovalRequest,
+  AgentModelOption
+} from '../shared/contracts.js'
 
 // `codex exec --json` never emits token deltas — an agent message arrives whole
 // when the turn ends, which is why Codex looked broken and then slow. The
@@ -23,6 +29,30 @@ interface PendingRequest {
 export interface CodexTurnHandlers {
   onChunk(chunk: AgentStreamChunk): void
   onRateLimit?(limit: CodexRateLimit): void
+  onApproval?(approval: AgentApprovalRequest): Promise<AgentApprovalDecision>
+}
+
+export function getCodexThreadAccess(accessMode: AgentAccessMode): {
+  sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
+  approvalPolicy: 'never' | 'on-request'
+} {
+  if (accessMode === 'review') return { sandbox: 'read-only', approvalPolicy: 'never' }
+  if (accessMode === 'auto') return { sandbox: 'workspace-write', approvalPolicy: 'on-request' }
+  return { sandbox: 'danger-full-access', approvalPolicy: 'never' }
+}
+
+export function getCodexTurnSandbox(accessMode: AgentAccessMode, cwd: string): Record<string, unknown> {
+  if (accessMode === 'review') return { type: 'readOnly', networkAccess: false }
+  if (accessMode === 'auto') {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: [cwd],
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false
+    }
+  }
+  return { type: 'dangerFullAccess' }
 }
 
 export class CodexAppServer {
@@ -34,6 +64,7 @@ export class CodexAppServer {
   #cwd: string | null = null
   #threadId: string | null = null
   #currentTurnId: string | null = null
+  #agentMessagePhases = new Map<string, string>()
   // `turn/start` replies as soon as the turn is *created*, long before any text
   // arrives, so the turn is only finished when turn/completed or turn/failed lands.
   #turnCompletion: { resolve(): void; reject(error: Error): void } | null = null
@@ -90,7 +121,25 @@ export class CodexAppServer {
       process.stderr.write(`codex ← ${JSON.stringify(message).slice(0, 300)}\n`)
     }
     if (typeof message.method === 'string') {
+      if (message.id != null) {
+        this.#handleServerRequest(message)
+        return
+      }
       const notification = { method: message.method, params: message.params }
+      const params = (typeof message.params === 'object' && message.params != null
+        ? message.params
+        : {}) as Record<string, unknown>
+      const item = typeof params.item === 'object' && params.item != null
+        ? params.item as Record<string, unknown>
+        : null
+      const itemId = typeof item?.id === 'string'
+        ? item.id
+        : typeof params.itemId === 'string' ? params.itemId : null
+      if (message.method === 'item/started' && item?.type === 'agentMessage' &&
+          itemId != null && typeof item.phase === 'string') {
+        this.#agentMessagePhases.set(itemId, item.phase)
+      }
+      const agentMessagePhase = itemId == null ? undefined : this.#agentMessagePhases.get(itemId)
       // Remember the live turn so Stop can interrupt precisely this one.
       if (message.method === 'turn/started') {
         const turn = (message.params as { turn?: { id?: unknown } } | undefined)?.turn
@@ -100,8 +149,9 @@ export class CodexAppServer {
       if (message.method === 'turn/failed') this.#finishTurn(null)
       const limit = readCodexRateLimit(notification)
       if (limit != null) this.#handlers?.onRateLimit?.(limit)
-      const chunk = interpretCodexNotification(notification)
+      const chunk = interpretCodexNotification(notification, agentMessagePhase)
       if (chunk != null) this.#handlers?.onChunk(chunk)
+      if (message.method === 'item/completed' && itemId != null) this.#agentMessagePhases.delete(itemId)
       return
     }
     if (typeof message.id !== 'number') return
@@ -114,6 +164,83 @@ export class CodexAppServer {
       return
     }
     request.resolve((message.result ?? {}) as Record<string, unknown>)
+  }
+
+  #handleServerRequest(message: Record<string, unknown>): void {
+    const method = message.method
+    const requestId = message.id
+    if (requestId == null || typeof method !== 'string') return
+    if (method === 'item/tool/requestUserInput') {
+      this.#replyToServer(requestId, { answers: {} })
+      return
+    }
+    if (method === 'mcpServer/elicitation/request') {
+      this.#replyToServer(requestId, { action: 'decline', content: null, _meta: null })
+      return
+    }
+    if (method === 'currentTime/read') {
+      this.#replyToServer(requestId, { currentTimeAt: Math.floor(Date.now() / 1_000) })
+      return
+    }
+    if (method !== 'item/commandExecution/requestApproval' &&
+        method !== 'item/fileChange/requestApproval' &&
+        method !== 'item/permissions/requestApproval') {
+      this.#replyToServer(requestId, null, {
+        code: -32601,
+        message: `Horus does not implement ${method}.`
+      })
+      return
+    }
+    const params = (typeof message.params === 'object' && message.params != null
+      ? message.params
+      : {}) as Record<string, unknown>
+    const itemId = typeof params.itemId === 'string' ? params.itemId : `codex-item-${String(requestId)}`
+    const command = typeof params.command === 'string' ? params.command : ''
+    const reason = typeof params.reason === 'string' ? params.reason : ''
+    const permissions = typeof params.permissions === 'object' && params.permissions != null
+      ? params.permissions as Record<string, unknown>
+      : null
+    const type = method === 'item/commandExecution/requestApproval'
+      ? 'command'
+      : method === 'item/fileChange/requestApproval' ? 'file-change' : 'permissions'
+    const approval: AgentApprovalRequest = {
+      requestId: `codex-${String(requestId)}`,
+      itemId,
+      type,
+      title: type === 'command'
+        ? 'Allow command?'
+        : type === 'file-change' ? 'Allow file changes?' : 'Allow extra access?',
+      detail: command || reason || (permissions == null
+        ? 'The agent needs permission to continue.'
+        : JSON.stringify(permissions))
+    }
+    const decide = this.#handlers?.onApproval?.(approval) ?? Promise.resolve('decline')
+    void decide.then((decision) => {
+      const result = type === 'permissions'
+        ? {
+            permissions: decision === 'decline' || permissions == null ? {} : permissions,
+            scope: decision === 'acceptForSession' ? 'session' : 'turn'
+          }
+        : { decision }
+      this.#replyToServer(requestId, result)
+    }).catch(() => {
+      this.#replyToServer(requestId, type === 'permissions'
+        ? { permissions: {}, scope: 'turn' }
+        : { decision: 'decline' })
+    })
+  }
+
+  #replyToServer(
+    id: unknown,
+    result: Record<string, unknown> | null,
+    error?: { code: number; message: string }
+  ): void {
+    const child = this.#child
+    if (child == null || child.exitCode != null) return
+    const response = error == null
+      ? { jsonrpc: '2.0', id, result }
+      : { jsonrpc: '2.0', id, error }
+    child.stdin?.write(`${JSON.stringify(response)}\n`)
   }
 
   #finishTurn(error: Error | null): void {
@@ -155,20 +282,32 @@ export class CodexAppServer {
     executable: string
     cwd: string
     prompt: string
+    model: string
+    effort: string
+    accessMode: AgentAccessMode
     resumeThreadId?: string
     handlers: CodexTurnHandlers
   }): Promise<void> {
-    const { executable, cwd, prompt, resumeThreadId, handlers } = options
+    const { executable, cwd, prompt, model, effort, accessMode, resumeThreadId, handlers } = options
     // Registered after the server is up: starting it tears down any previous
     // child, and that teardown clears the handler slot.
     await this.#ensureStarted(cwd, executable)
     this.#handlers = handlers
 
     if (this.#threadId == null) {
-      // read-only keeps the same promise the panel makes: Codex may look, not write.
+      const access = getCodexThreadAccess(accessMode)
+      const threadParams = {
+        cwd,
+        sandbox: access.sandbox,
+        approvalPolicy: access.approvalPolicy,
+        ...(model === '' || model === 'default' ? {} : { model })
+      }
       const started = resumeThreadId == null
-        ? await this.#request(CODEX_METHODS.threadStart, { cwd, sandbox: 'read-only' }, CODEX_STARTUP_TIMEOUT_MS)
-        : await this.#request(CODEX_METHODS.threadResume, { threadId: resumeThreadId }, CODEX_STARTUP_TIMEOUT_MS)
+        ? await this.#request(CODEX_METHODS.threadStart, threadParams, CODEX_STARTUP_TIMEOUT_MS)
+        : await this.#request(CODEX_METHODS.threadResume, {
+            threadId: resumeThreadId,
+            ...threadParams
+          }, CODEX_STARTUP_TIMEOUT_MS)
       const thread = started.thread as { id?: unknown } | undefined
       // The id lives at result.thread.id, not result.threadId.
       const threadId = typeof thread?.id === 'string' ? thread.id : null
@@ -187,13 +326,56 @@ export class CodexAppServer {
     try {
       await this.#request(CODEX_METHODS.turnStart, {
         threadId: this.#threadId,
-        input: [{ type: 'text', text: prompt }]
+        input: [{ type: 'text', text: prompt }],
+        approvalPolicy: getCodexThreadAccess(accessMode).approvalPolicy,
+        sandboxPolicy: getCodexTurnSandbox(accessMode, cwd),
+        summary: 'detailed',
+        ...(model === '' || model === 'default' ? {} : { model }),
+        ...(effort === '' || effort === 'default' ? {} : { effort })
       }, CODEX_STARTUP_TIMEOUT_MS)
       await completed
     } finally {
       clearTimeout(timeout)
       this.#turnCompletion = null
     }
+  }
+
+  async listModels(executable: string, cwd: string): Promise<AgentModelOption[]> {
+    await this.#ensureStarted(cwd, executable)
+    const models: AgentModelOption[] = []
+    let cursor: string | null = null
+    do {
+      const result = await this.#request(CODEX_METHODS.modelList, {
+        limit: 100,
+        ...(cursor == null ? {} : { cursor })
+      }, CODEX_STARTUP_TIMEOUT_MS)
+      const data = Array.isArray(result.data) ? result.data : []
+      for (const candidate of data) {
+        if (typeof candidate !== 'object' || candidate == null) continue
+        const model = candidate as Record<string, unknown>
+        const modelSlug = typeof model.model === 'string' ? model.model : model.id
+        if (model.hidden === true || typeof modelSlug !== 'string') continue
+        const efforts = Array.isArray(model.supportedReasoningEfforts)
+          ? model.supportedReasoningEfforts.flatMap((option) => {
+              if (typeof option !== 'object' || option == null) return []
+              const value = (option as Record<string, unknown>).reasoningEffort
+              return typeof value === 'string' ? [value] : []
+            })
+          : []
+        models.push({
+          id: modelSlug,
+          label: typeof model.displayName === 'string' ? model.displayName : modelSlug,
+          description: typeof model.description === 'string' ? model.description : '',
+          efforts,
+          defaultEffort: typeof model.defaultReasoningEffort === 'string'
+            ? model.defaultReasoningEffort
+            : efforts[0] ?? 'medium',
+          ...(model.isDefault === true ? { default: true } : {})
+        })
+      }
+      cursor = typeof result.nextCursor === 'string' ? result.nextCursor : null
+    } while (cursor != null)
+    return models
   }
 
   interrupt(): void {
@@ -209,6 +391,7 @@ export class CodexAppServer {
     this.#finishTurn(new Error('Codex was stopped.'))
     this.#threadId = null
     this.#currentTurnId = null
+    this.#agentMessagePhases.clear()
     this.#buffer = ''
     const child = this.#child
     this.#child = null

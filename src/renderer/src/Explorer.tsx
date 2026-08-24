@@ -54,7 +54,7 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType, on
   }, [onRowActivate])
 
   return (
-    <aside className="sidebar" id="repository-explorer" onClick={activateClickedRow}>
+    <aside className="sidebar" id="repository-explorer">
       <div className="sidebar-heading">
         <strong>Explorer</strong>
         <div className="sidebar-heading-actions">
@@ -76,7 +76,7 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType, on
           </button>
         </div>
       </div>
-      <FileTree className="project-tree" model={model} style={treeStyle} />
+      <FileTree className="project-tree" model={model} style={treeStyle} onClick={activateClickedRow} />
     </aside>
   )
 })

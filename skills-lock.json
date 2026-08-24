@@ -73,6 +73,12 @@
       "skillPath": ".agents/skills/deslop/SKILL.md",
       "computedHash": "9764a64c05365175b61ea024add957b6dd871bef3331c9f4cd7b366fffa11b94"
     },
+    "diffs": {
+      "source": "pierrecomputer/pierre",
+      "sourceType": "github",
+      "skillPath": "skills/diffs/SKILL.md",
+      "computedHash": "e09cc280eca6d961db4be654705cbb8b0aa0ccdfcd4640739bda554204b09c17"
+    },
     "electron-best-practices": {
       "source": "jwynia/agent-skills",
       "ref": "main",

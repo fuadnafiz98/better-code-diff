@@ -1,7 +1,14 @@
-// Answering questions about a diff never needs write access. This is both the
-// list passed to the agent and the list used to label its activity, so the two
-// cannot drift apart.
+import type {
+  AgentAccessMode,
+  AgentActivityUpdate,
+  AgentRateLimitWindow,
+  AgentUsageUpdate
+} from '../shared/contracts.js'
+
+// Review mode passes this list to the agent and uses it to label activity, so
+// its enforced access and displayed access cannot drift apart.
 export const AGENT_READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'] as const
+export const AGENT_REVIEW_TOOLS = [...AGENT_READ_ONLY_TOOLS, 'Bash'] as const
 
 export const MAX_AGENT_PROMPT_LENGTH = 200_000
 export const MAX_AGENT_CONTEXT_LENGTH = 400_000
@@ -9,6 +16,9 @@ export const MAX_AGENT_CONTEXT_LENGTH = 400_000
 export interface AgentAskRequest {
   id: string
   provider: 'claude' | 'codex'
+  model: string
+  effort: string
+  accessMode: AgentAccessMode
   prompt: string
   context: string
   resumeSessionId?: string
@@ -27,6 +37,9 @@ async function loadDecoder(): Promise<AgentAskDecoder> {
   const decode = Schema.decodeUnknownOption(Schema.Struct({
     id: Schema.String,
     provider: Schema.Literals(['claude', 'codex']),
+    model: Schema.String,
+    effort: Schema.String,
+    accessMode: Schema.Literals(['review', 'auto', 'full-access']),
     prompt: Schema.String,
     context: Schema.String,
     resumeSessionId: Schema.optional(Schema.String)
@@ -49,12 +62,22 @@ export async function parseAgentAskRequest(value: unknown): Promise<AgentAskRequ
   if (request.id.trim() === '' || request.id.length > 128) {
     throw new Error('The agent request could not be identified.')
   }
+  if (request.model !== '' &&
+      !/^[A-Za-z0-9][A-Za-z0-9._:/[\]-]{0,127}$/.test(request.model)) {
+    throw new Error('The selected agent model is not valid.')
+  }
+  if (!/^[a-z0-9-]{0,32}$/i.test(request.effort)) {
+    throw new Error('The selected reasoning effort is not valid.')
+  }
   if (request.resumeSessionId != null && !/^[A-Za-z0-9-]{1,128}$/.test(request.resumeSessionId)) {
     throw new Error('The agent session could not be identified.')
   }
   return {
     id: request.id,
     provider: request.provider,
+    model: request.model,
+    effort: request.effort,
+    accessMode: request.accessMode,
     prompt,
     context: request.context.slice(0, MAX_AGENT_CONTEXT_LENGTH),
     ...(request.resumeSessionId == null ? {} : { resumeSessionId: request.resumeSessionId })
@@ -62,31 +85,116 @@ export async function parseAgentAskRequest(value: unknown): Promise<AgentAskRequ
 }
 
 export interface AgentStreamChunk {
-  kind: 'session' | 'text' | 'result' | 'activity'
+  kind: 'session' | 'text' | 'result' | 'activity' | 'usage'
   text?: string
   sessionId?: string
   failed?: boolean
+  activity?: AgentActivityUpdate
+  activities?: AgentActivityUpdate[]
+  usage?: AgentUsageUpdate
   /** Where a text chunk came from: an incremental delta or an assembled message. */
   source?: 'delta' | 'message'
 }
 
 // A tool call is the agent telling you what it is doing; showing "Read foo.ts" is
 // what makes a long pause legible instead of looking stalled.
-function describeToolUse(block: Record<string, unknown>): string | null {
+function describeToolUse(
+  block: Record<string, unknown>,
+  accessMode: AgentAccessMode
+): AgentActivityUpdate | null {
   const name = typeof block.name === 'string' ? block.name : null
   if (name == null) return null
   const input = (typeof block.input === 'object' && block.input != null
     ? block.input
     : {}) as Record<string, unknown>
-  const filePath = typeof input.file_path === 'string' ? input.file_path.split('/').at(-1) : null
+  const filePath = typeof input.file_path === 'string' ? input.file_path : null
   const pattern = typeof input.pattern === 'string' ? input.pattern : null
+  const command = typeof input.command === 'string' ? input.command : null
+  const id = typeof block.id === 'string' ? block.id : `claude-tool-${name}`
   // The model can still ask for a tool it was not granted; the request is denied,
   // so reporting the bare name would imply something ran that never did.
-  if (!(AGENT_READ_ONLY_TOOLS as readonly string[]).includes(name)) return `Blocked ${name} (read-only)`
-  if (name === 'Read' && filePath != null) return `Read ${filePath}`
-  if (name === 'Grep' && pattern != null) return `Searched for ${pattern}`
-  if (name === 'Glob' && pattern != null) return `Listed ${pattern}`
-  return name
+  if (accessMode === 'review' && !(AGENT_REVIEW_TOOLS as readonly string[]).includes(name)) {
+    return { id, kind: 'tool', title: `${name} blocked`, detail: 'Review mode is read-only.', status: 'blocked' }
+  }
+  if (name === 'Read') return { id, kind: 'file', title: 'Read file', detail: filePath ?? '', status: 'running' }
+  if (name === 'Grep') return { id, kind: 'search', title: 'Search code', detail: pattern ?? '', status: 'running' }
+  if (name === 'Glob') return { id, kind: 'search', title: 'List files', detail: pattern ?? '', status: 'running' }
+  if (name === 'Bash') return { id, kind: 'command', title: 'Run command', detail: command ?? '', status: 'running' }
+  if (name === 'Edit' || name === 'Write' || name === 'NotebookEdit') {
+    return { id, kind: 'file', title: name === 'Write' ? 'Write file' : 'Edit file', detail: filePath ?? '', status: 'running' }
+  }
+  const detail = JSON.stringify(input)
+  return { id, kind: 'tool', title: name, detail: detail === '{}' ? '' : detail.slice(0, 1_000), status: 'running' }
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function readClaudeUsage(envelope: Record<string, unknown>): AgentUsageUpdate {
+  const modelUsage = typeof envelope.modelUsage === 'object' && envelope.modelUsage != null
+    ? envelope.modelUsage as Record<string, unknown>
+    : typeof envelope.model_usage === 'object' && envelope.model_usage != null
+      ? envelope.model_usage as Record<string, unknown>
+      : {}
+  let inputTokens = 0
+  let outputTokens = 0
+  let cachedInputTokens = 0
+  let cacheWriteInputTokens = 0
+  let costUsd = 0
+  let contextWindow = 0
+  let model: string | undefined
+  for (const [modelId, raw] of Object.entries(modelUsage)) {
+    if (typeof raw !== 'object' || raw == null) continue
+    const usage = raw as Record<string, unknown>
+    model ??= typeof usage.canonicalModel === 'string' ? usage.canonicalModel : modelId
+    inputTokens += finiteNumber(usage.inputTokens) ?? 0
+    outputTokens += finiteNumber(usage.outputTokens) ?? 0
+    cachedInputTokens += finiteNumber(usage.cacheReadInputTokens) ?? 0
+    cacheWriteInputTokens += finiteNumber(usage.cacheCreationInputTokens) ?? 0
+    costUsd += finiteNumber(usage.costUSD) ?? 0
+    contextWindow = Math.max(contextWindow, finiteNumber(usage.contextWindow) ?? 0)
+  }
+  const usage = typeof envelope.usage === 'object' && envelope.usage != null
+    ? envelope.usage as Record<string, unknown>
+    : {}
+  const outputDetails = typeof usage.output_tokens_details === 'object' && usage.output_tokens_details != null
+    ? usage.output_tokens_details as Record<string, unknown>
+    : {}
+  const reasoningTokens = finiteNumber(outputDetails.thinking_tokens) ?? 0
+  const reportedCost = finiteNumber(envelope.total_cost_usd)
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    reasoningTokens,
+    totalTokens: inputTokens + outputTokens + cachedInputTokens + cacheWriteInputTokens,
+    ...(contextWindow === 0 ? {} : { contextWindow }),
+    costUsd: reportedCost ?? costUsd,
+    durationMs: finiteNumber(envelope.duration_ms) ?? 0,
+    turns: finiteNumber(envelope.num_turns) ?? 0,
+    ...(model == null ? {} : { model })
+  }
+}
+
+function claudeRateLimitWindow(info: Record<string, unknown>): AgentRateLimitWindow | null {
+  const used = finiteNumber(info.utilization)
+  if (used == null) return null
+  const type = typeof info.rateLimitType === 'string' ? info.rateLimitType : 'plan'
+  const labels: Record<string, string> = {
+    five_hour: '5-hour',
+    seven_day: '7-day',
+    seven_day_opus: 'Opus 7-day',
+    seven_day_sonnet: 'Sonnet 7-day',
+    seven_day_overage_included: 'Overage 7-day',
+    overage: 'Overage'
+  }
+  return {
+    label: labels[type] ?? 'Plan',
+    usedPercent: used <= 1 ? used * 100 : used,
+    resetsAt: finiteNumber(info.resetsAt)
+  }
 }
 
 // Claude emits incremental `stream_event` deltas AND, at the end of the turn, the
@@ -145,20 +253,49 @@ function interpretCodexLine(envelope: Record<string, unknown>): AgentStreamChunk
   }
   // Reported as it starts, because the wait for a command is the pause the user sees.
   if (item.type === 'command_execution') {
-    return completed ? null : { kind: 'activity', text: describeCodexCommand(item) }
+    return {
+      kind: 'activity',
+      activity: {
+        id: typeof item.id === 'string' ? item.id : 'codex-command',
+        kind: 'command',
+        title: 'Run command',
+        detail: describeCodexCommand(item).replace(/^Ran /, ''),
+        status: completed ? 'completed' : 'running'
+      }
+    }
   }
   if (item.type === 'reasoning') {
-    return completed ? { kind: 'activity', text: 'Thought briefly' } : null
+    return completed ? {
+      kind: 'activity',
+      activity: {
+        id: typeof item.id === 'string' ? item.id : 'codex-reasoning',
+        kind: 'reasoning',
+        title: 'Reasoning',
+        detail: typeof item.text === 'string' ? item.text : '',
+        status: 'completed'
+      }
+    } : null
   }
   if (item.type === 'file_change' || item.type === 'patch_apply') {
-    return completed ? null : { kind: 'activity', text: 'Proposed a file change' }
+    return {
+      kind: 'activity',
+      activity: {
+        id: typeof item.id === 'string' ? item.id : 'codex-file-change',
+        kind: 'file',
+        title: 'Change files',
+        status: completed ? 'completed' : 'running'
+      }
+    }
   }
   return null
 }
 
 // Claude streams newline-delimited JSON envelopes; Codex uses its own event shape.
 // Only the fields this app renders are read, so unknown envelopes are ignored.
-export function interpretAgentLine(line: string): AgentStreamChunk | null {
+export function interpretAgentLine(
+  line: string,
+  accessMode: AgentAccessMode = 'review'
+): AgentStreamChunk | null {
   const trimmed = line.trim()
   if (trimmed === '') return null
   if (!trimmed.startsWith('{')) return { kind: 'text', text: `${line}\n` }
@@ -177,30 +314,185 @@ export function interpretAgentLine(line: string): AgentStreamChunk | null {
   }
 
   if (envelope.type === 'stream_event') {
-    const event = envelope.event as { delta?: { text?: unknown } } | undefined
+    const event = envelope.event as {
+      type?: unknown
+      index?: unknown
+      delta?: { type?: unknown; text?: unknown; thinking?: unknown }
+      content_block?: Record<string, unknown>
+    } | undefined
     const text = event?.delta?.text
-    return typeof text === 'string' && text !== '' ? { kind: 'text', text, source: 'delta' } : null
+    if (typeof text === 'string' && text !== '') return { kind: 'text', text, source: 'delta' }
+    const thinking = event?.delta?.thinking
+    if (typeof thinking === 'string' && thinking !== '') {
+      return {
+        kind: 'activity',
+        activity: {
+          id: `claude-reasoning-${typeof event?.index === 'number' ? event.index : 0}`,
+          kind: 'reasoning',
+          title: 'Reasoning',
+          detail: thinking,
+          status: 'running',
+          append: 'detail'
+        }
+      }
+    }
+    if (event?.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+      const activity = describeToolUse(event.content_block, accessMode)
+      return activity == null ? null : { kind: 'activity', activity }
+    }
+    return null
   }
 
   if (envelope.type === 'assistant') {
     const message = envelope.message as { content?: unknown } | undefined
     if (!Array.isArray(message?.content)) return null
     let text = ''
-    const activity: string[] = []
+    const activity: AgentActivityUpdate[] = []
     for (const block of message.content) {
       if (typeof block !== 'object' || block == null) continue
       const candidate = block as Record<string, unknown>
       if (candidate.type === 'text' && typeof candidate.text === 'string') text += candidate.text
-      else if (candidate.type === 'thinking') activity.push('Thought briefly')
+      else if (candidate.type === 'thinking') {
+        const thinking = typeof candidate.thinking === 'string' ? candidate.thinking : ''
+        activity.push({
+          id: typeof candidate.id === 'string' ? candidate.id : `claude-reasoning-${activity.length}`,
+          kind: 'reasoning',
+          title: 'Reasoning',
+          detail: thinking,
+          status: 'completed'
+        })
+      }
       else if (candidate.type === 'tool_use') {
-        const described = describeToolUse(candidate)
+        const described = describeToolUse(candidate, accessMode)
         if (described != null) activity.push(described)
       }
     }
     // Tool and thinking blocks are reported even when the same message carries
     // text, because the activity is what explains the pause before it.
-    if (activity.length > 0) return { kind: 'activity', text: activity.join('\n') }
-    return text === '' ? null : { kind: 'text', text, source: 'message' }
+    if (text !== '') {
+      return {
+        kind: 'text',
+        text,
+        source: 'message',
+        ...(activity.length === 0 ? {} : { activities: activity })
+      }
+    }
+    return activity.length === 0 ? null : { kind: 'activity', activities: activity }
+  }
+
+  if (envelope.type === 'user') {
+    const message = envelope.message as { content?: unknown } | undefined
+    if (!Array.isArray(message?.content)) return null
+    const result = message.content.find((block) => typeof block === 'object' && block != null &&
+      (block as Record<string, unknown>).type === 'tool_result') as Record<string, unknown> | undefined
+    if (result == null || typeof result.tool_use_id !== 'string') return null
+    const rawContent = result.content
+    const output = typeof rawContent === 'string' ? rawContent : ''
+    return {
+      kind: 'activity',
+      activity: {
+        id: result.tool_use_id,
+        kind: 'tool',
+        title: '',
+        status: result.is_error === true ? 'failed' : 'completed',
+        ...(output === '' ? {} : { output: output.slice(-4_000) })
+      }
+    }
+  }
+
+  if (envelope.type === 'tool_progress') {
+    const toolUseId = typeof envelope.tool_use_id === 'string' ? envelope.tool_use_id : null
+    if (toolUseId == null) return null
+    const elapsed = finiteNumber(envelope.elapsed_time_seconds)
+    return {
+      kind: 'activity',
+      activity: {
+        id: toolUseId,
+        kind: 'tool',
+        title: '',
+        status: 'running',
+        ...(elapsed == null ? {} : { output: `Running for ${Math.round(elapsed)}s` })
+      }
+    }
+  }
+
+  if (envelope.type === 'tool_use_summary' && typeof envelope.summary === 'string') {
+    const ids = Array.isArray(envelope.preceding_tool_use_ids)
+      ? envelope.preceding_tool_use_ids.filter((value): value is string => typeof value === 'string')
+      : []
+    return {
+      kind: 'activity',
+      activity: {
+        id: `claude-summary-${ids.join('-').slice(0, 80) || 'tool'}`,
+        kind: 'status',
+        title: envelope.summary,
+        status: 'completed'
+      }
+    }
+  }
+
+  if (envelope.type === 'rate_limit_event') {
+    const info = typeof envelope.rate_limit_info === 'object' && envelope.rate_limit_info != null
+      ? envelope.rate_limit_info as Record<string, unknown>
+      : {}
+    const window = claudeRateLimitWindow(info)
+    return window == null ? null : { kind: 'usage', usage: { rateLimits: [window] } }
+  }
+
+  if (envelope.type === 'system' && envelope.subtype === 'thinking_tokens') {
+    const reasoningTokens = finiteNumber(envelope.estimated_tokens)
+    return reasoningTokens == null ? null : { kind: 'usage', usage: { reasoningTokens } }
+  }
+
+  if (envelope.type === 'system' && envelope.subtype === 'task_started' && envelope.skip_transcript !== true) {
+    return {
+      kind: 'activity',
+      activity: {
+        id: typeof envelope.task_id === 'string' ? envelope.task_id : 'claude-task',
+        kind: 'tool',
+        title: typeof envelope.subagent_type === 'string' ? `Agent · ${envelope.subagent_type}` : 'Agent task',
+        detail: typeof envelope.description === 'string' ? envelope.description : '',
+        status: 'running'
+      }
+    }
+  }
+
+  if (envelope.type === 'system' && envelope.subtype === 'task_progress' && envelope.skip_transcript !== true) {
+    const taskUsage = typeof envelope.usage === 'object' && envelope.usage != null
+      ? envelope.usage as Record<string, unknown>
+      : {}
+    const tokens = finiteNumber(taskUsage.total_tokens)
+    const duration = finiteNumber(taskUsage.duration_ms)
+    const output = [
+      tokens == null ? null : `${Math.round(tokens).toLocaleString()} tokens`,
+      duration == null ? null : `${Math.round(duration / 1_000)}s`
+    ].filter((value): value is string => value != null).join(' · ')
+    return {
+      kind: 'activity',
+      activity: {
+        id: typeof envelope.task_id === 'string' ? envelope.task_id : 'claude-task',
+        kind: 'tool',
+        title: '',
+        detail: typeof envelope.description === 'string' ? envelope.description : undefined,
+        ...(output === '' ? {} : { output }),
+        status: 'running'
+      }
+    }
+  }
+
+  if (envelope.type === 'system' && envelope.subtype === 'task_notification' && envelope.skip_transcript !== true) {
+    const rawStatus = envelope.status
+    const status = rawStatus === 'failed' ? 'failed' : rawStatus === 'stopped' ? 'blocked' : 'completed'
+    return {
+      kind: 'activity',
+      activity: {
+        id: typeof envelope.task_id === 'string' ? envelope.task_id : 'claude-task',
+        kind: 'tool',
+        title: '',
+        detail: typeof envelope.summary === 'string' ? envelope.summary : undefined,
+        status
+      }
+    }
   }
 
   if (envelope.type === 'result') {
@@ -208,6 +500,7 @@ export function interpretAgentLine(line: string): AgentStreamChunk | null {
       kind: 'result',
       text: typeof envelope.result === 'string' ? envelope.result : '',
       failed: envelope.is_error === true,
+      usage: readClaudeUsage(envelope),
       ...(typeof envelope.session_id === 'string' ? { sessionId: envelope.session_id } : {})
     }
   }
