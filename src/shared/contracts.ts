@@ -23,27 +23,42 @@ export interface RepositorySnapshot {
 }
 
 export interface RepositoryChangeEvent {
-  snapshot: RepositorySnapshot
+  // Watcher ticks normally keep the same path list. Omitting it avoids cloning
+  // and serializing every path for a one-file content change.
+  snapshot: Omit<RepositorySnapshot, 'paths'> & { paths?: string[] }
   changedPaths: string[]
   revision: number
+}
+
+// Split from PerformanceMetrics because collecting it costs a full document
+// traversal in the preload and a per-process map/sort in main. Only gathered
+// while the diagnostics disclosure that renders it is open.
+export interface PerformanceMetricsDetail {
+  memoryByProcessType: Array<{ type: string; megabytes: number }>
+  mainPrivateMegabytes: number
+  rendererHeapUsedMegabytes: number
+  rendererHeapTotalMegabytes: number
+  rendererDomNodes: number
 }
 
 export interface PerformanceMetrics {
   cpuPercent: number
   gpuProcessCpuPercent: number | null
   workingSetMegabytes: number
-  memoryByProcessType: Array<{ type: string; megabytes: number }>
-  mainPrivateMegabytes: number
   rendererPrivateMegabytes: number
-  rendererHeapUsedMegabytes: number
-  rendererHeapTotalMegabytes: number
-  rendererBlinkAllocatedMegabytes: number
-  rendererBlinkTotalMegabytes: number
-  rendererDomNodes: number
   lastRendererTermination: RendererTermination | null
   processCount: number
   production: boolean
   sampledAt: number
+  detail: PerformanceMetricsDetail | null
+}
+
+// What main needs from the renderer's preferences before the next launch: the
+// window background colour it paints before first paint, and whether to reopen
+// the last folder while the renderer is still booting.
+export interface StartupPreferences {
+  themeType: 'dark' | 'light'
+  restoreLastFolder: boolean
 }
 
 export interface RendererTermination {
@@ -407,6 +422,8 @@ export interface RepositoryApi {
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
   openPath(path: string): Promise<RepositorySnapshot>
+  readClipboardText(type?: string): Promise<string>
+  revealPath(path: string): Promise<void>
   refresh(): Promise<RepositorySnapshot>
   getComparison(path: string): Promise<FileComparison>
   saveWorkingFile(request: WorkingFileSaveRequest): Promise<FileComparison>
@@ -415,6 +432,7 @@ export interface RepositoryApi {
   cancelContentSearch(): void
   getGitIntegration(): Promise<GitIntegrationSnapshot>
   getPullRequestInbox(): Promise<PullRequestInboxSnapshot>
+  getClosedPullRequests(): Promise<PullRequestSummary[]>
   switchBranch(name: string): Promise<RepositorySnapshot>
   getLocalBranchReview(baseRef: string, headRef: string): Promise<LocalBranchReview>
   getCommitReview(oid: string): Promise<LocalBranchReview>
@@ -422,6 +440,7 @@ export interface RepositoryApi {
   pullCurrentBranch(): Promise<RepositorySnapshot>
   pushCurrentBranch(): Promise<GitIntegrationSnapshot>
   getPullRequestReview(selector: number | string): Promise<PullRequestReview>
+  cancelPullRequestReview(): void
   getPullRequestConversation(selector: number | string): Promise<PullRequestConversation>
   replyToPullRequestThread(threadId: string, body: string): Promise<void>
   setPullRequestThreadResolved(threadId: string, resolved: boolean): Promise<void>
@@ -436,7 +455,8 @@ export interface RepositoryApi {
     comments: PullRequestReviewComment[]
   ): Promise<void>
   getAgentModels(): Promise<AgentModelCatalog>
-  getAgentStatuses(): Promise<AgentProviderStatuses>
+  /** Naming a provider re-probes only that one; the other keeps its cached status. */
+  getAgentStatuses(provider?: AgentProvider): Promise<AgentProviderStatuses>
   loginAgent(provider: AgentProvider): Promise<void>
   askAgent(request: AgentAskInput): Promise<void>
   cancelAgent(id: string): Promise<void>
@@ -447,14 +467,17 @@ export interface RepositoryApi {
   writeTerminal(sessionId: string, data: string): void
   resizeTerminal(sessionId: string, columns: number, rows: number): void
   clearTerminal(sessionId: string): void
+  setTerminalVisibility(sessionId: string, visible: boolean): void
   killTerminal(sessionId: string): Promise<void>
   onTerminalData(listener: (event: TerminalDataEvent) => void): () => void
   onTerminalExit(listener: (event: TerminalExitEvent) => void): () => void
-  getPerformanceMetrics(): Promise<PerformanceMetrics>
+  getPerformanceMetrics(detailed: boolean): Promise<PerformanceMetrics>
   setVisibility(visible: boolean): Promise<void>
+  setStartupPreferences(preferences: StartupPreferences): Promise<void>
   findInPage(query: string, forward: boolean, findNext: boolean): Promise<number>
   stopFindInPage(): Promise<void>
   onFoundInPage(listener: (result: FindInPageResult) => void): () => void
+  onFullscreenChange(listener: (fullscreen: boolean) => void): () => void
   onDidChange(listener: (event: RepositoryChangeEvent) => void): () => void
   onPullRequestReviewProgress(listener: (progress: PullRequestReviewProgress) => void): () => void
 }
@@ -463,6 +486,8 @@ export const IPC_CHANNELS = {
   getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
   openPath: 'repository:open-path',
+  readClipboardText: 'app:clipboard-read-text',
+  revealPath: 'app:reveal-path',
   refresh: 'repository:refresh',
   getComparison: 'repository:get-comparison',
   saveWorkingFile: 'repository:save-working-file',
@@ -471,6 +496,7 @@ export const IPC_CHANNELS = {
   cancelContentSearch: 'repository:cancel-content-search',
   getGitIntegration: 'repository:get-git-integration',
   getPullRequestInbox: 'repository:get-pull-request-inbox',
+  getClosedPullRequests: 'repository:get-closed-pull-requests',
   switchBranch: 'repository:switch-branch',
   getLocalBranchReview: 'repository:get-local-branch-review',
   getCommitReview: 'repository:get-commit-review',
@@ -478,6 +504,7 @@ export const IPC_CHANNELS = {
   pullCurrentBranch: 'repository:pull-current-branch',
   pushCurrentBranch: 'repository:push-current-branch',
   getPullRequestReview: 'repository:get-pull-request-review',
+  cancelPullRequestReview: 'repository:cancel-pull-request-review',
   getPullRequestConversation: 'repository:get-pull-request-conversation',
   replyToPullRequestThread: 'repository:reply-to-pull-request-thread',
   setPullRequestThreadResolved: 'repository:set-pull-request-thread-resolved',
@@ -497,14 +524,17 @@ export const IPC_CHANNELS = {
   writeTerminal: 'terminal:write',
   resizeTerminal: 'terminal:resize',
   clearTerminal: 'terminal:clear',
+  setTerminalVisibility: 'terminal:visibility',
   killTerminal: 'terminal:kill',
   terminalData: 'terminal:data',
   terminalExit: 'terminal:exit',
   getPerformanceMetrics: 'app:get-performance-metrics',
   setVisibility: 'app:set-visibility',
+  setStartupPreferences: 'app:set-startup-preferences',
   findInPage: 'app:find-in-page',
   stopFindInPage: 'app:stop-find-in-page',
   foundInPage: 'app:found-in-page',
+  fullscreenChange: 'app:fullscreen-change',
   didChange: 'repository:did-change',
   pullRequestReviewProgress: 'repository:pull-request-review-progress'
 } as const

@@ -95,15 +95,20 @@ export function splitPercentageFromPointer(clientX: number, left: number, width:
   return clampSplitPercentage(((clientX - left) / width) * 100)
 }
 
+export function resistedSplitPercentage(value: number, width: number): number {
+  return withResistance(value, MIN_SPLIT_PERCENT, MAX_SPLIT_PERCENT, width)
+}
+
 function findSurface(node: HTMLElement): HTMLElement {
   return node.closest<HTMLElement>('.diff-panel') ?? node.parentElement ?? node
 }
 
-function applySplitPercentage(surface: HTMLElement, value: number): number {
+function applySplitPercentage(surface: HTMLElement, value: number, resistanceWidth?: number): number {
   const percentage = clampSplitPercentage(value)
+  const displayed = resistanceWidth == null ? percentage : resistedSplitPercentage(value, resistanceWidth)
   splitPercentages.set(surface, percentage)
-  surface.style.setProperty('--horus-split-before', `${percentage}fr`)
-  surface.style.setProperty('--horus-split-after', `${100 - percentage}fr`)
+  surface.style.setProperty('--horus-split-before', `${displayed}fr`)
+  surface.style.setProperty('--horus-split-after', `${100 - displayed}fr`)
   surface.dispatchEvent(new CustomEvent<number>('horus:split-resize', { detail: percentage }))
   return percentage
 }
@@ -157,10 +162,19 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
   }
   let activePointer: number | null = null
   let activeHandle: HTMLElement | null = null
+  // Where the drag started, so the divider follows the pointer instead of
+  // teleporting under it: pressing 8px off centre used to snap the split there.
+  let dragOrigin: { clientX: number; percentage: number } | null = null
 
   const updateFromPointer = (event: PointerEvent): void => {
     const bounds = node.getBoundingClientRect()
-    applySplitPercentage(surface, splitPercentageFromPointer(event.clientX, bounds.left, bounds.width))
+    if (dragOrigin == null || !Number.isFinite(bounds.width) || bounds.width <= 0) {
+      const raw = ((event.clientX - bounds.left) / bounds.width) * 100
+      applySplitPercentage(surface, raw, bounds.width)
+      return
+    }
+    const delta = ((event.clientX - dragOrigin.clientX) / bounds.width) * 100
+    applySplitPercentage(surface, dragOrigin.percentage + delta, bounds.width)
   }
 
   const onPointerDown = (event: Event): void => {
@@ -171,9 +185,12 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
     event.preventDefault()
     activePointer = pointerEvent.pointerId
     activeHandle = handle
+    dragOrigin = {
+      clientX: pointerEvent.clientX,
+      percentage: splitPercentages.get(surface) ?? DEFAULT_SPLIT_PERCENT
+    }
     handle.dataset.dragging = ''
     handle.setPointerCapture?.(pointerEvent.pointerId)
-    updateFromPointer(pointerEvent)
   }
 
   const onPointerMove = (event: Event): void => {
@@ -190,8 +207,10 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
       activeHandle.releasePointerCapture(pointerEvent.pointerId)
     }
     activeHandle?.removeAttribute('data-dragging')
+    applySplitPercentage(surface, splitPercentages.get(surface) ?? DEFAULT_SPLIT_PERCENT)
     activePointer = null
     activeHandle = null
+    dragOrigin = null
   }
 
   const onDoubleClick = (event: Event): void => {
@@ -250,3 +269,4 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
     }
   })
 }
+import { withResistance } from './rubberband'

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 
 import {
   advanceStreamingMarkdown,
+  appendStreamingMarkdown,
   EMPTY_STREAMING_MARKDOWN,
   keyForBlock,
   parseInline,
@@ -145,6 +146,39 @@ describe('advanceStreamingMarkdown', () => {
     const truncated = advanceStreamingMarkdown(first, 'kept tail')
     expect(truncated.settledLength).toBe(0)
     expect(truncated.blocks).toEqual(parseMarkdown('kept tail'))
+  })
+})
+
+describe('appendStreamingMarkdown', () => {
+  const paragraph = (index: number): string => `Paragraph ${index} of the answer.\n\n`
+
+  it('matches a from-scratch parse while under the cap', () => {
+    let state = EMPTY_STREAMING_MARKDOWN
+    for (let index = 0; index < 5; index += 1) state = appendStreamingMarkdown(state, paragraph(index), 10_000)
+
+    expect(state.blocks).toEqual(parseMarkdown(state.source))
+  })
+
+  it('trims on a settled boundary and keeps parsing incrementally past the cap', () => {
+    const limit = 400
+    let state = EMPTY_STREAMING_MARKDOWN
+    for (let index = 0; index < 40; index += 1) state = appendStreamingMarkdown(state, paragraph(index), limit)
+
+    expect(state.source.length).toBeLessThanOrEqual(limit)
+    expect(state.blocks).toEqual(parseMarkdown(state.source))
+    // The retained blocks were carried over, not re-parsed: identity survives
+    // the next chunk, which is what the block memoization depends on.
+    const before = state.settled.at(-1)!
+    const after = appendStreamingMarkdown(state, paragraph(41), limit)
+    expect(after.settled).toContain(before)
+    expect(after.blocks).toEqual(parseMarkdown(after.source))
+  })
+
+  it('falls back to a raw cut when one unsettled block is longer than the cap', () => {
+    const state = appendStreamingMarkdown(EMPTY_STREAMING_MARKDOWN, 'x'.repeat(300), 100)
+
+    expect(state.source).toHaveLength(100)
+    expect(state.blocks).toEqual(parseMarkdown(state.source))
   })
 })
 

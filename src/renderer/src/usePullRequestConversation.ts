@@ -3,12 +3,29 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PullRequestConversation, RemoteReviewThread, RepositoryReview } from '../../shared/contracts'
 import { getErrorMessage } from './repositoryApi'
 
-const CONVERSATION_POLL_INTERVAL_MS = 15_000
+// Every tick is a `gh api graphql` process. At 15 s a half-hour review was ~120
+// spawns of a query that almost always returns the same bytes, and with GitHub
+// unreachable it was 120 failing spawns with nothing on screen to explain why
+// remote comments had vanished.
+const CONVERSATION_POLL_INTERVAL_MS = 30_000
+const MAX_CONVERSATION_POLL_INTERVAL_MS = 300_000
+const CONVERSATION_POLL_SCROLL_IDLE_MS = 2_000
+
+export function nextConversationPollDelay(
+  currentDelayMs: number,
+  available: boolean,
+  baseMs: number = CONVERSATION_POLL_INTERVAL_MS,
+  maxMs: number = MAX_CONVERSATION_POLL_INTERVAL_MS
+): number {
+  if (available) return baseMs
+  return Math.min(maxMs, Math.max(baseMs, currentDelayMs) * 2)
+}
 
 interface PullRequestConversationApi {
   conversation: PullRequestConversation | null
   threadsByPath: ReadonlyMap<string, RemoteReviewThread[]>
   pendingThreadId: string | null
+  unavailableMessage: string | null
   reply(threadId: string, body: string): void
   setResolved(threadId: string, resolved: boolean): void
   refresh(): void
@@ -41,6 +58,8 @@ export function sameConversation(
     const currentReview = current.reviews[index]!
     const nextReview = next.reviews[index]!
     if (currentReview.id !== nextReview.id || currentReview.state !== nextReview.state) return false
+    if (currentReview.body !== nextReview.body || currentReview.authorLogin !== nextReview.authorLogin) return false
+    if (currentReview.submittedAt !== nextReview.submittedAt) return false
   }
   return true
 }
@@ -79,6 +98,14 @@ export function usePullRequestConversation(
     }
     let cancelled = false
     let loading = false
+    let delay = CONVERSATION_POLL_INTERVAL_MS
+    let timer: number | null = null
+
+    const schedule = (): void => {
+      if (cancelled) return
+      if (timer != null) window.clearTimeout(timer)
+      timer = window.setTimeout(tick, delay)
+    }
     const load = async (): Promise<void> => {
       const repository = window.repository
       if (repository == null || loading) return
@@ -89,26 +116,53 @@ export function usePullRequestConversation(
         // An unchanged conversation must keep its identity, or every poll would
         // rebuild every annotated review item.
         setConversation((current) => sameConversation(current, next) ? current : next)
+        // Backing off on an unreachable GitHub is the difference between a
+        // failing subprocess every 30 s forever and one every five minutes.
+        delay = nextConversationPollDelay(delay, next.available)
+      } catch (error) {
+        if (cancelled) return
+        delay = nextConversationPollDelay(delay, false)
+        onErrorRef.current(getErrorMessage(error))
       } finally {
         loading = false
       }
     }
-    const tick = (): void => {
-      if (document.hidden) return
-      void load()
+    let lastScrollAt = 0
+    const noteScroll = (): void => {
+      lastScrollAt = performance.now()
     }
-    void load()
-    const timer = window.setInterval(tick, CONVERSATION_POLL_INTERVAL_MS)
-    // A hidden window must not keep spawning GitHub reads; returning focus
-    // catches up immediately instead of waiting out the interval.
+    const tick = (): void => {
+      // A hidden window must not keep spawning GitHub reads.
+      if (document.hidden) {
+        schedule()
+        return
+      }
+      // A `gh` subprocess in the middle of a fling spikes CPU on the same thread
+      // that is already highlighting. Wait until scrolling has been idle.
+      const scrollAge = performance.now() - lastScrollAt
+      if (lastScrollAt > 0 && scrollAge < CONVERSATION_POLL_SCROLL_IDLE_MS) {
+        if (timer != null) window.clearTimeout(timer)
+        timer = window.setTimeout(tick, CONVERSATION_POLL_SCROLL_IDLE_MS - scrollAge)
+        return
+      }
+      void load().finally(schedule)
+    }
+
+    void load().finally(schedule)
+    // Returning focus catches up immediately instead of waiting out a backed-off
+    // interval, and resets the back-off because the user is watching again.
     const handleVisibility = (): void => {
-      if (!document.hidden) void load()
+      if (document.hidden) return
+      delay = CONVERSATION_POLL_INTERVAL_MS
+      void load().finally(schedule)
     }
     document.addEventListener('visibilitychange', handleVisibility)
+    document.addEventListener('scroll', noteScroll, { capture: true, passive: true })
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      if (timer != null) window.clearTimeout(timer)
       document.removeEventListener('visibilitychange', handleVisibility)
+      document.removeEventListener('scroll', noteScroll, true)
     }
   }, [refreshRevision, selector])
 
@@ -144,5 +198,9 @@ export function usePullRequestConversation(
     [conversation]
   )
 
-  return { conversation, threadsByPath, pendingThreadId, reply, setResolved, refresh }
+  const unavailableMessage = conversation != null && !conversation.available
+    ? conversation.message ?? 'GitHub is unavailable, so remote review comments are not shown.'
+    : null
+
+  return { conversation, threadsByPath, pendingThreadId, unavailableMessage, reply, setResolved, refresh }
 }

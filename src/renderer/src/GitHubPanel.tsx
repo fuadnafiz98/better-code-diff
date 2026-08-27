@@ -14,17 +14,31 @@ import {
 
 import type {
   GitIntegrationSnapshot,
+  InboxPullRequest,
   PullRequestMergeStrategy,
   PullRequestInboxSnapshot,
   PullRequestSummary
 } from '../../shared/contracts'
 import { parsePullRequestSelector } from './pullRequestSelector'
+import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import { SelectControl } from './SelectControl'
 import type { RepositoryPanelTab } from './useGitWorkflow'
 
 const shortDateFormatter = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+const FRESHNESS_TICK_MS = 5_000
+
+export function formatUpdatedAgo(elapsedMs: number): string {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return 'just now'
+  const seconds = Math.floor(elapsedMs / 1_000)
+  if (seconds < 5) return 'just now'
+  if (seconds < 60) return `${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  return `${Math.floor(minutes / 60)}h ago`
+}
 
 interface RepositoryPanelProps {
+  open: boolean
   initialTab: RepositoryPanelTab
   integration: GitIntegrationSnapshot | null
   loading: boolean
@@ -43,6 +57,89 @@ interface RepositoryPanelProps {
   onMarkReady(pullRequest: PullRequestSummary): void
   onOpenPullRequest(selector: number | string): void
   onCheckout(pullRequest: PullRequestSummary): void
+  onRefresh?(): void
+  updatedAt?: number | null
+}
+
+interface PullRequestRowProps {
+  summary: PullRequestSummary | InboxPullRequest
+  details: PullRequestSummary | undefined
+  actionKey: string | null
+  onReview(pullRequest: PullRequestSummary): void
+  onMerge(pullRequest: PullRequestSummary, strategy: PullRequestMergeStrategy): void
+  onMarkReady(pullRequest: PullRequestSummary): void
+  onOpenPullRequest(selector: number | string): void
+  onCheckout(pullRequest: PullRequestSummary): void
+}
+
+// Anything that moves HEAD, the index or a remote branch. Two of these at once
+// means index.lock contention, or two merges into the same base, so they exclude
+// each other. Read-only work (review:, commit:, compare:) never joins the set, so
+// opening a review while a merge finishes stays allowed.
+const MUTATING_ACTION_PREFIXES = ['sync:', 'checkout:', 'merge:', 'ready:', 'branch:']
+
+function isMutatingAction(actionKey: string | null): boolean {
+  return actionKey != null && MUTATING_ACTION_PREFIXES.some((prefix) => actionKey.startsWith(prefix))
+}
+
+function PullRequestRow({
+  summary,
+  details,
+  actionKey,
+  onReview,
+  onMerge,
+  onMarkReady,
+  onOpenPullRequest,
+  onCheckout
+}: PullRequestRowProps): React.JSX.Element {
+  const state = summary.state.toLowerCase()
+  const mutating = isMutatingAction(actionKey)
+  return (
+    <article className="pr-row compact">
+      <div className="pr-row-title">
+        <span>#{summary.number}</span>
+        <strong>{summary.title}</strong>
+        {state === 'open' ? null : <em className={`pr-state state-${state}`}>{summary.state}</em>}
+        {summary.isDraft ? <em>Draft</em> : null}
+      </div>
+      <div className="pr-row-meta">
+        <span>{summary.author.login}</span>
+        {details != null ? <span>{details.headRefName} → {details.baseRefName}</span> : null}
+        <span>{formatRelativeDate(summary.updatedAt)}</span>
+      </div>
+      <div className="pr-row-actions">
+        {details != null ? <button type="button" onClick={() => onCheckout(details)}
+          disabled={mutating}
+          aria-busy={actionKey === `checkout:${summary.number}`}
+          aria-label={`Checkout pull request ${summary.number}`} title="Checkout">
+          <ActionIcon busy={actionKey === `checkout:${summary.number}`}><IconBranch /></ActionIcon>
+        </button> : null}
+        {details?.isDraft && details.state.toLowerCase() === 'open' ? (
+          <button type="button" onClick={() => onMarkReady(details)}
+            disabled={mutating}
+            aria-busy={actionKey === `ready:${summary.number}`}
+            aria-label={`Mark pull request ${summary.number} ready`} title="Mark ready">
+            <ActionIcon busy={actionKey === `ready:${summary.number}`}><IconApproved /></ActionIcon>
+          </button>
+        ) : null}
+        {details?.state.toLowerCase() === 'open' && !details.isDraft ? (
+          <button type="button" onClick={() => onMerge(details, 'squash')}
+            disabled={mutating}
+            aria-busy={actionKey === `merge:${summary.number}`}
+            aria-label={`Squash and merge pull request ${summary.number}`} title="Squash and merge">
+            <ActionIcon busy={actionKey === `merge:${summary.number}`}><IconMerged /></ActionIcon>
+          </button>
+        ) : null}
+        <button className="primary" type="button"
+          onClick={() => details == null ? onOpenPullRequest(summary.number) : onReview(details)}
+          disabled={actionKey === `review:${summary.number}`}
+          aria-busy={actionKey === `review:${summary.number}`}
+          aria-label={`Review pull request ${summary.number}`} title="Review changes">
+          {actionKey === `review:${summary.number}` ? <IconRefresh className="spin" /> : <IconInReview />}
+        </button>
+      </div>
+    </article>
+  )
 }
 
 function formatRelativeDate(value: string): string {
@@ -61,6 +158,7 @@ function ActionIcon({ busy, children }: { busy: boolean; children?: React.ReactN
 }
 
 export function RepositoryPanel({
+  open,
   initialTab,
   integration,
   loading,
@@ -78,14 +176,23 @@ export function RepositoryPanel({
   onMerge,
   onMarkReady,
   onOpenPullRequest,
-  onCheckout
+  onCheckout,
+  onRefresh,
+  updatedAt
 }: RepositoryPanelProps): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const [tab, setTab] = useState<RepositoryPanelTab>(initialTab)
   const [selectedBaseBranch, setSelectedBaseBranch] = useState('')
   const [pullRequestQuery, setPullRequestQuery] = useState('')
   const [pullRequestQueryError, setPullRequestQueryError] = useState<string | null>(null)
+  const [showClosed, setShowClosed] = useState(false)
+  const [closedPullRequests, setClosedPullRequests] = useState<PullRequestSummary[] | null>(null)
+  const [loadingClosed, setLoadingClosed] = useState(false)
+  const [closedPullRequestsError, setClosedPullRequestsError] = useState<string | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   const currentBranch = integration?.branches.find((branch) => branch.current)?.name ?? null
+  const syncing = actionKey?.startsWith('sync:') === true
+  const mutating = isMutatingAction(actionKey)
   const populatedInboxSections = inbox?.available
     ? inbox.sections.filter((section) => section.pullRequests.length > 0)
     : []
@@ -101,9 +208,41 @@ export function RepositoryPanel({
 
   useEffect(() => {
     const dialog = dialogRef.current
-    dialog?.showModal()
-    return () => dialog?.close()
-  }, [])
+    if (dialog == null) return
+    if (open && !dialog.open) dialog.showModal()
+    if (!open && dialog.open) dialog.close()
+    return () => {
+      if (dialog.open) dialog.close()
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (updatedAt == null) return
+    const timer = window.setInterval(() => setNow(Date.now()), FRESHNESS_TICK_MS)
+    return () => window.clearInterval(timer)
+  }, [updatedAt])
+
+  // Closed and merged pull requests are a second network round trip, so they load
+  // the first time somebody asks to see them rather than on every panel open.
+  const toggleClosed = (): void => {
+    if (showClosed) {
+      setShowClosed(false)
+      return
+    }
+    setShowClosed(true)
+    if ((closedPullRequests != null && closedPullRequestsError == null) || loadingClosed) return
+    setLoadingClosed(true)
+    void (async () => {
+      try {
+        setClosedPullRequests(await requireRepositoryApi().getClosedPullRequests())
+        setClosedPullRequestsError(null)
+      } catch (error) {
+        setClosedPullRequestsError(getErrorMessage(error))
+      } finally {
+        setLoadingClosed(false)
+      }
+    })()
+  }
 
   const submitPullRequestQuery = (): void => {
     const selector = parsePullRequestSelector(pullRequestQuery)
@@ -146,10 +285,20 @@ export function RepositoryPanel({
         <div className="git-sync-bar" aria-label="Remote synchronization">
           <span>{integration?.behind ?? 0} behind</span>
           <span>{integration?.ahead ?? 0} ahead</span>
+          {updatedAt == null ? null : (
+            <small className="git-sync-freshness">
+              {loading || loadingInbox ? 'updating…' : `updated ${formatUpdatedAgo(now - updatedAt)}`}
+            </small>
+          )}
           <div>
-            <button type="button" onClick={onFetch} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:fetch'} />Fetch</button>
-            <button type="button" onClick={onPull} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:pull'} />Pull</button>
-            <button type="button" onClick={onPush} disabled={actionKey != null}><ActionIcon busy={actionKey === 'sync:push'} />Push</button>
+            {onRefresh == null ? null : (
+              <button type="button" onClick={onRefresh} disabled={syncing} title="Refresh repository data">
+                <ActionIcon busy={loading || loadingInbox}><IconRefresh /></ActionIcon>Refresh
+              </button>
+            )}
+            <button type="button" onClick={onFetch} disabled={mutating} aria-busy={actionKey === 'sync:fetch'}><ActionIcon busy={actionKey === 'sync:fetch'} />Fetch</button>
+            <button type="button" onClick={onPull} disabled={mutating} aria-busy={actionKey === 'sync:pull'}><ActionIcon busy={actionKey === 'sync:pull'} />Pull</button>
+            <button type="button" onClick={onPush} disabled={mutating} aria-busy={actionKey === 'sync:push'}><ActionIcon busy={actionKey === 'sync:push'} />Push</button>
           </div>
         </div>
 
@@ -183,7 +332,9 @@ export function RepositoryPanel({
                     {commit.decorations.length > 0 ? <div>{commit.decorations.map((decoration) => <em key={decoration}>{decoration}</em>)}</div> : null}
                   </div>
                   <code>{commit.shortOid}</code>
-                  <button type="button" onClick={() => onReviewCommit(commit.oid)} disabled={actionKey != null} aria-label={`Review commit ${commit.shortOid}`}>
+                  <button type="button" onClick={() => onReviewCommit(commit.oid)}
+                    disabled={actionKey === `commit:${commit.oid}`} aria-busy={actionKey === `commit:${commit.oid}`}
+                    aria-label={`Review commit ${commit.shortOid}`}>
                     {actionKey === `commit:${commit.oid}` ? <IconRefresh className="spin" /> : <IconInReview />}
                   </button>
                 </article>
@@ -210,7 +361,8 @@ export function RepositoryPanel({
                     aria-describedby={pullRequestQueryError == null ? undefined : 'pr-open-error'}
                     aria-invalid={pullRequestQueryError != null}
                   />
-                  <button type="submit" disabled={actionKey != null || pullRequestQuery.trim() === ''}>
+                  <button type="submit" disabled={pullRequestQuery.trim() === ''}
+                    aria-busy={actionKey?.startsWith('review:') === true}>
                     {actionKey?.startsWith('review:') ? <IconRefresh className="spin" /> : <IconInReview />}
                     Review
                   </button>
@@ -225,50 +377,34 @@ export function RepositoryPanel({
                 </div>
                 {visiblePullRequests.length === 0 && loadingInbox ? null : visiblePullRequests.length === 0 ? (
                   <div className="git-panel-state"><strong>Inbox zero</strong><span>Nothing needs your review right now.</span></div>
-                ) : visiblePullRequests.map((pullRequest) => {
-                  const details = pullRequestsByNumber.get(pullRequest.number)
-                  const reviewKey = `review:${pullRequest.number}`
-                  return (
-                    <article className="pr-row compact" key={pullRequest.number}>
-                      <div className="pr-row-title">
-                        <span>#{pullRequest.number}</span>
-                        <strong>{pullRequest.title}</strong>
-                        {pullRequest.state.toLowerCase() === 'open' ? null : (
-                          <em className={`pr-state state-${pullRequest.state.toLowerCase()}`}>{pullRequest.state}</em>
-                        )}
-                        {pullRequest.isDraft ? <em>Draft</em> : null}
-                      </div>
-                      <div className="pr-row-meta">
-                        <span>{pullRequest.author.login}</span>
-                        {details != null ? <span>{details.headRefName} → {details.baseRefName}</span> : null}
-                        <span>{formatRelativeDate(pullRequest.updatedAt)}</span>
-                      </div>
-                      <div className="pr-row-actions">
-                        {details != null ? <button type="button" onClick={() => onCheckout(details)} disabled={actionKey != null}
-                          aria-label={`Checkout pull request ${pullRequest.number}`} title="Checkout">
-                          <ActionIcon busy={actionKey === `checkout:${pullRequest.number}`}><IconBranch /></ActionIcon>
-                        </button> : null}
-                        {details?.isDraft && details.state.toLowerCase() === 'open' ? (
-                          <button type="button" onClick={() => onMarkReady(details)} disabled={actionKey != null}
-                            aria-label={`Mark pull request ${pullRequest.number} ready`} title="Mark ready">
-                            <ActionIcon busy={actionKey === `ready:${pullRequest.number}`}><IconApproved /></ActionIcon>
-                          </button>
-                        ) : null}
-                        {details?.state.toLowerCase() === 'open' && !details.isDraft ? (
-                          <button type="button" onClick={() => onMerge(details, 'squash')} disabled={actionKey != null}
-                            aria-label={`Squash and merge pull request ${pullRequest.number}`} title="Squash and merge">
-                            <ActionIcon busy={actionKey === `merge:${pullRequest.number}`}><IconMerged /></ActionIcon>
-                          </button>
-                        ) : null}
-                        <button className="primary" type="button"
-                          onClick={() => details == null ? onOpenPullRequest(pullRequest.number) : onReview(details)}
-                          disabled={actionKey != null} aria-label={`Review pull request ${pullRequest.number}`} title="Review changes">
-                          {actionKey === reviewKey ? <IconRefresh className="spin" /> : <IconInReview />}
-                        </button>
-                      </div>
-                    </article>
-                  )
-                })}
+                ) : visiblePullRequests.map((pullRequest) => (
+                  <PullRequestRow key={pullRequest.number} summary={pullRequest}
+                    details={pullRequestsByNumber.get(pullRequest.number)} actionKey={actionKey}
+                    onReview={onReview} onMerge={onMerge} onMarkReady={onMarkReady}
+                    onOpenPullRequest={onOpenPullRequest} onCheckout={onCheckout} />
+                ))}
+              </div>
+              <div className="pr-inbox" aria-label="Closed pull requests">
+                <div className="pr-inbox-heading">
+                  <strong>Closed and merged</strong>
+                  {closedPullRequests == null ? null : <span>{closedPullRequests.length}</span>}
+                  {loadingClosed ? <IconRefresh className="spin" /> : null}
+                  <button type="button" onClick={toggleClosed} aria-expanded={showClosed}>
+                    {showClosed ? 'Hide' : 'Show closed'}
+                  </button>
+                </div>
+                {!showClosed || loadingClosed ? null : closedPullRequestsError != null ? (
+                  <div className="git-panel-state">
+                    <strong>Could not load closed pull requests</strong>
+                    <span>{closedPullRequestsError}</span>
+                  </div>
+                ) : closedPullRequests?.length === 0 ? (
+                  <div className="git-panel-state"><strong>Nothing closed</strong><span>No recently closed pull requests.</span></div>
+                ) : closedPullRequests?.map((pullRequest) => (
+                  <PullRequestRow key={pullRequest.number} summary={pullRequest} details={pullRequest}
+                    actionKey={actionKey} onReview={onReview} onMerge={onMerge} onMarkReady={onMarkReady}
+                    onOpenPullRequest={onOpenPullRequest} onCheckout={onCheckout} />
+                ))}
               </div>
               {integration?.githubAvailable === false ? (
                 <div className="git-panel-notice"><strong>GitHub is unavailable</strong><span>{integration.githubMessage}</span></div>
@@ -293,8 +429,8 @@ export function RepositoryPanel({
                     <span><strong>{branch.name}</strong>{branch.upstream != null ? <small>{branch.upstream}</small> : null}</span>
                     {branch.current ? <em>Current</em> : null}
                     <div>
-                      {branch.name !== baseBranch ? <button type="button" onClick={() => onReviewLocalBranch(baseBranch, branch.name)} disabled={actionKey != null}>{actionKey === compareKey ? <IconRefresh className="spin" /> : <IconInReview />}Compare</button> : null}
-                      {!branch.current ? <button type="button" onClick={() => onSwitchBranch(branch.name)} disabled={actionKey != null}><ActionIcon busy={actionKey === branchKey} />Switch</button> : null}
+                      {branch.name !== baseBranch ? <button type="button" onClick={() => onReviewLocalBranch(baseBranch, branch.name)} disabled={actionKey === compareKey} aria-busy={actionKey === compareKey}>{actionKey === compareKey ? <IconRefresh className="spin" /> : <IconInReview />}Compare</button> : null}
+                      {!branch.current ? <button type="button" onClick={() => onSwitchBranch(branch.name)} disabled={mutating} aria-busy={actionKey === branchKey}><ActionIcon busy={actionKey === branchKey} />Switch</button> : null}
                     </div>
                   </article>
                 )

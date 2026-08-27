@@ -19,7 +19,11 @@ import type {
 // app-server speaks JSON-RPC over stdio and pushes `item/agentMessage/delta`,
 // so this is the only transport that can stream.
 const CODEX_STARTUP_TIMEOUT_MS = 30_000
-const CODEX_TURN_TIMEOUT_MS = 300_000
+// Like the Claude path: a turn is ended by silence, not by length, with an
+// absolute ceiling so a wedged child cannot hold the panel forever.
+const CODEX_TURN_IDLE_TIMEOUT_MS = 120_000
+const CODEX_TURN_TIMEOUT_MS = 1_800_000
+const CODEX_STDERR_TAIL = 8_000
 
 interface PendingRequest {
   resolve(result: Record<string, unknown>): void
@@ -68,6 +72,12 @@ export class CodexAppServer {
   // `turn/start` replies as soon as the turn is *created*, long before any text
   // arrives, so the turn is only finished when turn/completed or turn/failed lands.
   #turnCompletion: { resolve(): void; reject(error: Error): void } | null = null
+  // Set while a turn runs: every notification re-arms its idle timer.
+  #turnActivity: (() => void) | null = null
+  // The child logs MCP startup and tracing here. Nothing read it before, so the
+  // 64 KB pipe filled and the JSON-RPC stream stalled with the explanation stuck
+  // inside it; a bounded tail is both the drain and the diagnostic.
+  #stderrTail = ''
 
   // The server loads the user's MCP servers on start, which takes seconds, so one
   // process is reused for every turn in the same working directory.
@@ -76,17 +86,31 @@ export class CodexAppServer {
     this.#killChild()
     this.#cwd = cwd
 
+    this.#stderrTail = ''
     const child = spawn(executable, ['app-server'], { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
     this.#child = child
     child.stdout?.setEncoding('utf8')
     child.stdout?.on('data', (chunk: string) => this.#readStdout(chunk))
-    child.stdin?.on('error', () => {})
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk: string) => {
+      this.#stderrTail = `${this.#stderrTail}${chunk}`.slice(-CODEX_STDERR_TAIL)
+    })
+    // Without this listener a missing `codex` binary is an unhandled 'error'
+    // event, which takes the whole main process down with it.
+    child.once('error', (error: Error) => {
+      // A replaced child can report its spawn error after the new child starts.
+      // Do not reject requests owned by the replacement.
+      if (this.#child !== child) return
+      this.#child = null
+      this.#cwd = null
+      this.#threadId = null
+      this.#abort(error)
+    })
     child.on('exit', () => {
-      for (const request of this.#pending.values()) {
-        request.reject(new Error('Codex stopped before answering.'))
-      }
-      this.#pending.clear()
-      this.#finishTurn(new Error('Codex stopped before answering.'))
+      // `exit` is async: a child killed by stop()/#ensureStarted can outlive its
+      // own replacement, and aborting here would reject the new child's work.
+      if (this.#child !== child) return
+      this.#abort(new Error(this.#describeFailure('Codex stopped before answering.')))
       this.#child = null
       this.#threadId = null
     })
@@ -94,6 +118,17 @@ export class CodexAppServer {
     await this.#request(CODEX_METHODS.initialize, {
       clientInfo: { name: 'horus', title: 'Horus', version: '0.1.0' }
     }, CODEX_STARTUP_TIMEOUT_MS)
+  }
+
+  #abort(error: Error): void {
+    for (const request of this.#pending.values()) request.reject(error)
+    this.#pending.clear()
+    this.#finishTurn(error)
+  }
+
+  #describeFailure(message: string): string {
+    const tail = this.#stderrTail.trim()
+    return tail === '' ? message : `${message}\n${tail.slice(-2_000)}`
   }
 
   #readStdout(chunk: string): void {
@@ -125,6 +160,7 @@ export class CodexAppServer {
         this.#handleServerRequest(message)
         return
       }
+      this.#turnActivity?.()
       const notification = { method: message.method, params: message.params }
       const params = (typeof message.params === 'object' && message.params != null
         ? message.params
@@ -319,10 +355,18 @@ export class CodexAppServer {
     const completed = new Promise<void>((resolve, reject) => {
       this.#turnCompletion = { resolve, reject }
     })
-    const timeout = setTimeout(
-      () => this.#finishTurn(new Error('Codex took too long to answer.')),
-      CODEX_TURN_TIMEOUT_MS
-    )
+    const deadline = Date.now() + CODEX_TURN_TIMEOUT_MS
+    let timeout: ReturnType<typeof setTimeout> | null = null
+    const armTimeout = (): void => {
+      if (timeout != null) clearTimeout(timeout)
+      const remaining = deadline - Date.now()
+      const reachedLimit = remaining <= CODEX_TURN_IDLE_TIMEOUT_MS
+      timeout = setTimeout(() => this.#finishTurn(new Error(this.#describeFailure(reachedLimit
+        ? 'Codex reached the maximum turn length.'
+        : 'Codex stopped responding.'))), Math.max(0, reachedLimit ? remaining : CODEX_TURN_IDLE_TIMEOUT_MS))
+    }
+    armTimeout()
+    this.#turnActivity = armTimeout
     try {
       await this.#request(CODEX_METHODS.turnStart, {
         threadId: this.#threadId,
@@ -335,7 +379,8 @@ export class CodexAppServer {
       }, CODEX_STARTUP_TIMEOUT_MS)
       await completed
     } finally {
-      clearTimeout(timeout)
+      if (timeout != null) clearTimeout(timeout)
+      this.#turnActivity = null
       this.#turnCompletion = null
     }
   }
@@ -388,7 +433,11 @@ export class CodexAppServer {
   }
 
   #killChild(): void {
-    this.#finishTurn(new Error('Codex was stopped.'))
+    this.#turnActivity = null
+    // Startup and model-list requests live in #pending, not #turnCompletion.
+    // Reject both classes before replacing the child so neither waits for its
+    // timeout and the old child's late events cannot affect the replacement.
+    this.#abort(new Error('Codex was stopped.'))
     this.#threadId = null
     this.#currentTurnId = null
     this.#agentMessagePhases.clear()

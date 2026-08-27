@@ -2,7 +2,6 @@ import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { basename, isAbsolute } from 'node:path'
 
-import * as nodePty from 'node-pty'
 import type { IDisposable, IPty, IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 
 import {
@@ -19,6 +18,10 @@ const MAX_ROWS = 240
 const MAX_INPUT_CHUNK = 256 * 1_024
 const OUTPUT_BATCH_DELAY_MS = 8
 const OUTPUT_BATCH_SIZE = 64 * 1_024
+// What a hidden dock keeps: a build left running behind a closed terminal is
+// the state most sessions end in, and the user can only scroll back through the
+// tail anyway.
+const MAX_HIDDEN_OUTPUT = 512 * 1_024
 
 const OMITTED_CHILD_ENVIRONMENT_KEYS = new Set([
   'ELECTRON_RUN_AS_NODE',
@@ -49,6 +52,16 @@ type PtyFactory = (
   options: IPtyForkOptions | IWindowsPtyForkOptions
 ) => IPty
 
+// node-pty dlopens its native addon while the module evaluates, so a static
+// import pays for it in every cold start — including the runs where no terminal
+// is ever opened.
+let ptyPromise: Promise<typeof import('node-pty')> | null = null
+
+function loadPty(): Promise<typeof import('node-pty')> {
+  ptyPromise ??= import('node-pty')
+  return ptyPromise
+}
+
 interface ManagedTerminal {
   id: string
   owner: TerminalOwner
@@ -58,6 +71,7 @@ interface ManagedTerminal {
   pendingOutput: string
   outputTimer: ReturnType<typeof setTimeout> | null
   ready: boolean
+  visible: boolean
 }
 
 export function normalizeTerminalSize(columns: unknown, rows: unknown): { columns: number; rows: number } {
@@ -116,58 +130,70 @@ export class TerminalService {
   private readonly sessions = new Map<string, ManagedTerminal>()
   private readonly boundOwners = new Set<number>()
 
-  constructor(private readonly spawnPty: PtyFactory = nodePty.spawn) {}
+  constructor(private readonly spawnPty?: PtyFactory) {}
 
-  create(
+  async create(
     owner: TerminalOwner,
     cwd: string,
     columns: unknown,
     rows: unknown,
     version: string
-  ): TerminalSession {
+  ): Promise<TerminalSession> {
     if (!isAbsolute(cwd) || !existsSync(cwd)) {
       throw new Error('The open project does not have a valid terminal directory.')
     }
     const size = normalizeTerminalSize(columns, rows)
     const shell = resolveTerminalShell()
+    const spawnPty = this.spawnPty ?? (await loadPty()).spawn
     this.killOwnerSessions(owner.id)
 
-    const process = this.spawnPty(shell.executable, shell.args, {
+    const pty = spawnPty(shell.executable, shell.args, {
       name: 'xterm-256color',
       cols: size.columns,
       rows: size.rows,
       cwd,
       env: createTerminalEnvironment(cwd, version)
     })
-    process.pause()
+    pty.pause()
 
     const id = randomUUID()
-    const session = {
+    // The subscriptions are built before the session is published, so the map
+    // can never hold a session whose disposables do not exist yet.
+    const session: ManagedTerminal = {
       id,
       owner,
-      process,
-      dataSubscription: null as unknown as IDisposable,
-      exitSubscription: null as unknown as IDisposable,
+      process: pty,
+      dataSubscription: pty.onData((data) => { this.queueOutput(session, data) }),
+      exitSubscription: pty.onExit(({ exitCode, signal }) => {
+        this.flushOutput(session)
+        if (!owner.isDestroyed()) {
+          owner.send(IPC_CHANNELS.terminalExit, {
+            sessionId: id,
+            exitCode,
+            ...(signal == null ? {} : { signal })
+          })
+        }
+        this.disposeSession(session, false)
+      }),
       pendingOutput: '',
       outputTimer: null,
-      ready: false
-    } satisfies ManagedTerminal
+      ready: false,
+      visible: true
+    }
     this.sessions.set(id, session)
-    session.dataSubscription = process.onData((data) => this.queueOutput(session, data))
-    session.exitSubscription = process.onExit(({ exitCode, signal }) => {
-      this.flushOutput(session)
-      if (!owner.isDestroyed()) {
-        owner.send(IPC_CHANNELS.terminalExit, {
-          sessionId: id,
-          exitCode,
-          ...(signal == null ? {} : { signal })
-        })
-      }
-      this.disposeSession(session, false)
-    })
     this.bindOwner(owner)
 
-    return { id, cwd, shell: shell.label, pid: process.pid }
+    return { id, cwd, shell: shell.label, pid: pty.pid }
+  }
+
+  // A closed dock still has a live shell behind it; buffering here keeps the
+  // renderer from parsing and painting output nobody can see.
+  setVisible(ownerId: number, sessionId: unknown, visible: unknown): void {
+    if (typeof visible !== 'boolean') return
+    const session = this.getOwnedSession(ownerId, sessionId)
+    if (session == null || session.visible === visible) return
+    session.visible = visible
+    if (visible) this.flushOutput(session)
   }
 
   ready(ownerId: number, sessionId: unknown): void {
@@ -204,7 +230,7 @@ export class TerminalService {
   }
 
   killAll(): void {
-    for (const session of [...this.sessions.values()]) this.disposeSession(session, true)
+    for (const session of this.sessions.values()) this.disposeSession(session, true)
   }
 
   private bindOwner(owner: TerminalOwner): void {
@@ -223,7 +249,7 @@ export class TerminalService {
   }
 
   private killOwnerSessions(ownerId: number): void {
-    for (const session of [...this.sessions.values()]) {
+    for (const session of this.sessions.values()) {
       if (session.owner.id === ownerId) this.disposeSession(session, true)
     }
   }
@@ -232,6 +258,12 @@ export class TerminalService {
     if (!this.sessions.has(session.id) || data === '') return
     session.pendingOutput += data
     if (!session.ready) return
+    if (!session.visible) {
+      if (session.pendingOutput.length > MAX_HIDDEN_OUTPUT) {
+        session.pendingOutput = session.pendingOutput.slice(-MAX_HIDDEN_OUTPUT)
+      }
+      return
+    }
     if (session.pendingOutput.length >= OUTPUT_BATCH_SIZE) {
       this.flushOutput(session)
       return
@@ -239,7 +271,7 @@ export class TerminalService {
     if (session.outputTimer != null) return
     session.outputTimer = setTimeout(() => {
       session.outputTimer = null
-      this.flushOutput(session)
+      if (session.visible) this.flushOutput(session)
     }, OUTPUT_BATCH_DELAY_MS)
   }
 

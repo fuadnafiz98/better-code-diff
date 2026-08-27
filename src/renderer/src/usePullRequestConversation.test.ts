@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'bun:test'
 
 import type { PullRequestConversation, RemoteReviewThread } from '../../shared/contracts'
-import { groupRemoteThreadsByPath, sameConversation } from './usePullRequestConversation'
+import {
+  groupRemoteThreadsByPath,
+  nextConversationPollDelay,
+  sameConversation
+} from './usePullRequestConversation'
+
+describe('nextConversationPollDelay', () => {
+  it('stays at the base interval while GitHub answers', () => {
+    expect(nextConversationPollDelay(30_000, true)).toBe(30_000)
+    expect(nextConversationPollDelay(240_000, true)).toBe(30_000)
+  })
+
+  it('doubles while GitHub is unavailable and stops at five minutes', () => {
+    expect(nextConversationPollDelay(30_000, false)).toBe(60_000)
+    expect(nextConversationPollDelay(60_000, false)).toBe(120_000)
+    expect(nextConversationPollDelay(240_000, false)).toBe(300_000)
+    expect(nextConversationPollDelay(300_000, false)).toBe(300_000)
+  })
+})
 
 const thread = (overrides: Partial<RemoteReviewThread> = {}): RemoteReviewThread => ({
   id: 'thread-1',

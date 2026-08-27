@@ -169,7 +169,7 @@ export const PerformanceChart = memo(function PerformanceChart({ history }: Perf
               return (
                 <g key={value} className="performance-chart-grid">
                   <line x1={chart.plotLeft} x2={chart.plotRight} y1={y} y2={y} />
-                  <text x={chart.plotLeft - 7} y={y + 3}>{formatChartValue(value, metric)}</text>
+                  <text x={chart.plotLeft - 7} y={y + 3} textAnchor="end">{formatChartValue(value, metric)}</text>
                 </g>
               )
             })}

@@ -1,9 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 
-const HIDDEN_VIEWER_RELEASE_DELAY_MS = 300_000
+import { isHighMemory } from './performanceHealth'
+import { getMemorySamples } from './performanceHistory'
 
-// The diff viewer holds worker and highlighter memory, so a window left hidden
-// long enough releases it. Short window switches must never lose review state.
+export const HIDDEN_VIEWER_RELEASE_DELAY_MS = 300_000
+export const HIGH_MEMORY_HIDDEN_RELEASE_DELAY_MS = 60_000
+
+// Short window switches must never lose review state. A working set already at
+// the 1 GB warning can drop workers sooner once the window is actually hidden.
+export function hiddenViewerReleaseDelayMs(
+  workingSetMegabytes: number | undefined = getMemorySamples().at(-1)?.workingSetMegabytes
+): number {
+  return isHighMemory(workingSetMegabytes)
+    ? HIGH_MEMORY_HIDDEN_RELEASE_DELAY_MS
+    : HIDDEN_VIEWER_RELEASE_DELAY_MS
+}
+
 export function useViewerSuspension(): boolean {
   const [suspended, setSuspended] = useState(false)
   const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -17,7 +29,7 @@ export function useViewerSuspension(): boolean {
     const handleVisibility = (): void => {
       clearReleaseTimer()
       if (document.hidden) {
-        releaseTimerRef.current = setTimeout(() => setSuspended(true), HIDDEN_VIEWER_RELEASE_DELAY_MS)
+        releaseTimerRef.current = setTimeout(() => setSuspended(true), hiddenViewerReleaseDelayMs())
       } else {
         setSuspended(false)
       }

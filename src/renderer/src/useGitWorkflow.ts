@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type {
   GitIntegrationSnapshot,
@@ -11,6 +11,7 @@ import type {
   RepositorySnapshot
 } from '../../shared/contracts'
 import type { WorkspaceView } from './AppView'
+import type { ConfirmRequest } from './ConfirmDialog'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 
 interface UseGitWorkflowOptions {
@@ -19,87 +20,175 @@ interface UseGitWorkflowOptions {
   onError(message: string | null): void
   onSelectPath(path: string | null): void
   onWorkspaceViewChange(view: WorkspaceView): void
+  confirm(request: ConfirmRequest): Promise<boolean>
 }
 
 export type RepositoryPanelTab = 'history' | 'branches' | 'remotes' | 'pull-requests'
+
+// Long enough that closing and reopening the panel — the normal way to check a
+// pull request — is free, short enough that a branch you switched in a terminal
+// shows up without a manual refresh. Anything that moves HEAD or the branch
+// invalidates the entry immediately regardless of the clock.
+export const GIT_PANEL_TTL_MS = 30_000
+
+export interface PanelCacheEntry<Value> {
+  data: Value | null
+  fetchedAt: number
+  head: string | null
+  branch: string | null
+}
+
+const emptyEntry = <Value,>(): PanelCacheEntry<Value> => ({
+  data: null,
+  fetchedAt: 0,
+  head: null,
+  branch: null
+})
+
+export function isPanelDataStale(
+  entry: PanelCacheEntry<unknown>,
+  snapshot: { head: string | null; branch: string | null } | null,
+  now: number,
+  ttlMs: number = GIT_PANEL_TTL_MS
+): boolean {
+  if (entry.data == null) return true
+  if (snapshot != null && (entry.head !== snapshot.head || entry.branch !== snapshot.branch)) return true
+  return now - entry.fetchedAt >= ttlMs
+}
 
 export function useGitWorkflow({
   snapshot,
   applySnapshot,
   onError,
   onSelectPath,
-  onWorkspaceViewChange
+  onWorkspaceViewChange,
+  confirm
 }: UseGitWorkflowOptions) {
   const [panelOpen, setPanelOpen] = useState(false)
   const [panelTab, setPanelTab] = useState<RepositoryPanelTab>('pull-requests')
-  const [integration, setIntegration] = useState<GitIntegrationSnapshot | null>(null)
+  const [integrationEntry, setIntegrationEntry] = useState<PanelCacheEntry<GitIntegrationSnapshot>>(emptyEntry)
   const [loadingIntegration, setLoadingIntegration] = useState(false)
-  const [inbox, setInbox] = useState<PullRequestInboxSnapshot | null>(null)
+  const [inboxEntry, setInboxEntry] = useState<PanelCacheEntry<PullRequestInboxSnapshot>>(emptyEntry)
   const [loadingInbox, setLoadingInbox] = useState(false)
   const [actionKey, setActionKey] = useState<string | null>(null)
   const [repositoryReview, setRepositoryReview] = useState<RepositoryReview | null>(null)
   const [submittingReview, setSubmittingReview] = useState(false)
   const [submissionMessage, setSubmissionMessage] = useState<string | null>(null)
 
-  const reset = useCallback(() => {
-    setRepositoryReview(null)
-    setSubmissionMessage(null)
-    setIntegration(null)
-    setInbox(null)
-    setPanelOpen(false)
+  const head = snapshot?.head ?? null
+  const branch = snapshot?.branch ?? null
+  const integration = integrationEntry.data
+  const inbox = inboxEntry.data
+  const reviewRequestRef = useRef(0)
+  // The cache entries are mirrored into refs so a loader can decide whether it
+  // still has anything to do without depending on the render that produced it.
+  // Only the writers below touch them, never a render.
+  const integrationEntryRef = useRef(integrationEntry)
+  const inboxEntryRef = useRef(inboxEntry)
+  const writeIntegrationEntry = useCallback((entry: PanelCacheEntry<GitIntegrationSnapshot>) => {
+    integrationEntryRef.current = entry
+    setIntegrationEntry(entry)
+  }, [])
+  const writeInboxEntry = useCallback((entry: PanelCacheEntry<PullRequestInboxSnapshot>) => {
+    inboxEntryRef.current = entry
+    setInboxEntry(entry)
   }, [])
 
-  const loadIntegration = useCallback(async () => {
+  const reset = useCallback(() => {
+    requireRepositoryApi().cancelPullRequestReview()
+    // Supersede any review still in flight: without this its rejection reports an
+    // error in the repository the user just opened, and a late metadata event
+    // would install the previous repository's review over it.
+    reviewRequestRef.current += 1
+    setRepositoryReview(null)
+    setSubmissionMessage(null)
+    writeIntegrationEntry(emptyEntry())
+    writeInboxEntry(emptyEntry())
+    setPanelOpen(false)
+  }, [writeInboxEntry, writeIntegrationEntry])
+
+  const loadIntegration = useCallback(async (force = false) => {
+    if (!force && !isPanelDataStale(integrationEntryRef.current, { head, branch }, Date.now())) return
     setLoadingIntegration(true)
     onError(null)
     try {
-      setIntegration(await requireRepositoryApi().getGitIntegration())
+      const data = await requireRepositoryApi().getGitIntegration()
+      writeIntegrationEntry({ data, fetchedAt: Date.now(), head, branch })
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setLoadingIntegration(false)
     }
-  }, [onError])
+  }, [branch, head, onError, writeIntegrationEntry])
 
-  const loadInbox = useCallback(async () => {
+  const loadInbox = useCallback(async (force = false) => {
+    if (!force && !isPanelDataStale(inboxEntryRef.current, { head, branch }, Date.now())) return
     setLoadingInbox(true)
     try {
-      setInbox(await requireRepositoryApi().getPullRequestInbox())
+      const data = await requireRepositoryApi().getPullRequestInbox()
+      writeInboxEntry({ data, fetchedAt: Date.now(), head, branch })
     } catch (error) {
-      setInbox({ available: false, message: getErrorMessage(error), sections: [] })
+      writeInboxEntry({
+        data: { available: false, message: getErrorMessage(error), sections: [] },
+        fetchedAt: Date.now(),
+        head,
+        branch
+      })
     } finally {
       setLoadingInbox(false)
     }
-  }, [])
+  }, [branch, head, writeInboxEntry])
+
+  const refreshPanelData = useCallback(() => {
+    void loadIntegration(true)
+    void loadInbox(true)
+  }, [loadInbox, loadIntegration])
 
   const mergePullRequest = useCallback(async (
     pullRequest: PullRequestSummary,
     strategy: PullRequestMergeStrategy
   ) => {
+    const action = strategy === 'merge' ? 'Merge' : strategy === 'rebase' ? 'Rebase and merge' : 'Squash and merge'
+    // A merge is irreversible and the button sits in a dense icon row next to
+    // Checkout and Review, where a misclick used to be enough.
+    if (!(await confirm({
+      title: `${action} #${pullRequest.number}?`,
+      detail: `Merge “${pullRequest.title}” into ${pullRequest.baseRefName}. This cannot be undone.`,
+      confirmLabel: action,
+      destructive: true
+    }))) return
     setActionKey(`merge:${pullRequest.number}`)
     onError(null)
     try {
       await requireRepositoryApi().mergePullRequest(pullRequest.number, strategy)
-      await loadIntegration()
+      // The panel prefers the inbox whenever it has entries, so refreshing only
+      // the integration snapshot left the merged row on screen, still labelled
+      // open, with its merge button live.
+      await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [loadIntegration, onError])
+  }, [confirm, loadInbox, loadIntegration, onError])
 
   const markPullRequestReady = useCallback(async (pullRequest: PullRequestSummary) => {
+    if (!(await confirm({
+      title: `Mark #${pullRequest.number} ready for review?`,
+      detail: `Reviewers will be notified about “${pullRequest.title}”.`,
+      confirmLabel: 'Mark ready'
+    }))) return
     setActionKey(`ready:${pullRequest.number}`)
     onError(null)
     try {
       await requireRepositoryApi().markPullRequestReady(pullRequest.number)
-      await loadIntegration()
+      await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [loadIntegration, onError])
+  }, [confirm, loadInbox, loadIntegration, onError])
 
   const openPanel = useCallback(() => {
     setPanelTab('pull-requests')
@@ -115,13 +204,16 @@ export function useGitWorkflow({
     void loadInbox()
   }, [loadInbox, loadIntegration])
 
-  const confirmWorkingTreeChange = useCallback((action: string): boolean => {
+  const confirmWorkingTreeChange = useCallback(async (action: string): Promise<boolean> => {
     if ((snapshot?.statuses.length ?? 0) === 0) return true
-    return window.confirm(`The working tree has local changes. Git will stop the ${action} if it would overwrite them. Continue?`)
-  }, [snapshot?.statuses.length])
+    return confirm({
+      title: `Continue with the ${action}?`,
+      detail: `The working tree has local changes. Git will stop the ${action} if it would overwrite them.`
+    })
+  }, [confirm, snapshot?.statuses.length])
 
   const switchBranch = useCallback(async (name: string) => {
-    if (!confirmWorkingTreeChange('branch switch')) return
+    if (!(await confirmWorkingTreeChange('branch switch'))) return
     setActionKey(`branch:${name}`)
     onError(null)
     try {
@@ -138,6 +230,8 @@ export function useGitWorkflow({
   }, [applySnapshot, confirmWorkingTreeChange, onError])
 
   const openPullRequestReview = useCallback(async (selector: number | string) => {
+    reviewRequestRef.current += 1
+    const requestId = reviewRequestRef.current
     setActionKey(`review:${selector}`)
     onError(null)
     // A large review is streamed: its metadata opens the view, then each page of
@@ -147,6 +241,9 @@ export function useGitWorkflow({
     let selectedFirstStreamedPath = false
     const stopListening = requireRepositoryApi().onPullRequestReviewProgress((progress) => {
       if (progress.kind === 'metadata') {
+        // A superseded review's metadata can still arrive: without this guard it
+        // installs the wrong review over the one the user actually asked for.
+        if (reviewRequestRef.current !== requestId) return
         streamed = true
         setRepositoryReview(progress.review)
         setSubmissionMessage(null)
@@ -155,6 +252,7 @@ export function useGitWorkflow({
         setActionKey(null)
         return
       }
+      if (reviewRequestRef.current !== requestId) return
       const firstPath = selectedFirstStreamedPath ? null : progress.files[0]?.path ?? null
       setRepositoryReview((current) => {
         if (current == null || current.kind !== 'github' || current.selector !== progress.selector) return current
@@ -174,6 +272,9 @@ export function useGitWorkflow({
     })
     try {
       const review = await requireRepositoryApi().getPullRequestReview(selector)
+      // An aborted review resolves successfully with whatever was collected, so a
+      // superseded request must not adopt it over the newer stream.
+      if (reviewRequestRef.current !== requestId) return
       if (streamed) {
         // The resolved review is authoritative: progress events and the reply to
         // this call are separate IPC messages, so a late page can land after the
@@ -194,10 +295,24 @@ export function useGitWorkflow({
       onWorkspaceViewChange('multi')
       setPanelOpen(false)
     } catch (error) {
-      onError(getErrorMessage(error))
+      // A review the user closed, or one superseded by another, fails by design:
+      // reporting it would show a banner for something they asked to stop.
+      if (reviewRequestRef.current === requestId) onError(getErrorMessage(error))
+      // The stream is dead either way, so collapse the target onto what actually
+      // arrived — otherwise the review sits there looking like it is still loading
+      // until the 25 s stall backstop fires.
+      if (streamed && reviewRequestRef.current === requestId) {
+        setRepositoryReview((current) => current != null
+          && current.kind === 'github'
+          && current.selector === selector
+          ? { ...current, expectedFileCount: current.files.length }
+          : current)
+      }
     } finally {
       stopListening()
-      setActionKey(null)
+      // Not gated on the request id: closing a review bumps that ref, and the
+      // abandoned key would then disable the open-by-number form for good.
+      setActionKey((current) => current === `review:${selector}` ? null : current)
     }
   }, [onError, onSelectPath, onWorkspaceViewChange])
 
@@ -240,7 +355,7 @@ export function useGitWorkflow({
   }, [onError, onSelectPath, onWorkspaceViewChange])
 
   const checkoutPullRequest = useCallback(async (pullRequest: PullRequestSummary) => {
-    if (!confirmWorkingTreeChange('pull request checkout')) return
+    if (!(await confirmWorkingTreeChange('pull request checkout'))) return
     setActionKey(`checkout:${pullRequest.number}`)
     onError(null)
     try {
@@ -260,41 +375,47 @@ export function useGitWorkflow({
     setActionKey('sync:fetch')
     onError(null)
     try {
-      setIntegration(await requireRepositoryApi().fetchRemote())
+      writeIntegrationEntry({ data: await requireRepositoryApi().fetchRemote(), fetchedAt: Date.now(), head, branch })
+      void loadInbox(true)
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [onError])
+  }, [branch, head, loadInbox, onError, writeIntegrationEntry])
 
   const pullCurrentBranch = useCallback(async () => {
-    if (!confirmWorkingTreeChange('pull')) return
+    if (!(await confirmWorkingTreeChange('pull'))) return
     setActionKey('sync:pull')
     onError(null)
     try {
       const nextSnapshot = await requireRepositoryApi().pullCurrentBranch()
       setRepositoryReview(null)
       applySnapshot(nextSnapshot)
-      setIntegration(await requireRepositoryApi().getGitIntegration())
+      await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, onError])
+  }, [applySnapshot, confirmWorkingTreeChange, loadInbox, loadIntegration, onError])
 
   const pushCurrentBranch = useCallback(async () => {
     setActionKey('sync:push')
     onError(null)
     try {
-      setIntegration(await requireRepositoryApi().pushCurrentBranch())
+      writeIntegrationEntry({
+        data: await requireRepositoryApi().pushCurrentBranch(),
+        fetchedAt: Date.now(),
+        head,
+        branch
+      })
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [onError])
+  }, [branch, head, onError, writeIntegrationEntry])
 
   const submitReview = useCallback(async (
     reviewEvent: PullRequestReviewEvent,
@@ -310,14 +431,21 @@ export function useGitWorkflow({
     const commentSummary = comments.length === 0
       ? ''
       : ` with ${comments.length} inline ${comments.length === 1 ? 'comment' : 'comments'}`
-    if (!window.confirm(`Submit this review${commentSummary} to GitHub and ${actionLabel} #${pullRequest.number}?`)) return false
+    if (!(await confirm({
+      title: `Submit review for #${pullRequest.number}?`,
+      detail: `This will submit the review${commentSummary} to GitHub and ${actionLabel} #${pullRequest.number}.`,
+      confirmLabel: 'Submit review'
+    }))) return false
 
     setSubmittingReview(true)
     setSubmissionMessage(null)
     onError(null)
     try {
       await requireRepositoryApi().submitPullRequestReview(selector, repositoryReview.commitId, reviewEvent, body, comments)
-      setIntegration(null)
+      // Marked stale rather than cleared: blanking the cache put the panel back
+      // on its blocking spinner the next time it opened.
+      writeIntegrationEntry({ ...integrationEntryRef.current, fetchedAt: 0 })
+      writeInboxEntry({ ...inboxEntryRef.current, fetchedAt: 0 })
       setSubmissionMessage('Review submitted to GitHub.')
       return true
     } catch (error) {
@@ -326,22 +454,37 @@ export function useGitWorkflow({
     } finally {
       setSubmittingReview(false)
     }
-  }, [onError, repositoryReview])
+  }, [confirm, onError, repositoryReview, writeInboxEntry, writeIntegrationEntry])
 
   const closeReview = useCallback(() => {
+    // Otherwise up to eight `gh api` children per wave keep paging a patch that
+    // is already discarded.
+    requireRepositoryApi().cancelPullRequestReview()
+    reviewRequestRef.current += 1
     setRepositoryReview(null)
     setSubmissionMessage(null)
     onSelectPath(snapshot?.statuses[0]?.path ?? null)
   }, [onSelectPath, snapshot?.statuses])
+
+  // While the panel is open a commit or a branch switch made in the terminal
+  // invalidates the entry, so ahead/behind and the branch list stop being a
+  // snapshot of whenever the panel was last opened.
+  useEffect(() => {
+    if (!panelOpen) return
+    void loadIntegration()
+    void loadInbox()
+  }, [branch, head, loadInbox, loadIntegration, panelOpen])
 
   return useMemo(() => ({
     panelOpen,
     panelTab,
     setPanelOpen,
     integration,
+    integrationFetchedAt: integrationEntry.fetchedAt === 0 ? null : integrationEntry.fetchedAt,
     loadingIntegration,
     inbox,
     loadingInbox,
+    refreshPanelData,
     actionKey,
     repositoryReview,
     submittingReview,
@@ -365,6 +508,8 @@ export function useGitWorkflow({
     markPullRequestReady
   }), [
     actionKey,
+    integrationEntry.fetchedAt,
+    refreshPanelData,
     checkoutPullRequest,
     closeReview,
     fetchRemote,

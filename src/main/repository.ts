@@ -1,9 +1,9 @@
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants as fileConstants } from 'node:fs'
-import { access, lstat, readFile, readlink, realpath, rename, unlink, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { basename, dirname, relative, resolve, sep } from 'node:path'
+import { basename, dirname, resolve, sep } from 'node:path'
 
 import type {
   ContentSearchResult,
@@ -37,23 +37,83 @@ import type {
   WorkingFileSaveRequest,
   WorkingTreePatch
 } from '../shared/contracts.js'
+import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
+import {
+  COMMAND_ABORTED_MESSAGE,
+  comparePaths,
+  GitObjectReader,
+  MAX_DIFF_FILE_BYTES,
+  mapWithConcurrency,
+  runCommand,
+  splitNullDelimited,
+  type CommandResult,
+  type GitObjectRead
+} from './gitCommands.js'
+import {
+  buildPullRequestPatchFromFiles,
+  chunkPathspecs,
+  createNewFilePatch,
+  diffFilesFromChurn,
+  filesFromPatch,
+  isPullRequestDiffTooLargeError,
+  limitPatchFileSize,
+  MAX_PULL_REQUEST_FILES,
+  parseNumstat,
+  PULL_REQUEST_FILES_PAGE_SIZE,
+  pullRequestFilePageWave,
+  selectOversizedDiffFiles,
+  type RawPullRequestFile
+} from './patchBuilder.js'
 
-const MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
-const MAX_DIFF_FILE_CHURN_LINES = 20_000
-const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
+// Re-exported so the process, object-reading and patch primitives keep one import
+// site for callers and tests while living in their own modules.
+export {
+  GitObjectReader,
+  readGitObject,
+  type GitObjectRead
+} from './gitCommands.js'
+export {
+  buildPullRequestPatchFromFiles,
+  chunkPathspecs,
+  createNewFilePatch,
+  diffFilesFromChurn,
+  filesFromPatch,
+  isPullRequestDiffTooLargeError,
+  limitPatchFileSize,
+  parseNumstat,
+  pullRequestFilePageWave,
+  selectOversizedDiffFiles,
+  type DiffChurnEntry,
+  type RawPullRequestFile
+} from './patchBuilder.js'
+
 const MAX_SEARCH_RESULTS = 200
-const MAX_HEAD_CACHE_ENTRIES = 16
-const MAX_HEAD_CACHE_BYTES = 16 * 1024 * 1024
+// The byte cap is the real guard: at a 2 MB per-entry ceiling 512 typical source
+// files cost a few MB, while 16 entries evicted the first file of any review page
+// before the reader could scroll back to it.
+const MAX_HEAD_CACHE_ENTRIES = 512
+const MAX_HEAD_CACHE_BYTES = 64 * 1024 * 1024
+const MAX_WORKING_CACHE_ENTRIES = 256
+const MAX_WORKING_CACHE_BYTES = 64 * 1024 * 1024
 const MAX_PATCH_COMMAND_CONCURRENCY = 4
 const MAX_PULL_REQUEST_REVIEW_COMMENTS = 100
-const MAX_PULL_REQUEST_INBOX_RESULTS = 30
-// `gh pr diff` asks GitHub for one diff document, and GitHub refuses past 300
-// files. The files API pages instead, up to its own ceiling of 3000.
-const PULL_REQUEST_FILES_PAGE_SIZE = 100
-const MAX_PULL_REQUEST_FILES = 3_000
-// Each page is one `gh` process and one GitHub round trip, ~5s for a large pull
-// request. Fetched one after another a 3000-file review took nearly two minutes.
-const PULL_REQUEST_FILES_PAGE_CONCURRENCY = 8
+const PULL_REQUEST_LIST_LIMIT = 30
+// A pull request's diff is immutable for a given head oid, so a reopen — after
+// closing the panel, after switching to the working tree and back, after a
+// restart — can serve it from disk instead of repeating a download the code's own
+// comment measures at nearly two minutes for a 3000-file review. A force-push
+// produces a new oid and therefore a new key, so staleness is impossible.
+const PULL_REQUEST_CACHE_VERSION = 1
+const MAX_PULL_REQUEST_CACHE_ENTRIES = 20
+const MAX_PULL_REQUEST_CACHE_BYTES = 200 * 1024 * 1024
+
+export interface CachedPullRequestReview {
+  version: number
+  headRefOid: string
+  files: PullRequestFile[]
+  patch: string
+  omittedFiles: OmittedDiffFile[]
+}
 const MAX_REVIEW_BODY_LENGTH = 65_536
 // `gh search prs --json` only exposes these pull request fields; richer fields need `gh pr view`.
 const PULL_REQUEST_LIST_FIELDS = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles'
@@ -172,9 +232,6 @@ const UNRESOLVE_REVIEW_THREAD_MUTATION = `
 `
 const MAX_REMOTE_THREAD_BODY_LENGTH = 65_536
 const GH_EXECUTABLE_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
-const GIT_DIFF_SECTION_PREFIX = 'diff --git '
-const DIFF_HEADER_PATHS = /^diff --git (?:"a\/(.+?)"|a\/(.+?)) (?:"b\/(.+?)"|b\/(.+?))$/
-const PATCH_PATH_QUOTE_PATTERN = /["\\\x00-\x1f\x7f]/
 const SEARCH_CANCELLED_MESSAGE = 'The search was cancelled before it finished.'
 const SEARCH_INTERRUPTED_MESSAGE = 'The search stopped before it finished.'
 const EXCLUDED_DIRECTORIES = [
@@ -203,10 +260,18 @@ const RIPGREP_EXCLUSION_ARGS = EXCLUDED_DIRECTORIES.flatMap((directory) => [
   `!**/${directory}/**`
 ])
 
+// `file` is the materialized diff side, built once when the version is read.
+// Rebuilding it per comparison re-ran a utf8 decode and a sha1 over the whole
+// buffer on every navigation, scroll hydration and post-save refetch.
 type ReadVersion = {
-  contents: Buffer | null
+  file: DiffFileContents | null
   binary: boolean
   oversized: boolean
+}
+
+type WorkingFileRead = ReadVersion & {
+  contents: Buffer | null
+  revision: string
 }
 
 export function isSameGitHubLogin(firstLogin: string, secondLogin: string): boolean {
@@ -219,11 +284,6 @@ const RIPGREP_EXECUTABLE = resolvePackagedExecutablePath(rgPath)
 
 export function resolvePackagedExecutablePath(executablePath: string): string {
   return executablePath.replace(/([\\/])app\.asar([\\/])/, '$1app.asar.unpacked$2')
-}
-
-interface CommandResult {
-  stdout: Buffer
-  stderr: Buffer
 }
 
 let ghExecutablePromise: Promise<string> | null = null
@@ -242,156 +302,6 @@ function getGhExecutable(): Promise<string> {
   return ghExecutablePromise
 }
 
-export interface GitObjectRead {
-  contents: Buffer | null
-  size: number
-  missing: boolean
-  oversized: boolean
-}
-
-const MAX_CAT_FILE_HEADER_BYTES = 4_096
-
-// Reading a HEAD blob used to cost two git spawns per file: `cat-file -s` for the
-// size guard, then `cat-file -p` for the contents. `cat-file --batch` emits
-// "<oid> <type> <size>\n<contents>\n", so one spawn carries both — and because the
-// size arrives before the body, an oversized blob is abandoned by killing the
-// child rather than being read into memory first.
-export function readGitObject(root: string, object: string): Promise<GitObjectRead> {
-  return new Promise((resolveRead, rejectRead) => {
-    const child = spawn('git', ['-C', root, 'cat-file', '--batch'], { windowsHide: true })
-    let header: Buffer = Buffer.alloc(0)
-    let expected: number | null = null
-    const body: Buffer[] = []
-    let bodyBytes = 0
-    let stderr = ''
-    let settled = false
-
-    const settle = (value: GitObjectRead): void => {
-      if (settled) return
-      settled = true
-      child.kill()
-      resolveRead(value)
-    }
-    const fail = (error: Error): void => {
-      if (settled) return
-      settled = true
-      child.kill()
-      rejectRead(error)
-    }
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      if (settled) return
-      if (expected == null) {
-        header = header.length === 0 ? chunk : Buffer.concat([header, chunk])
-        const newline = header.indexOf(0x0a)
-        if (newline === -1) {
-          if (header.length > MAX_CAT_FILE_HEADER_BYTES) fail(new Error('git cat-file returned no header.'))
-          return
-        }
-        const fields = header.subarray(0, newline).toString('utf8').split(' ')
-        if (fields[1] === 'missing' || fields.length < 3) {
-          settle({ contents: null, size: 0, missing: true, oversized: false })
-          return
-        }
-        const size = Number(fields[2])
-        if (!Number.isFinite(size) || size < 0) {
-          fail(new Error('git cat-file returned an unreadable size.'))
-          return
-        }
-        if (size > MAX_DIFF_FILE_BYTES) {
-          settle({ contents: null, size, missing: false, oversized: true })
-          return
-        }
-        expected = size
-        const rest = header.subarray(newline + 1)
-        header = Buffer.alloc(0)
-        if (rest.length > 0) {
-          body.push(rest)
-          bodyBytes += rest.length
-        }
-      } else {
-        body.push(chunk)
-        bodyBytes += chunk.length
-      }
-      if (expected != null && bodyBytes >= expected) {
-        settle({
-          contents: Buffer.concat(body).subarray(0, expected),
-          size: expected,
-          missing: false,
-          oversized: false
-        })
-      }
-    })
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString('utf8')}`.slice(-2_048)
-    })
-    child.on('error', fail)
-    child.on('close', () => {
-      fail(new Error(stderr.trim() || 'git cat-file did not return the object.'))
-    })
-    child.stdin.on('error', () => {})
-    child.stdin.end(`${object}\n`)
-  })
-}
-
-function runCommand(
-  executable: string,
-  args: readonly string[],
-  cwd?: string,
-  allowedExitCodes: readonly number[] = [],
-  input?: string
-): Promise<CommandResult> {
-  return new Promise((resolveCommand, rejectCommand) => {
-    const child = execFile(
-      executable,
-      [...args],
-      {
-        cwd,
-        encoding: 'buffer',
-        maxBuffer: MAX_GIT_OUTPUT_BYTES,
-        windowsHide: true
-      },
-      (error, stdout, stderr) => {
-        const result = { stdout, stderr }
-
-        const exitCode = error == null ? 0 : Number(error.code)
-        if (error && !allowedExitCodes.includes(exitCode)) {
-          const message = result.stderr.toString('utf8').trim() || error.message
-          rejectCommand(new Error(message))
-          return
-        }
-
-        resolveCommand(result)
-      }
-    )
-    if (input != null) {
-      child.stdin?.on('error', () => {})
-      child.stdin?.end(input)
-    }
-  })
-}
-
-async function mapWithConcurrency<Value, Result>(
-  values: readonly Value[],
-  concurrency: number,
-  transform: (value: Value) => Promise<Result>
-): Promise<Result[]> {
-  const results = new Array<Result>(values.length)
-  let nextIndex = 0
-  const runNext = async (): Promise<void> => {
-    const index = nextIndex
-    nextIndex += 1
-    if (index >= values.length) return
-    const value = values[index]!
-    results[index] = await transform(value)
-    return runNext()
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, values.length) }, () => runNext())
-  )
-  return results
-}
 
 function isTransientGitHubError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
@@ -401,14 +311,16 @@ function isTransientGitHubError(error: unknown): boolean {
 async function runGitHubReadCommand(
   executable: string,
   args: readonly string[],
-  cwd: string
+  cwd: string,
+  signal?: AbortSignal
 ): Promise<CommandResult> {
   const retryDelays = [0, 250, 750] as const
   let lastError: unknown
   for (const retryDelay of retryDelays) {
+    if (signal?.aborted === true) throw new Error(COMMAND_ABORTED_MESSAGE)
     if (retryDelay > 0) await new Promise((resolve) => setTimeout(resolve, retryDelay))
     try {
-      return await runCommand(executable, args, cwd)
+      return await runCommand(executable, args, cwd, [], undefined, signal)
     } catch (error) {
       lastError = error
       if (!isTransientGitHubError(error)) throw error
@@ -417,42 +329,11 @@ async function runGitHubReadCommand(
   throw lastError
 }
 
-// Check data is optional garnish, so an unsupported field costs the chips instead of the whole response.
-// An older `gh` rejects the check fields, and the fallback costs a second spawn.
-// Whether they are supported is a property of the installed binary, so the answer
-// is remembered instead of being rediscovered on every poll.
-let pullRequestCheckFieldsSupported = true
-
-async function runPullRequestJsonCommand(
-  executable: string,
-  args: readonly string[],
-  fields: string,
-  cwd: string
-): Promise<CommandResult> {
-  if (!pullRequestCheckFieldsSupported) {
-    return runGitHubReadCommand(executable, [...args, '--json', fields], cwd)
-  }
-  try {
-    return await runGitHubReadCommand(executable, [...args, '--json', `${fields},${PULL_REQUEST_CHECK_FIELDS}`], cwd)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (!/unknown json field/i.test(message)) throw error
-    pullRequestCheckFieldsSupported = false
-    return runGitHubReadCommand(executable, [...args, '--json', fields], cwd)
-  }
-}
-
 function gitHubIntegrationErrorMessage(error: unknown): string {
   if (isTransientGitHubError(error)) {
     return 'GitHub timed out while loading the pull request list. Retry, or open a pull request directly by number or URL.'
   }
   return error instanceof Error ? error.message : String(error)
-}
-
-function splitNullDelimited(buffer: Buffer): string[] {
-  const values = buffer.toString('utf8').split('\0')
-  if (values.at(-1) === '') values.pop()
-  return values
 }
 
 export function mapGitStatus(indexStatus: string, workingStatus: string): RepositoryFileStatus {
@@ -467,6 +348,30 @@ export function mapGitStatus(indexStatus: string, workingStatus: string): Reposi
   if (indexStatus === 'A' || workingStatus === 'A') return 'added'
   if (indexStatus === 'D' || workingStatus === 'D') return 'deleted'
   return 'modified'
+}
+
+// A full refresh rebuilds the snapshot from a whole-tree status walk. A save
+// touches one file, so the entry for that path is swapped in place instead —
+// preserving the order a full refresh would produce (tracked entries in path
+// order, then untracked ones) so the two never disagree.
+export function replaceStatusEntry(
+  statuses: readonly RepositoryStatusEntry[],
+  path: string,
+  next: RepositoryStatusEntry | null
+): RepositoryStatusEntry[] {
+  const tracked: RepositoryStatusEntry[] = []
+  const untracked: RepositoryStatusEntry[] = []
+  for (const entry of statuses) {
+    if (entry.path === path) continue
+    if (entry.status === 'untracked') untracked.push(entry)
+    else tracked.push(entry)
+  }
+  if (next != null) {
+    const target = next.status === 'untracked' ? untracked : tracked
+    const index = target.findIndex((entry) => comparePaths(entry.path, path) > 0)
+    target.splice(index === -1 ? target.length : index, 0, next)
+  }
+  return [...tracked, ...untracked]
 }
 
 export interface PorcelainV2Status {
@@ -572,13 +477,28 @@ function isBinary(contents: Buffer): boolean {
   return false
 }
 
-function comparePaths(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0
+// Answered per parent directory rather than per path: on a 100k-path snapshot the
+// split-and-scan version cost 67 ms of the 120 ms refresh, and every path under a
+// directory shares its answer.
+const excludedDirectoryMemo = new Map<string, boolean>()
+
+const MAX_EXCLUDED_DIRECTORY_MEMO_ENTRIES = 100_000
+
+function isExcludedDirectory(directory: string): boolean {
+  const memoized = excludedDirectoryMemo.get(directory)
+  if (memoized !== undefined) return memoized
+  if (excludedDirectoryMemo.size >= MAX_EXCLUDED_DIRECTORY_MEMO_ENTRIES) excludedDirectoryMemo.clear()
+  const separator = Math.max(directory.lastIndexOf('/'), directory.lastIndexOf('\\'))
+  const segment = separator === -1 ? directory : directory.slice(separator + 1)
+  const excluded = EXCLUDED_DIRECTORY_SET.has(segment)
+    || (separator > 0 && isExcludedDirectory(directory.slice(0, separator)))
+  excludedDirectoryMemo.set(directory, excluded)
+  return excluded
 }
 
 function isExcludedPath(path: string): boolean {
-  const segments = path.replace(/\\/g, '/').split('/')
-  return segments.some((segment) => EXCLUDED_DIRECTORY_SET.has(segment))
+  const separator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return separator > 0 && isExcludedDirectory(path.slice(0, separator))
 }
 
 function prepareVisiblePaths(buffer: Buffer): string[] {
@@ -593,12 +513,14 @@ function prepareVisiblePaths(buffer: Buffer): string[] {
 // Tracked paths come from `ls-files`, untracked ones from the same status call
 // that produced the statuses. A file can appear in both when it is tracked and
 // also reported, so the set is deduplicated.
+//
+// The build-output exclusion applies only to the untracked side. A repository that
+// commits its `dist/` is telling git those files matter; hiding them made them
+// unreviewable and made commit reviews disagree with their own patch, which never
+// carried the exclusion. Anything genuinely generated is already ignored, so git
+// never lists it as tracked.
 export function mergeVisiblePaths(trackedBuffer: Buffer, untrackedPaths: readonly string[]): string[] {
-  const seen = new Set<string>()
-  for (const rawPath of splitNullDelimited(trackedBuffer)) {
-    const path = rawPath.replace(/^\.\//, '')
-    if (!isExcludedPath(path)) seen.add(path)
-  }
+  const seen = new Set<string>(splitNullDelimited(trackedBuffer))
   for (const rawPath of untrackedPaths) {
     const path = rawPath.replace(/^\.\//, '')
     if (!isExcludedPath(path)) seen.add(path)
@@ -606,256 +528,6 @@ export function mergeVisiblePaths(trackedBuffer: Buffer, untrackedPaths: readonl
   return [...seen].sort(comparePaths)
 }
 
-export interface DiffChurnEntry {
-  path: string
-  previousPath?: string
-  additions: number
-  deletions: number
-  binary: boolean
-}
-
-export function parseNumstat(buffer: Buffer): DiffChurnEntry[] {
-  const fields = splitNullDelimited(buffer)
-  const entries: DiffChurnEntry[] = []
-
-  for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex += 1) {
-    const field = fields[fieldIndex]
-    if (field == null) continue
-    const firstTab = field.indexOf('\t')
-    const secondTab = field.indexOf('\t', firstTab + 1)
-    if (firstTab < 1 || secondTab < 0) continue
-
-    const additionsText = field.slice(0, firstTab)
-    const deletionsText = field.slice(firstTab + 1, secondTab)
-    const binary = additionsText === '-' || deletionsText === '-'
-    const churn = {
-      additions: binary ? 0 : Number(additionsText) || 0,
-      deletions: binary ? 0 : Number(deletionsText) || 0,
-      binary
-    }
-    const inlinePath = field.slice(secondTab + 1)
-    if (inlinePath !== '') {
-      entries.push({ path: inlinePath, ...churn })
-      continue
-    }
-
-    const previousPath = fields[fieldIndex + 1]
-    const path = fields[fieldIndex + 2]
-    fieldIndex += 2
-    if (previousPath == null || path == null) continue
-    entries.push({ path, previousPath, ...churn })
-  }
-
-  return entries
-}
-
-export function diffFilesFromChurn(entries: readonly DiffChurnEntry[]): PullRequestFile[] {
-  return entries
-    .map((entry) => ({ path: entry.path, additions: entry.additions, deletions: entry.deletions }))
-    .sort((left, right) => comparePaths(left.path, right.path))
-}
-
-export function selectOversizedDiffFiles(entries: readonly DiffChurnEntry[]): {
-  omittedFiles: OmittedDiffFile[]
-  excludePathspecs: string[]
-} {
-  const omittedFiles: OmittedDiffFile[] = []
-  const excludePathspecs: string[] = []
-
-  for (const entry of entries) {
-    if (entry.binary || entry.additions + entry.deletions <= MAX_DIFF_FILE_CHURN_LINES) continue
-    omittedFiles.push({
-      path: entry.path,
-      reason: 'too-large',
-      additions: entry.additions,
-      deletions: entry.deletions
-    })
-    excludePathspecs.push(`:(exclude,literal)${entry.path}`)
-    if (entry.previousPath != null) excludePathspecs.push(`:(exclude,literal)${entry.previousPath}`)
-  }
-
-  return { omittedFiles, excludePathspecs }
-}
-
-function formatPatchPath(side: 'a' | 'b', path: string): string {
-  const sidedPath = `${side}/${path}`
-  if (!PATCH_PATH_QUOTE_PATTERN.test(path)) return sidedPath
-  const escapedPath = sidedPath
-    .replace(/[\\"]/g, '\\$&')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')
-  return `"${escapedPath}"`
-}
-
-export function createNewFilePatch(path: string, contents: string, binary = false): string {
-  const header = `diff --git ${formatPatchPath('a', path)} ${formatPatchPath('b', path)}\nnew file mode 100644\n`
-  if (binary) return `${header}Binary files /dev/null and ${formatPatchPath('b', path)} differ\n`
-  // Git emits no hunk, and no file headers, for an empty new file.
-  if (contents === '') return header
-
-  const endsWithNewline = contents.endsWith('\n')
-  const lines = (endsWithNewline ? contents.slice(0, -1) : contents).split('\n')
-  const hunkHeader = lines.length === 1 ? '@@ -0,0 +1 @@' : `@@ -0,0 +1,${lines.length} @@`
-  const body = lines.map((line) => `+${line}`).join('\n')
-  const incompleteLastLine = endsWithNewline ? '' : '\\ No newline at end of file\n'
-  return `${header}--- /dev/null\n+++ ${formatPatchPath('b', path)}\n${hunkHeader}\n${body}\n${incompleteLastLine}`
-}
-
-/**
- * One wave of file pages to request together. GitHub gives no reliable total —
- * its own file count can exceed what the API serves, and a page carrying large
- * patches comes back short without meaning the end — so pages are read in waves
- * until a whole wave comes back empty, capped at the 3000 files the API answers.
- */
-export function pullRequestFilePageWave(startPage: number): number[] {
-  const maxPages = MAX_PULL_REQUEST_FILES / PULL_REQUEST_FILES_PAGE_SIZE
-  const first = Math.max(1, Math.floor(startPage))
-  const last = Math.min(maxPages, first + PULL_REQUEST_FILES_PAGE_CONCURRENCY - 1)
-  if (first > maxPages) return []
-  return Array.from({ length: last - first + 1 }, (_unused, index) => first + index)
-}
-
-export interface RawPullRequestFile {
-  filename: string
-  previous_filename?: string
-  status?: string
-  additions?: number
-  deletions?: number
-  patch?: string
-}
-
-/**
- * GitHub answers `gh pr diff` with HTTP 406 once a pull request touches more than
- * 300 files, and `gh` surfaces that verbatim. Recognising it lets the review fall
- * back to the paged files API instead of failing to open at all.
- */
-export function isPullRequestDiffTooLargeError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /HTTP 406|too_large|exceeded the maximum number of files/i.test(message)
-}
-
-/**
- * Rebuilds a git-style patch from the files API, which returns each file's hunks
- * without the `diff --git` headers the diff parser keys on. Files GitHub declines
- * to diff (binary, or too large for its own limit) arrive without a patch and are
- * reported as omitted rather than dropped silently.
- */
-export function buildPullRequestPatchFromFiles(rawFiles: readonly RawPullRequestFile[]): {
-  patch: string
-  files: PullRequestFile[]
-  omittedFiles: OmittedDiffFile[]
-} {
-  const sections: string[] = []
-  const files: PullRequestFile[] = []
-  const omittedFiles: OmittedDiffFile[] = []
-  for (const rawFile of rawFiles) {
-    const path = typeof rawFile.filename === 'string' ? rawFile.filename : ''
-    if (path === '' || isExcludedPath(path)) continue
-    const additions = Number.isFinite(rawFile.additions) ? Number(rawFile.additions) : 0
-    const deletions = Number.isFinite(rawFile.deletions) ? Number(rawFile.deletions) : 0
-    files.push({ path, additions, deletions })
-    if (typeof rawFile.patch !== 'string' || rawFile.patch === '') {
-      omittedFiles.push({ path, reason: 'too-large', additions, deletions })
-      continue
-    }
-
-    const previousPath = typeof rawFile.previous_filename === 'string' && rawFile.previous_filename !== ''
-      ? rawFile.previous_filename
-      : path
-    const header = [`${GIT_DIFF_SECTION_PREFIX}${formatPatchPath('a', previousPath)} ${formatPatchPath('b', path)}`]
-    if (rawFile.status === 'added') header.push('new file mode 100644')
-    if (rawFile.status === 'removed') header.push('deleted file mode 100644')
-    if (rawFile.status === 'renamed' && previousPath !== path) {
-      header.push(`rename from ${previousPath}`, `rename to ${path}`)
-    }
-    header.push(
-      rawFile.status === 'added' ? '--- /dev/null' : `--- ${formatPatchPath('a', previousPath)}`,
-      rawFile.status === 'removed' ? '+++ /dev/null' : `+++ ${formatPatchPath('b', path)}`
-    )
-    const body = rawFile.patch.endsWith('\n') ? rawFile.patch : `${rawFile.patch}\n`
-    sections.push(`${header.join('\n')}\n${body}`)
-  }
-  return { patch: sections.join(''), files, omittedFiles }
-}
-
-function findPatchSectionStarts(patch: string): number[] {
-  const starts: number[] = []
-  if (patch.startsWith(GIT_DIFF_SECTION_PREFIX)) starts.push(0)
-  let boundaryIndex = patch.indexOf(`\n${GIT_DIFF_SECTION_PREFIX}`)
-  while (boundaryIndex !== -1) {
-    starts.push(boundaryIndex + 1)
-    boundaryIndex = patch.indexOf(`\n${GIT_DIFF_SECTION_PREFIX}`, boundaryIndex + 1)
-  }
-  return starts
-}
-
-function patchSectionPath(patch: string, start: number, end: number): string {
-  const newlineIndex = patch.indexOf('\n', start)
-  const headerEnd = newlineIndex === -1 || newlineIndex > end ? end : newlineIndex
-  const header = patch.slice(start, headerEnd)
-  const match = DIFF_HEADER_PATHS.exec(header)
-  const plainPath = match?.[4]
-  if (plainPath != null) return plainPath
-  const quotedPath = match?.[3]
-  if (quotedPath != null) return quotedPath.replace(/\\(.)/g, '$1')
-  return header.slice(GIT_DIFF_SECTION_PREFIX.length)
-}
-
-function countPatchSectionChurn(
-  patch: string,
-  start: number,
-  end: number
-): { additions: number; deletions: number } {
-  let additions = 0
-  let deletions = 0
-  let lineStart = start
-
-  while (lineStart < end) {
-    const newlineIndex = patch.indexOf('\n', lineStart)
-    const lineEnd = newlineIndex === -1 || newlineIndex > end ? end : newlineIndex
-    const marker = patch[lineStart]
-    if (marker === '+' && !patch.startsWith('+++ ', lineStart)) additions += 1
-    else if (marker === '-' && !patch.startsWith('--- ', lineStart)) deletions += 1
-    lineStart = lineEnd + 1
-  }
-
-  return { additions, deletions }
-}
-
-export function limitPatchFileSize(
-  patch: string,
-  maxBytes: number
-): { patch: string; omittedFiles: OmittedDiffFile[] } {
-  const sectionStarts = findPatchSectionStarts(patch)
-  const sectionEnd = (index: number): number => sectionStarts[index + 1] ?? patch.length
-  const oversizedSections = new Set<number>()
-  for (let index = 0; index < sectionStarts.length; index += 1) {
-    if (sectionEnd(index) - sectionStarts[index]! > maxBytes) oversizedSections.add(index)
-  }
-  if (oversizedSections.size === 0) return { patch, omittedFiles: [] }
-
-  const omittedFiles: OmittedDiffFile[] = []
-  const keptParts: string[] = []
-  const firstStart = sectionStarts[0]!
-  if (firstStart > 0) keptParts.push(patch.slice(0, firstStart))
-
-  for (let index = 0; index < sectionStarts.length; index += 1) {
-    const start = sectionStarts[index]!
-    const end = sectionEnd(index)
-    if (!oversizedSections.has(index)) {
-      keptParts.push(patch.slice(start, end))
-      continue
-    }
-    omittedFiles.push({
-      path: patchSectionPath(patch, start, end),
-      reason: 'too-large',
-      ...countPatchSectionChurn(patch, start, end)
-    })
-  }
-
-  return { patch: keptParts.join(''), omittedFiles }
-}
 
 export function classifySearchCompletion(outcome: {
   cancelled: boolean
@@ -880,11 +552,15 @@ export function isPathWithinApprovedRoots(roots: readonly string[], candidate: s
   return roots.some((root) => isWithinRoot(root, candidate))
 }
 
-function toDiffFile(name: string, contents: Buffer, revision: string): DiffFileContents {
+// The key identifies content, not the read that produced it. Folding the commit
+// oid or the file's mtime in here re-keyed every open file after any commit or
+// any byte-identical rewrite, which both re-tokenized the whole diff in the
+// worker pool and made a pending draft unsavable against its own unchanged file.
+function toDiffFile(name: string, contents: Buffer): DiffFileContents {
   return {
     name,
     contents: contents.toString('utf8'),
-    cacheKey: createCacheKey(revision, name, contents)
+    cacheKey: createCacheKey(name, contents)
   }
 }
 
@@ -973,9 +649,8 @@ export function normalizePullRequestSelector(selector: number | string): string 
     requirePullRequestNumber(pullRequestNumber)
     return String(pullRequestNumber)
   }
-  if (/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(trimmedSelector)) {
-    return trimmedSelector
-  }
+  const pullRequestUrl = normalizeGitHubPullRequestUrl(trimmedSelector)
+  if (pullRequestUrl != null) return pullRequestUrl
   throw new Error('Pull request selector must be a positive number or a GitHub pull request URL.')
 }
 
@@ -1251,6 +926,84 @@ export interface ContentSearchMetrics {
   durationsMs: number[]
 }
 
+export class PullRequestReviewCache {
+  #directory: string
+
+  constructor(directory: string) {
+    this.#directory = directory
+  }
+
+  // Hashed rather than composed from the slug: a pull request URL is remote input
+  // and must never decide a path segment.
+  #entryPath(url: string, headRefOid: string): string {
+    return resolve(this.#directory, `${createCacheKey(url, headRefOid)}.json`)
+  }
+
+  async read(url: string, headRefOid: string): Promise<CachedPullRequestReview | null> {
+    if (headRefOid === '') return null
+    try {
+      const entry = JSON.parse(await readFile(this.#entryPath(url, headRefOid), 'utf8')) as CachedPullRequestReview
+      if (
+        entry.version !== PULL_REQUEST_CACHE_VERSION
+        || entry.headRefOid !== headRefOid
+        || typeof entry.patch !== 'string'
+        || !Array.isArray(entry.files)
+        || !Array.isArray(entry.omittedFiles)
+      ) return null
+      return entry
+    } catch {
+      // A missing, truncated or half-written entry is simply a miss.
+      return null
+    }
+  }
+
+  async write(url: string, headRefOid: string, review: PullRequestReview): Promise<void> {
+    if (headRefOid === '' || review.files.length === 0) return
+    const entry: CachedPullRequestReview = {
+      version: PULL_REQUEST_CACHE_VERSION,
+      headRefOid,
+      files: review.files,
+      patch: review.patch,
+      omittedFiles: review.omittedFiles
+    }
+    try {
+      await mkdir(this.#directory, { recursive: true })
+      const entryPath = this.#entryPath(url, headRefOid)
+      const temporaryPath = `${entryPath}.${randomUUID()}`
+      await writeFile(temporaryPath, JSON.stringify(entry), 'utf8')
+      await rename(temporaryPath, entryPath)
+      await this.sweep()
+    } catch {
+      // The cache is an optimisation; failing to write it must never fail a review.
+    }
+  }
+
+  async sweep(): Promise<void> {
+    const names = await readdir(this.#directory).catch(() => [] as string[])
+    const entries = await mapWithConcurrency(
+      names.filter((name) => name.endsWith('.json')),
+      MAX_PATCH_COMMAND_CONCURRENCY,
+      async (name) => {
+        const entryPath = resolve(this.#directory, name)
+        try {
+          const metadata = await stat(entryPath)
+          return { path: entryPath, bytes: metadata.size, modifiedAt: metadata.mtimeMs }
+        } catch {
+          return null
+        }
+      }
+    )
+    const present = entries.filter((entry) => entry != null)
+    present.sort((left, right) => right.modifiedAt - left.modifiedAt)
+    let bytes = 0
+    const expired = present.filter((entry, index) => {
+      bytes += entry.bytes
+      return index >= MAX_PULL_REQUEST_CACHE_ENTRIES || bytes > MAX_PULL_REQUEST_CACHE_BYTES
+    })
+    await Promise.all(expired.map((entry) => unlink(entry.path).catch(() => {})))
+  }
+}
+
 export class RepositoryService {
   #root: string | null = null
   #kind: RepositorySnapshot['kind'] = 'folder'
@@ -1259,6 +1012,15 @@ export class RepositoryService {
   #statusByPath = new Map<string, RepositoryStatusEntry>()
   #headFileCache = new Map<string, { promise: Promise<ReadVersion | null>; bytes: number }>()
   #headFileCacheBytes = 0
+  #objectReader: GitObjectReader | null = null
+  #trackedPathsCache: { buffer: Buffer; untrackedPaths: string[]; paths: string[] } | null = null
+  #workingFileCache = new Map<string, { read: WorkingFileRead; bytes: number }>()
+  #workingFileCacheBytes = 0
+  #pendingComparisons = new Map<string, Promise<FileComparison>>()
+  #selfWriteObserver: ((path: string) => void) | null = null
+  #checkFieldsSupported = true
+  #reviewAbort: AbortController | null = null
+  #pullRequestCache: PullRequestReviewCache | null = null
   #activeSearch: { child: ReturnType<typeof spawn>; cancelled: boolean; startedAt: number } | null = null
   #contentSearchMetrics: ContentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
   #githubViewerLogin: string | null = null
@@ -1272,6 +1034,17 @@ export class RepositoryService {
     return this.#snapshot
   }
 
+  // The watcher needs to know a write is ours before it lands, or it refreshes
+  // the whole tree for a file the app just wrote and already has the contents of.
+  setSelfWriteObserver(observe: ((path: string) => void) | null): void {
+    this.#selfWriteObserver = observe
+  }
+
+  // Passed in from the main entry point so this module keeps no Electron import.
+  setPullRequestCacheDirectory(directory: string | null): void {
+    this.#pullRequestCache = directory == null ? null : new PullRequestReviewCache(directory)
+  }
+
   getContentSearchMetricsForTests(): ContentSearchMetrics {
     return {
       ...this.#contentSearchMetrics,
@@ -1281,6 +1054,20 @@ export class RepositoryService {
 
   resetContentSearchMetricsForTests(): void {
     this.#contentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
+  }
+
+  getHeadCacheStatsForTests(): { entries: number; bytes: number; objectReaderSpawns: number } {
+    return {
+      entries: this.#headFileCache.size,
+      bytes: this.#headFileCacheBytes,
+      objectReaderSpawns: this.#objectReader?.spawnCountForTests ?? 0
+    }
+  }
+
+  dispose(): void {
+    this.#cancelActiveSearch()
+    this.#objectReader?.dispose()
+    this.#objectReader = null
   }
 
   async open(folderPath: string): Promise<RepositorySnapshot> {
@@ -1296,6 +1083,15 @@ export class RepositoryService {
     this.#pullRequestIdentities.clear()
     this.#cancelActiveSearch()
     this.#clearHeadFileCache()
+    this.#objectReader?.dispose()
+    this.#objectReader = null
+    this.#trackedPathsCache = null
+    // A read still in flight would otherwise be served, keyed by path alone, into
+    // the repository that just replaced it.
+    this.#pendingComparisons.clear()
+    this.cancelPullRequestReview()
+    this.#workingFileCache.clear()
+    this.#workingFileCacheBytes = 0
     return this.refresh()
   }
 
@@ -1320,12 +1116,28 @@ export class RepositoryService {
       kind: 'git',
       branch,
       head,
-      paths: mergeVisiblePaths(trackedResult.stdout, status.untrackedPaths),
-      statuses: status.statuses.filter((entry) => !isExcludedPath(entry.path))
+      paths: this.#visiblePaths(trackedResult.stdout, status.untrackedPaths),
+      statuses: status.statuses.filter((entry) => entry.status !== 'untracked' || !isExcludedPath(entry.path))
     }
 
     this.#setSnapshot(snapshot)
     return snapshot
+  }
+
+  // Editing a file leaves both lists byte-for-byte identical, which is the
+  // common watcher tick. Re-splitting, re-filtering and re-sorting 100k paths for
+  // that cost ~120 ms of blocked main process per tick. Cache repositories with
+  // untracked files too; otherwise one draft file disabled the fast path.
+  #visiblePaths(trackedBuffer: Buffer, untrackedPaths: readonly string[]): string[] {
+    const cached = this.#trackedPathsCache
+    if (cached != null && cached.buffer.equals(trackedBuffer)
+        && cached.untrackedPaths.length === untrackedPaths.length
+        && cached.untrackedPaths.every((path, index) => path === untrackedPaths[index])) {
+      return cached.paths
+    }
+    const paths = mergeVisiblePaths(trackedBuffer, untrackedPaths)
+    this.#trackedPathsCache = { buffer: trackedBuffer, untrackedPaths: [...untrackedPaths], paths }
+    return paths
   }
 
   async #refreshFolder(root: string): Promise<RepositorySnapshot> {
@@ -1358,7 +1170,20 @@ export class RepositoryService {
     return snapshot
   }
 
-  async getComparison(path: string): Promise<FileComparison> {
+  getComparison(path: string): Promise<FileComparison> {
+    const pending = this.#pendingComparisons.get(path)
+    if (pending != null) return pending
+    // App.tsx, the multi-file viewer's scroll hydration and the editor can each
+    // ask for the same path in the same tick; without this they each ran the
+    // whole read/decode/hash pipeline.
+    const comparison = this.#loadComparison(path).finally(() => {
+      this.#pendingComparisons.delete(path)
+    })
+    this.#pendingComparisons.set(path, comparison)
+    return comparison
+  }
+
+  async #loadComparison(path: string): Promise<FileComparison> {
     const root = this.#requireRoot()
     const snapshot = this.#requireSnapshot()
     if (!this.#pathSet.has(path)) throw new Error('The selected path is not in the repository.')
@@ -1374,16 +1199,10 @@ export class RepositoryService {
 
     return {
       path,
-      mode: snapshot.kind === 'git' ? 'diff' : 'file',
+      mode: snapshot.kind === 'git' && status != null ? 'diff' : 'file',
       status: status?.status ?? 'unchanged',
-      oldFile:
-        oldVersion?.contents != null && !binary && !oversized
-          ? toDiffFile(oldPath, oldVersion.contents, snapshot.head ?? 'empty-head')
-          : null,
-      newFile:
-        workingVersion?.contents != null && !binary && !oversized
-          ? toDiffFile(path, workingVersion.contents, workingVersion.revision)
-          : null,
+      oldFile: binary || oversized ? null : oldVersion?.file ?? null,
+      newFile: binary || oversized ? null : workingVersion?.file ?? null,
       binary,
       oversized
     }
@@ -1408,15 +1227,16 @@ export class RepositoryService {
     }
     if (contents.includes('\0')) throw new Error('Binary files cannot be edited in Horus.')
 
-    const currentVersion = await this.#readWorkingFile(path, root)
+    // The conflict check is the one place that must see the disk, not the cache.
+    const currentVersion = await this.#readWorkingFile(path, root, true)
     if (
-      currentVersion?.contents == null
+      currentVersion?.file == null
       || currentVersion.binary
       || currentVersion.oversized
     ) {
       throw new Error('This working file is not editable.')
     }
-    const currentFile = toDiffFile(path, currentVersion.contents, currentVersion.revision)
+    const currentFile = currentVersion.file
     if (currentFile.cacheKey !== expectedCacheKey) {
       throw new Error('The file changed on disk. Reload it before saving your draft.')
     }
@@ -1436,13 +1256,43 @@ export class RepositoryService {
     const temporaryPath = resolve(dirname(resolvedPath), `.horus-save-${randomUUID()}`)
     try {
       await writeFile(temporaryPath, contents, { encoding: 'utf8', flag: 'wx', mode: metadata.mode })
+      this.#selfWriteObserver?.(path)
       await rename(temporaryPath, resolvedPath)
     } finally {
       await unlink(temporaryPath).catch(() => {})
     }
 
-    await this.refresh()
+    this.#deleteWorkingCacheEntry(path)
+    this.#pendingComparisons.delete(path)
+    // A single-file write cannot change the tracked path list, the branch or HEAD,
+    // so the whole-tree `ls-files` + `status --untracked-files=all` pair the save
+    // used to run is replaced by one status call scoped to the saved path.
+    if (!await this.#refreshSavedPathStatus(path)) await this.refresh()
     return this.getComparison(path)
+  }
+
+  async #refreshSavedPathStatus(path: string): Promise<boolean> {
+    const snapshot = this.#snapshot
+    if (snapshot == null || snapshot.kind !== 'git') return false
+    let result: CommandResult
+    try {
+      result = await this.#git([
+        'status', '--porcelain=v2', '-z', '--untracked-files=all', '--', `:(literal)${path}`
+      ])
+    } catch {
+      return false
+    }
+    const entries = parsePorcelainV2Status(result.stdout).statuses
+    // A rename record or a report about another path means the narrow view is
+    // wrong about what moved; fall back to the whole-tree walk.
+    if (entries.length > 1 || entries.some((entry) => entry.path !== path || entry.previousPath != null)) {
+      return false
+    }
+    const next = entries[0] ?? null
+    const previous = this.#statusByPath.get(path) ?? null
+    if (previous?.status === next?.status && previous?.previousPath === next?.previousPath) return true
+    this.#setSnapshot({ ...snapshot, statuses: replaceStatusEntry(snapshot.statuses, path, next) })
+    return true
   }
 
   async getWorkingTreePatch(pathsValue: unknown): Promise<WorkingTreePatch> {
@@ -1468,18 +1318,26 @@ export class RepositoryService {
     const patchParts: string[] = []
 
     if (trackedPaths.length > 0) {
-      const churnResult = await this.#git([
-        'diff', '--numstat', '-z', '--find-renames', snapshot.head!, '--', ...trackedPaths
-      ])
-      const oversized = selectOversizedDiffFiles(parseNumstat(churnResult.stdout))
+      const head = snapshot.head!
+      const churnChunks = await mapWithConcurrency(
+        chunkPathspecs(trackedPaths),
+        MAX_PATCH_COMMAND_CONCURRENCY,
+        async (chunk) => parseNumstat(
+          (await this.#git(['diff', '--numstat', '-z', '--find-renames', head, '--', ...chunk])).stdout
+        )
+      )
+      const oversized = selectOversizedDiffFiles(churnChunks.flat())
       omittedFiles.push(...oversized.omittedFiles)
       const oversizedPaths = new Set(oversized.omittedFiles.map((file) => file.path))
       const includedPaths = trackedPaths.filter((path) => !oversizedPaths.has(path))
-      if (includedPaths.length > 0) {
-        const result = await this.#git([
-          'diff', '--no-color', '--find-renames', '--unified=3', snapshot.head!, '--', ...includedPaths
-        ])
-        const patch = result.stdout.toString('utf8')
+      const patchChunks = await mapWithConcurrency(
+        chunkPathspecs(includedPaths),
+        MAX_PATCH_COMMAND_CONCURRENCY,
+        async (chunk) => (
+          await this.#git(['diff', '--no-color', '--find-renames', '--unified=3', head, '--', ...chunk])
+        ).stdout.toString('utf8')
+      )
+      for (const patch of patchChunks) {
         if (patch !== '') patchParts.push(patch)
       }
     }
@@ -1715,6 +1573,11 @@ export class RepositoryService {
   async mergePullRequest(selector: number | string, strategy: unknown): Promise<void> {
     this.#requireGitRepository()
     const normalizedSelector = normalizePullRequestSelector(selector)
+    // Merging is irreversible: an unrecognized strategy is a caller bug, not a
+    // reason to pick one.
+    if (strategy !== 'merge' && strategy !== 'rebase' && strategy !== 'squash') {
+      throw new Error('Unknown merge strategy.')
+    }
     const mergeFlag = strategy === 'merge' ? '--merge' : strategy === 'rebase' ? '--rebase' : '--squash'
     const ghExecutable = await getGhExecutable()
     const remotes = parseRemotes(await this.#git(['remote', '-v']))
@@ -1736,6 +1599,19 @@ export class RepositoryService {
     this.#requireGitRepository()
     const normalizedSelector = normalizePullRequestSelector(selector)
     const ghExecutable = await getGhExecutable()
+    // Marking ready is a remote write, so it is held to the same rule as merging:
+    // a pasted URL must name the repository that is open.
+    const remotes = parseRemotes(await this.#git(['remote', '-v']))
+    const detailsResult = await runGitHubReadCommand(
+      ghExecutable,
+      ['pr', 'view', normalizedSelector, '--json', 'number,url'],
+      this.#requireRoot()
+    )
+    const details = parseJson<{ number: number; url: string }>(detailsResult, 'GitHub CLI')
+    validatePullRequestTarget(details.url, details.number)
+    if (!pullRequestTargetsRemotes(remotes, details.url)) {
+      throw new Error('This pull request belongs to a different repository than the open one.')
+    }
     await runCommand(ghExecutable, ['pr', 'ready', normalizedSelector], this.#requireRoot())
   }
 
@@ -1792,10 +1668,15 @@ export class RepositoryService {
       '--format=%(HEAD)%09%(refname:short)%09%(upstream:short)',
       'refs/heads'
     ])
-    const pullRequestsPromise = runPullRequestJsonCommand(
+    // Open pull requests only, and without `statusCheckRollup`/`mergeable`.
+    // Measured against vercel/next.js: 100 PRs with the check fields answered
+    // HTTP 504 after 11.3 s (retried three times by runGitHubReadCommand), the
+    // same call without them 6.5 s, and `--state open --limit 30` 2.4 s. Nothing
+    // in the panel renders check data; the review of a single pull request still
+    // asks for it. Closed and merged rows load on demand instead.
+    const pullRequestsPromise = runGitHubReadCommand(
       ghExecutable,
-      ['pr', 'list', '--state', 'all', '--limit', '100'],
-      PULL_REQUEST_LIST_FIELDS,
+      ['pr', 'list', '--state', 'open', '--limit', String(PULL_REQUEST_LIST_LIMIT), '--json', PULL_REQUEST_LIST_FIELDS],
       this.#requireRoot()
     ).then(
       (result) => ({ pullRequests: parsePullRequestSummaries(result), message: null }),
@@ -1836,6 +1717,20 @@ export class RepositoryService {
     }
   }
 
+  // Closed and merged pull requests are a deliberate second request: including
+  // them in the panel's first paint tripled its latency for rows nobody had asked
+  // to see.
+  async getClosedPullRequests(): Promise<PullRequestSummary[]> {
+    this.#requireGitRepository()
+    const ghExecutable = await getGhExecutable()
+    const result = await runGitHubReadCommand(
+      ghExecutable,
+      ['pr', 'list', '--state', 'closed', '--limit', String(PULL_REQUEST_LIST_LIMIT), '--json', PULL_REQUEST_LIST_FIELDS],
+      this.#requireRoot()
+    )
+    return parsePullRequestSummaries(result)
+  }
+
   async switchBranch(name: string): Promise<RepositorySnapshot> {
     this.#requireGitRepository()
     const branchesResult = await this.#git([
@@ -1858,7 +1753,7 @@ export class RepositoryService {
       this.#git(['diff', '--numstat', '-z', '--find-renames', comparison, '--']),
       this.#git(['rev-parse', headRef])
     ])
-    const entries = parseNumstat(churnResult.stdout).filter((entry) => !isExcludedPath(entry.path))
+    const entries = parseNumstat(churnResult.stdout)
     const oversized = selectOversizedDiffFiles(entries)
     const patchResult = await this.#git([
       'diff', '--no-color', '--find-renames', comparison, '--', ...oversized.excludePathspecs
@@ -1894,7 +1789,7 @@ export class RepositoryService {
       this.#git(['show', '-s', '--format=%h%x1f%s', commitOid])
     ])
     const [shortOid = commitOid.slice(0, 8), subject = 'Commit'] = metadataResult.stdout.toString('utf8').trim().split('\x1f')
-    const entries = parseNumstat(churnResult.stdout).filter((entry) => !isExcludedPath(entry.path))
+    const entries = parseNumstat(churnResult.stdout)
     const oversized = selectOversizedDiffFiles(entries)
     const patchResult = await this.#git([...patchArgs, ...oversized.excludePathspecs])
     const limited = limitPatchFileSize(patchResult.stdout.toString('utf8'), MAX_DIFF_FILE_BYTES)
@@ -1940,21 +1835,45 @@ export class RepositoryService {
     return this.getGitIntegration()
   }
 
+  // Closing a big review left up to eight `gh api` children per wave running to
+  // completion for a patch that was already discarded, and on a rate-limited token
+  // that budget is spent invisibly.
+  cancelPullRequestReview(): void {
+    this.#reviewAbort?.abort()
+    this.#reviewAbort = null
+  }
+
   async getPullRequestReview(
     selector: number | string,
     onProgress?: (progress: PullRequestReviewProgress) => void
   ): Promise<PullRequestReview> {
     this.#requireGitRepository()
-    const normalizedSelector = normalizePullRequestSelector(selector)
+    // A second review supersedes the first rather than racing it.
+    this.cancelPullRequestReview()
+    const abort = new AbortController()
+    this.#reviewAbort = abort
+    try {
+      return await this.#loadPullRequestReview(normalizePullRequestSelector(selector), abort.signal, onProgress)
+    } finally {
+      if (this.#reviewAbort === abort) this.#reviewAbort = null
+    }
+  }
+
+  async #loadPullRequestReview(
+    normalizedSelector: string,
+    signal: AbortSignal,
+    onProgress?: (progress: PullRequestReviewProgress) => void
+  ): Promise<PullRequestReview> {
     const ghExecutable = await getGhExecutable()
     // Metadata resolves in a second or two while the diff can take minutes, so it
     // is awaited on its own: the review header and file tree can open on it alone.
     const [detailsResult, viewerLogin] = await Promise.all([
-      runPullRequestJsonCommand(
+      this.#runPullRequestJsonCommand(
         ghExecutable,
         ['pr', 'view', normalizedSelector],
         PULL_REQUEST_REVIEW_FIELDS,
-        this.#requireRoot()
+        this.#requireRoot(),
+        signal
       ),
       this.#getGitHubViewerLogin(ghExecutable)
     ])
@@ -1983,6 +1902,20 @@ export class RepositoryService {
     }
     onProgress?.({ kind: 'metadata', selector: normalizedSelector, review: base })
 
+    const cached = await this.#pullRequestCache?.read(pullRequest.url, headRefOid) ?? null
+    if (cached != null) {
+      // No files event: the whole patch is already in hand, so emitting it here
+      // and returning it from the same call would clone up to the entire review
+      // over IPC twice in one tick. The renderer adopts the resolved review.
+      return {
+        ...base,
+        files: cached.files,
+        patch: cached.patch,
+        omittedFiles: cached.omittedFiles,
+        expectedFileCount: cached.files.length
+      }
+    }
+
     const collectedFiles: PullRequestFile[] = []
     const collectedOmitted: OmittedDiffFile[] = []
     const patchParts: string[] = []
@@ -2000,14 +1933,24 @@ export class RepositoryService {
       })
     }
 
-    await this.#collectPullRequestPatch(ghExecutable, normalizedSelector, files ?? [], emit)
-    return {
+    await this.#collectPullRequestPatch(
+      ghExecutable,
+      normalizedSelector,
+      files ?? [],
+      expectedFileCount,
+      signal,
+      emit
+    )
+    const review: PullRequestReview = {
       ...base,
       files: collectedFiles,
       patch: patchParts.join(''),
       omittedFiles: collectedOmitted
     }
+    if (!signal.aborted) await this.#pullRequestCache?.write(pullRequest.url, headRefOid, review)
+    return review
   }
+
 
   /**
    * One diff document is the fast path; a pull request too big for GitHub to render
@@ -2017,29 +1960,35 @@ export class RepositoryService {
     ghExecutable: string,
     selector: string,
     detailFiles: readonly PullRequestFile[],
+    expectedFileCount: number,
+    signal: AbortSignal,
     emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
   ): Promise<void> {
     try {
       const diffResult = await runGitHubReadCommand(
         ghExecutable,
         ['pr', 'diff', selector, '--color', 'never'],
-        this.#requireRoot()
+        this.#requireRoot(),
+        signal
       )
+      const patch = diffResult.stdout.toString('utf8')
       emit({
-        patch: diffResult.stdout.toString('utf8'),
-        files: [...detailFiles],
+        patch,
+        files: detailFiles.length >= expectedFileCount ? [...detailFiles] : filesFromPatch(patch),
         omittedFiles: []
       })
       return
     } catch (error) {
+      if (signal.aborted) return
       if (!isPullRequestDiffTooLargeError(error)) throw error
     }
-    await this.#collectPullRequestPatchFromFilesApi(ghExecutable, selector, emit)
+    await this.#collectPullRequestPatchFromFilesApi(ghExecutable, selector, signal, emit)
   }
 
   async #collectPullRequestPatchFromFilesApi(
     ghExecutable: string,
     selector: string,
+    signal: AbortSignal,
     emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
   ): Promise<void> {
     const { owner, name, number } = await this.#resolvePullRequestIdentity(ghExecutable, selector)
@@ -2050,14 +1999,17 @@ export class RepositoryService {
           'api',
           `repos/${owner}/${name}/pulls/${number}/files?per_page=${PULL_REQUEST_FILES_PAGE_SIZE}&page=${page}`
         ],
-        this.#requireRoot()
+        this.#requireRoot(),
+        signal
       )
       const pageFiles = parseJson<RawPullRequestFile[]>(result, 'GitHub')
       return Array.isArray(pageFiles) ? pageFiles : []
     }
 
     for (let wave = pullRequestFilePageWave(1); wave.length > 0; wave = pullRequestFilePageWave(wave[wave.length - 1]! + 1)) {
+      if (signal.aborted) return
       const pages = await Promise.all(wave.map(readPage))
+      if (signal.aborted) return
       let filesInWave = 0
       for (const pageFiles of pages) {
         if (pageFiles.length === 0) continue
@@ -2141,6 +2093,36 @@ export class RepositoryService {
     }
   }
 
+  // Check data is optional garnish, so an unsupported field costs the chips instead
+  // of the whole response. An older `gh` rejects the check fields and the fallback
+  // costs a second spawn, so the answer is remembered — on the service rather than
+  // the module, where one degraded call used to degrade every later one in the
+  // process, tests included.
+  async #runPullRequestJsonCommand(
+    executable: string,
+    args: readonly string[],
+    fields: string,
+    cwd: string,
+    signal?: AbortSignal
+  ): Promise<CommandResult> {
+    if (!this.#checkFieldsSupported) {
+      return runGitHubReadCommand(executable, [...args, '--json', fields], cwd, signal)
+    }
+    try {
+      return await runGitHubReadCommand(
+        executable,
+        [...args, '--json', `${fields},${PULL_REQUEST_CHECK_FIELDS}`],
+        cwd,
+        signal
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!/unknown json field/i.test(message)) throw error
+      this.#checkFieldsSupported = false
+      return runGitHubReadCommand(executable, [...args, '--json', fields], cwd, signal)
+    }
+  }
+
   async #getGitHubViewerLogin(ghExecutable: string): Promise<string> {
     if (this.#githubViewerLogin != null) return this.#githubViewerLogin
     const result = await runGitHubReadCommand(
@@ -2149,7 +2131,11 @@ export class RepositoryService {
       this.#requireRoot()
     )
     const login = result.stdout.toString('utf8').trim()
-    if (login === '' || login.length > 64 || /[\x00-\x1f\x7f]/.test(login)) {
+    const containsControlCharacter = [...login].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0
+      return codePoint <= 0x1f || codePoint === 0x7f
+    })
+    if (login === '' || login.length > 64 || containsControlCharacter) {
       throw new Error('GitHub returned an invalid viewer login.')
     }
     this.#githubViewerLogin = login
@@ -2178,8 +2164,8 @@ export class RepositoryService {
       entry.bytes = bytes
       this.#evictHeadFileCache()
     }
-    entry.promise = this.#loadHeadFile(object, chargeBytes).then((version) => {
-      chargeBytes(version?.contents?.byteLength ?? 0)
+    entry.promise = this.#loadHeadFile(path, object, chargeBytes).then((version) => {
+      chargeBytes(version?.file == null ? 0 : Buffer.byteLength(version.file.contents, 'utf8'))
       return version
     }).catch((error: unknown) => {
       if (this.#headFileCache.get(object) === entry) this.#deleteHeadCacheEntry(object)
@@ -2191,32 +2177,35 @@ export class RepositoryService {
   }
 
   async #loadHeadFile(
+    path: string,
     object: string,
     chargeBytes: (bytes: number) => void
   ): Promise<ReadVersion | null> {
     this.#requireGitRepository()
     let read: GitObjectRead
     try {
-      read = await readGitObject(this.#requireRoot(), object)
+      read = await this.#readObject(object)
     } catch {
       // A HEAD side that cannot be read reads as "no previous version", which is
       // what the two-spawn version did when the size probe failed.
       return null
     }
-    if (read.missing) return null
-    if (read.oversized) return { contents: null, binary: false, oversized: true }
+    // A gitlink resolves to the submodule's commit object. Rendering its body as
+    // the old side turned every submodule into a deleted file full of plumbing.
+    if (read.missing || read.type !== 'blob') return null
+    if (read.oversized) return { file: null, binary: false, oversized: true }
     chargeBytes(read.size)
 
     const contents = read.contents ?? Buffer.alloc(0)
-    return { contents, binary: isBinary(contents), oversized: false }
+    const binary = isBinary(contents)
+    return { file: binary ? null : toDiffFile(path, contents), binary, oversized: false }
   }
 
   async #readWorkingFile(
     path: string,
-    root: string
-  ): Promise<
-    { contents: Buffer | null; binary: boolean; oversized: boolean; revision: string } | null
-  > {
+    root: string,
+    bypassCache = false
+  ): Promise<WorkingFileRead | null> {
     const candidate = resolve(root, path)
     if (!isWithinRoot(root, candidate)) throw new Error('The selected path escapes the repository.')
 
@@ -2224,37 +2213,88 @@ export class RepositoryService {
     try {
       metadata = await lstat(candidate)
     } catch {
+      this.#deleteWorkingCacheEntry(path)
       return null
     }
 
+    // Identity as well as timestamps: a same-millisecond rewrite of the same size
+    // would otherwise be served from the cache.
+    const revision = `${metadata.mtimeMs}:${metadata.ctimeMs}:${metadata.size}:${metadata.ino}`
+    if (!bypassCache) {
+      const cached = this.#workingFileCache.get(path)
+      if (cached != null && cached.read.revision === revision) {
+        this.#workingFileCache.delete(path)
+        this.#workingFileCache.set(path, cached)
+        return cached.read
+      }
+    }
+
+    const read = await this.#loadWorkingFile(path, candidate, root, metadata, revision)
+    if (read != null) this.#storeWorkingFile(path, read)
+    return read
+  }
+
+  async #loadWorkingFile(
+    path: string,
+    candidate: string,
+    root: string,
+    metadata: Awaited<ReturnType<typeof lstat>>,
+    revision: string
+  ): Promise<WorkingFileRead | null> {
     if (metadata.isSymbolicLink()) {
       const linkTarget = Buffer.from(await readlink(candidate), 'utf8')
       return {
         contents: linkTarget,
+        file: toDiffFile(path, linkTarget),
         binary: false,
         oversized: false,
-        revision: `${metadata.mtimeMs}:${metadata.size}`
+        revision
       }
     }
     if (!metadata.isFile()) return null
     if (metadata.size > MAX_DIFF_FILE_BYTES) {
-      return {
-        contents: null,
-        binary: false,
-        oversized: true,
-        revision: `${metadata.mtimeMs}:${metadata.size}`
-      }
+      return { contents: null, file: null, binary: false, oversized: true, revision }
     }
 
     const resolvedPath = await realpath(candidate)
     if (!isWithinRoot(root, resolvedPath)) throw new Error('The selected file resolves outside the repository.')
     const contents = await readFile(resolvedPath)
+    const binary = isBinary(contents)
     return {
       contents,
-      binary: isBinary(contents),
+      file: binary ? null : toDiffFile(path, contents),
+      binary,
       oversized: false,
-      revision: `${metadata.mtimeMs}:${metadata.size}`
+      revision
     }
+  }
+
+  #storeWorkingFile(path: string, read: WorkingFileRead): void {
+    const bytes = read.contents?.byteLength ?? 0
+    this.#deleteWorkingCacheEntry(path)
+    this.#workingFileCache.set(path, { read, bytes })
+    this.#workingFileCacheBytes += bytes
+    while (
+      this.#workingFileCache.size > MAX_WORKING_CACHE_ENTRIES
+      || this.#workingFileCacheBytes > MAX_WORKING_CACHE_BYTES
+    ) {
+      const oldest = this.#workingFileCache.keys().next().value
+      if (oldest == null || oldest === path) return
+      this.#deleteWorkingCacheEntry(oldest)
+    }
+  }
+
+  #deleteWorkingCacheEntry(path: string): void {
+    const entry = this.#workingFileCache.get(path)
+    if (entry == null) return
+    this.#workingFileCacheBytes -= entry.bytes
+    this.#workingFileCache.delete(path)
+  }
+
+  #readObject(object: string): Promise<GitObjectRead> {
+    const root = this.#requireRoot()
+    if (this.#objectReader == null) this.#objectReader = new GitObjectReader(root)
+    return this.#objectReader.read(object)
   }
 
   async #git(args: readonly string[]): Promise<CommandResult> {
@@ -2278,8 +2318,10 @@ export class RepositoryService {
     if (this.#snapshot?.root !== snapshot.root || this.#snapshot?.head !== snapshot.head) {
       this.#clearHeadFileCache()
     }
+    // Rebuilding the set costs ~5 ms per refresh at 100k paths, and the watcher's
+    // steady-state tick hands back the same array `#visiblePaths` already reused.
+    if (this.#snapshot?.paths !== snapshot.paths) this.#pathSet = new Set(snapshot.paths)
     this.#snapshot = snapshot
-    this.#pathSet = new Set(snapshot.paths)
     this.#statusByPath = new Map(snapshot.statuses.map((status) => [status.path, status]))
   }
 

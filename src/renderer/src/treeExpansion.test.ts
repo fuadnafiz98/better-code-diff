@@ -3,8 +3,8 @@ import { describe, expect, it } from 'bun:test'
 import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
 
 describe('getTreeFollowBehavior', () => {
-  it('centers the active file when the review scroll drives the tree', () => {
-    expect(getTreeFollowBehavior('review-scroll')).toEqual({ offset: 'center', animate: true })
+  it('centers the active file instantly when the review scroll drives the tree', () => {
+    expect(getTreeFollowBehavior('review-scroll')).toEqual({ offset: 'center', animate: false })
   })
 
   it('does not recenter the tree during direct navigation', () => {
@@ -45,5 +45,30 @@ describe('getDirectoryPaths', () => {
 
   it('returns no directories for root files', () => {
     expect(getDirectoryPaths(['README.md', 'package.json'])).toEqual([])
+  })
+
+  it('lists every parent before its children', () => {
+    const directoryPaths = getDirectoryPaths([
+      'a/b/c/deep.ts',
+      'a/other.ts',
+      'z/top.ts'
+    ])
+    expect(directoryPaths).toEqual(['a', 'z', 'a/b', 'a/b/c'])
+    for (const directoryPath of directoryPaths) {
+      const parent = directoryPath.slice(0, directoryPath.lastIndexOf('/'))
+      if (parent === '') continue
+      expect(directoryPaths.indexOf(parent)).toBeLessThan(directoryPaths.indexOf(directoryPath))
+    }
+  })
+
+  it('deduplicates repeated ancestors across files', () => {
+    expect(getDirectoryPaths(['src/a.ts', 'src/b.ts', 'src/nested/c.ts']))
+      .toEqual(['src', 'src/nested'])
+  })
+
+  it('returns the same array for the same input identity', () => {
+    const filePaths = ['src/a.ts', 'src/nested/b.ts']
+    expect(getDirectoryPaths(filePaths)).toBe(getDirectoryPaths(filePaths))
+    expect(getDirectoryPaths([...filePaths])).toEqual(getDirectoryPaths(filePaths))
   })
 })

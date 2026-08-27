@@ -6,9 +6,12 @@ export interface MemorySample {
   gpuProcessCpuPercent?: number | null
 }
 
-// 3s sampling, so this is an hour of history — long enough to see a leak trend
-// without holding the samples of a whole workday.
-const MAX_SAMPLES = 1_200
+// Keep the chart recent enough that a new sample still moves visibly. A long
+// visibility gap starts a new continuous series instead of drawing a misleading
+// line across hours when the app did not sample.
+const HISTORY_WINDOW_MS = 1_200_000
+const HISTORY_GAP_RESET_MS = 30_000
+const MAX_SAMPLES = 500
 // Startup allocates fast; extrapolating those first seconds to an hour reports a
 // leak that isn't there. Wait for a few minutes, then read only recent history so
 // an old ramp stops dominating the slope.
@@ -20,7 +23,13 @@ const TREND_WINDOW_MS = 1_200_000
 const samples: MemorySample[] = []
 
 export function recordMemorySample(sample: MemorySample): readonly MemorySample[] {
+  const previous = samples[samples.length - 1]
+  if (previous != null && (sample.atMs <= previous.atMs || sample.atMs - previous.atMs > HISTORY_GAP_RESET_MS)) {
+    samples.length = 0
+  }
   samples.push(sample)
+  const firstRecentIndex = samples.findIndex((entry) => entry.atMs >= sample.atMs - HISTORY_WINDOW_MS)
+  if (firstRecentIndex > 0) samples.splice(0, firstRecentIndex)
   if (samples.length > MAX_SAMPLES) samples.splice(0, samples.length - MAX_SAMPLES)
   return samples
 }
@@ -45,16 +54,22 @@ export function memoryTrendPerHour(history: readonly MemorySample[]): number | n
   if (first == null || window.length < 4) return null
   if (newest.atMs - first.atMs < TREND_MIN_SPAN_MS) return null
 
-  const meanHours = window.reduce((total, sample) => total + sample.atMs, 0) / window.length / 3_600_000
-  const meanValue = window.reduce((total, sample) => total + sample.workingSetMegabytes, 0) / window.length
-  let covariance = 0
-  let variance = 0
-  for (const sample of window) {
-    const hours = sample.atMs / 3_600_000 - meanHours
-    covariance += hours * (sample.workingSetMegabytes - meanValue)
-    variance += hours * hours
+  const bucketSize = Math.max(2, Math.floor(window.length * 0.15))
+  const start = window.slice(0, bucketSize)
+  const end = window.slice(-bucketSize)
+  const median = (values: readonly number[]): number => {
+    const ordered = [...values].sort((left, right) => left - right)
+    const middle = Math.floor(ordered.length / 2)
+    return ordered.length % 2 === 0
+      ? ((ordered[middle - 1] ?? 0) + (ordered[middle] ?? 0)) / 2
+      : ordered[middle] ?? 0
   }
-  return variance === 0 ? null : covariance / variance
+  const startValue = median(start.map((sample) => sample.workingSetMegabytes))
+  const endValue = median(end.map((sample) => sample.workingSetMegabytes))
+  const startTime = median(start.map((sample) => sample.atMs))
+  const endTime = median(end.map((sample) => sample.atMs))
+  const elapsedHours = (endTime - startTime) / 3_600_000
+  return elapsedHours <= 0 ? null : (endValue - startValue) / elapsedHours
 }
 
 export function formatTrendPerHour(megabytesPerHour: number | null): string {
@@ -82,13 +97,6 @@ export function formatPerformanceMemory(megabytes: number): string {
   return megabytes >= 1_024
     ? `${(megabytes / 1_024).toFixed(1)} GB`
     : `${Math.round(megabytes)} MB`
-}
-
-export interface SparklineGeometry {
-  line: string
-  area: string
-  low: number
-  high: number
 }
 
 export type PerformanceChartMetric = 'memory' | 'cpu'
@@ -193,40 +201,4 @@ export function findNearestSampleIndex(history: readonly MemorySample[], atMs: n
   const before = history[low - 1]!
   const after = history[low]!
   return atMs - before.atMs <= after.atMs - atMs ? low - 1 : low
-}
-
-/**
- * Plots against wall-clock time rather than sample index: sampling pauses while
- * the window is hidden, and evenly spacing those samples would hide the gap.
- */
-export function buildMemorySparkline(
-  history: readonly MemorySample[],
-  width: number,
-  height: number
-): SparklineGeometry | null {
-  if (history.length < 2) return null
-  const first = history[0]
-  const last = history[history.length - 1]
-  if (first == null || last == null) return null
-  const values = history.map((sample) => sample.workingSetMegabytes)
-  const low = Math.min(...values)
-  const high = Math.max(...values)
-  const startMs = first.atMs
-  const spanMs = last.atMs - startMs
-  if (spanMs <= 0) return null
-  // A flat series would divide by zero; draw it down the middle instead.
-  const range = high - low
-  const points = history.map((sample) => {
-    const x = ((sample.atMs - startMs) / spanMs) * width
-    const y = range === 0
-      ? height / 2
-      : height - ((sample.workingSetMegabytes - low) / range) * height
-    return `${x.toFixed(1)},${y.toFixed(1)}`
-  })
-  return {
-    line: `M${points.join('L')}`,
-    area: `M0,${height.toFixed(1)}L${points.join('L')}L${width.toFixed(1)},${height.toFixed(1)}Z`,
-    low,
-    high
-  }
 }

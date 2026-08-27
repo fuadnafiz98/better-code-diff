@@ -49,13 +49,18 @@ Use the Electron window opened by `bun run dev`. The renderer URL on its own doe
 | `bun run build` | Build the main process, preload script, and renderer |
 | `bun run preview` | Preview the production renderer build |
 | `bun run typecheck` | Type-check Node and renderer projects |
+| `bun run lint` | Lint `src` with oxlint |
 | `bun test` | Run the test suite |
+| `bun run verify` | Lint, type-check, test, and build in one pass |
 
 Run the complete local verification with:
 
 ```sh
-bun run typecheck && bun test && bun run build
+bun run verify
 ```
+
+The same four steps run in CI (`.github/workflows/ci.yml`), followed by a React
+Doctor scan that fails on any diagnostic.
 
 ## Keyboard shortcuts
 

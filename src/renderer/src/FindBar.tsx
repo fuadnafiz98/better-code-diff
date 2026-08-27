@@ -2,8 +2,19 @@ import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import { IconChevronSm, IconX } from '@pierre/icons'
 
 import type { FindInPageResult } from '../../shared/contracts'
+import { deepActiveElement } from './keybindings'
 
 const FIND_DEBOUNCE_MS = 60
+
+// The editor binds ⌘F, ⌘G and Escape itself and calls preventDefault without
+// stopping propagation, so the window listener has to stand down while the
+// caret is inside it — otherwise both find UIs open and the editor's panel
+// loses focus to this one immediately.
+function editorOwnsFindKeys(event: KeyboardEvent): boolean {
+  if (event.defaultPrevented) return true
+  const active = deepActiveElement(document)
+  return active instanceof HTMLElement && active.isContentEditable
+}
 
 export function FindBar(): React.JSX.Element {
   const [open, setOpen] = useState(false)
@@ -23,6 +34,7 @@ export function FindBar(): React.JSX.Element {
   }
 
   const handleGlobalKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    if (editorOwnsFindKeys(event)) return
     const commandKey = event.metaKey || event.ctrlKey
     if (commandKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'f') {
       event.preventDefault()
@@ -66,32 +78,32 @@ export function FindBar(): React.JSX.Element {
 
   return (
     <div className="find-bar-anchor">
-      {open ? (
-        <search className="find-bar">
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== 'Enter') return
-              event.preventDefault()
-              findNext(!event.shiftKey)
-            }}
-            placeholder="Find in view"
-            aria-label="Find in current view"
-          />
-          <span className="find-count">{query === '' ? '—' : `${result?.activeMatchOrdinal ?? 0}/${result?.matches ?? 0}`}</span>
-          <button type="button" className="find-previous" disabled={query === ''} onClick={() => findNext(false)} aria-label="Previous match" title="Previous Match (Shift+Enter)">
-            <IconChevronSm />
-          </button>
-          <button type="button" disabled={query === ''} onClick={() => findNext(true)} aria-label="Next match" title="Next Match (Enter)">
-            <IconChevronSm />
-          </button>
-          <button type="button" onClick={close} aria-label="Close find" title="Close (Escape)">
-            <IconX />
-          </button>
-        </search>
-      ) : null}
+      {/* Staying mounted is what lets CSS run the exit; `inert` keeps Tab out of
+          the hidden bar, which the conditional render used to do for free. */}
+      <search className="find-bar" data-open={open ? '' : undefined} inert={!open}>
+        <input
+          ref={inputRef}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter') return
+            event.preventDefault()
+            findNext(!event.shiftKey)
+          }}
+          placeholder="Find in view"
+          aria-label="Find in current view"
+        />
+        <span className="find-count">{query === '' ? '—' : `${result?.activeMatchOrdinal ?? 0}/${result?.matches ?? 0}`}</span>
+        <button type="button" className="find-previous" disabled={query === ''} onClick={() => findNext(false)} aria-label="Previous match" title="Previous Match (Shift+Enter)">
+          <IconChevronSm />
+        </button>
+        <button type="button" disabled={query === ''} onClick={() => findNext(true)} aria-label="Next match" title="Next Match (Enter)">
+          <IconChevronSm />
+        </button>
+        <button type="button" onClick={close} aria-label="Close find" title="Close (Escape)">
+          <IconX />
+        </button>
+      </search>
     </div>
   )
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { clampSplitPercentage, splitPercentageFromPointer } from './splitDiffResize'
+import { clampSplitPercentage, resistedSplitPercentage, splitPercentageFromPointer } from './splitDiffResize'
 
 describe('split diff resizing', () => {
   it('keeps both code panes within useful limits', () => {
@@ -17,5 +17,10 @@ describe('split diff resizing', () => {
 
   it('uses the balanced split when the surface has no width', () => {
     expect(splitPercentageFromPointer(400, 200, 0)).toBe(50)
+  })
+
+  it('answers overshoot with resistance during a drag', () => {
+    expect(resistedSplitPercentage(15, 1_000)).toBeGreaterThan(15)
+    expect(resistedSplitPercentage(85, 1_000)).toBeLessThan(85)
   })
 })

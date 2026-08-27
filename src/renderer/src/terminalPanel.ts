@@ -28,3 +28,15 @@ export function resizedTerminalHeight(
 ): number {
   return clampTerminalHeight(initialHeight + initialPointerY - pointerY, viewportHeight)
 }
+
+export function resistedTerminalHeight(
+  initialHeight: number,
+  initialPointerY: number,
+  pointerY: number,
+  viewportHeight: number
+): number {
+  const range = terminalHeightRange(viewportHeight)
+  const raw = initialHeight + initialPointerY - pointerY
+  return Math.round(withResistance(raw, range.minimum, range.maximum, viewportHeight))
+}
+import { withResistance } from './rubberband'

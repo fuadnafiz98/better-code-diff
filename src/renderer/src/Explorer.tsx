@@ -1,13 +1,37 @@
-import { memo, useCallback, useMemo } from 'react'
-import type { FileTree as FileTreeModel } from '@pierre/trees'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import type { FileTree as FileTreeModel, TreeThemeStyles } from '@pierre/trees'
 import { themeToTreeStyles } from '@pierre/trees'
 import { FileTree, useFileTreeSearch } from '@pierre/trees/react'
 import pierreDarkTheme from '@pierre/theme/pierre-dark'
-import pierreLightTheme from '@pierre/theme/pierre-light'
 import { IconChevronsClose, IconExpandAll, IconSearch, IconX } from '@pierre/icons'
 
 import { getDirectoryPaths } from './treeExpansion'
 import type { EditorThemeType } from './preferences'
+
+// Only one palette is ever rendered, so the other one stays out of the workspace
+// chunk: the light theme is fetched the first time it is selected and kept for the
+// rest of the session. The first frame after that switch paints dark.
+const DARK_TREE_STYLES = themeToTreeStyles(pierreDarkTheme)
+let lightTreeStyles: Promise<TreeThemeStyles> | null = null
+
+function loadLightTreeStyles(): Promise<TreeThemeStyles> {
+  lightTreeStyles ??= import('@pierre/theme/pierre-light')
+    .then((module) => themeToTreeStyles(module.default))
+  return lightTreeStyles
+}
+
+function useTreeThemeStyles(themeType: EditorThemeType): TreeThemeStyles {
+  const [lightStyles, setLightStyles] = useState<TreeThemeStyles | null>(null)
+  useEffect(() => {
+    if (themeType !== 'light') return
+    let cancelled = false
+    void loadLightTreeStyles().then((styles) => {
+      if (!cancelled) setLightStyles(styles)
+    })
+    return () => { cancelled = true }
+  }, [themeType])
+  return themeType === 'light' ? lightStyles ?? DARK_TREE_STYLES : DARK_TREE_STYLES
+}
 
 interface ExplorerProps {
   filePaths: readonly string[]
@@ -20,12 +44,15 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType, on
   const search = useFileTreeSearch(model)
   const directoryPaths = useMemo(() => getDirectoryPaths(filePaths), [filePaths])
   const visibleFileCount = search.value.length > 0 ? search.matchingPaths.length : filePaths.length
+  const themeStyles = useTreeThemeStyles(themeType)
   const treeStyle = useMemo(() => ({
-    ...themeToTreeStyles(themeType === 'light' ? pierreLightTheme : pierreDarkTheme),
+    ...themeStyles,
     height: '100%',
     colorScheme: themeType,
-    fontFamily: '"Fira Code Variable", "Fira Code", monospace'
-  }) as React.CSSProperties, [themeType])
+    // TREE_STYLES only reaches [data-type="item"], so the library's sticky row
+    // and context-menu trigger keep their 6px unless the variable is overridden.
+    '--trees-border-radius-override': 'var(--corner-compact)'
+  }) as React.CSSProperties, [themeStyles, themeType])
 
   const expandAll = useCallback(() => {
     for (const directoryPath of directoryPaths) {

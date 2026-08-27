@@ -1,17 +1,22 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { describe, expect, it } from 'bun:test'
 
+import type { PullRequestReview } from '../shared/contracts.js'
+
 import {
   buildPullRequestPatchFromFiles,
+  chunkPathspecs,
   classifySearchCompletion,
   createNewFilePatch,
   createPullRequestReviewPayload,
   diffFilesFromChurn,
+  filesFromPatch,
+  GitObjectReader,
   githubRepoSlugFromRemoteUrl,
   readGitObject,
   isPathWithinApprovedRoots,
@@ -25,8 +30,10 @@ import {
   parsePullRequestInboxResponse,
   parsePorcelainV2Status,
   parsePullRequestConversation,
+  PullRequestReviewCache,
   pullRequestFilePageWave,
   pullRequestTargetsRemotes,
+  replaceStatusEntry,
   RepositoryService,
   resolvePackagedExecutablePath,
   sectionPullRequestInbox,
@@ -93,13 +100,47 @@ describe('resolvePackagedExecutablePath', () => {
 
 const executeFile = promisify(execFile)
 
+// Without this every git test reads the developer's global configuration, so a
+// machine with commit signing, a hooks path, a global excludes file or an unusual
+// init.defaultBranch produces different results from CI for reasons unrelated to
+// the change under test.
+function gitEnvironment(repositoryPath: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    HOME: repositoryPath
+  }
+}
+
 async function runGit(repositoryPath: string, ...args: string[]): Promise<void> {
-  await executeFile('git', ['-C', repositoryPath, ...args])
+  await executeFile('git', ['-C', repositoryPath, ...args], { env: gitEnvironment(repositoryPath) })
+}
+
+async function initRepository(repositoryPath: string): Promise<void> {
+  await runGit(repositoryPath, '-c', 'init.defaultBranch=main', 'init', '--quiet')
+}
+
+async function commitAll(repositoryPath: string, message: string): Promise<void> {
+  await runGit(repositoryPath, 'add', '--all')
+  await commitIndex(repositoryPath, message)
+}
+
+async function commitIndex(repositoryPath: string, message: string): Promise<void> {
+  await runGit(
+    repositoryPath,
+    '-c', 'user.name=Better Code Diff Test',
+    '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false',
+    'commit', '--quiet', '-m', message
+  )
 }
 
 async function runGitAllowingDifferences(repositoryPath: string, ...args: string[]): Promise<string> {
   try {
-    return (await executeFile('git', ['-C', repositoryPath, ...args])).stdout
+    return (await executeFile('git', ['-C', repositoryPath, ...args], { env: gitEnvironment(repositoryPath) })).stdout
   } catch (error) {
     return (error as { stdout?: string }).stdout ?? ''
   }
@@ -207,11 +248,15 @@ describe('mergeVisiblePaths', () => {
     ])
   })
 
-  it('drops excluded paths from both sides', () => {
-    const tracked = Buffer.from('src/a.ts\0node_modules/pkg/index.js\0')
+  it('drops excluded untracked paths but keeps tracked build output', () => {
+    const tracked = Buffer.from('src/a.ts\0dist/app.js\0')
     expect(mergeVisiblePaths(tracked, ['node_modules/other/x.js', 'keep.txt'])).toEqual([
-      'keep.txt', 'src/a.ts'
+      'dist/app.js', 'keep.txt', 'src/a.ts'
     ])
+  })
+
+  it('keeps a file whose own name matches an excluded directory', () => {
+    expect(mergeVisiblePaths(Buffer.alloc(0), ['dist', 'src/out'])).toEqual(['dist', 'src/out'])
   })
 })
 
@@ -270,6 +315,12 @@ describe('normalizePullRequestSelector', () => {
 
   it('normalizes hash-prefixed PR numbers', () => {
     expect(normalizePullRequestSelector(' #123 ')).toBe('123')
+  })
+
+  it('canonicalizes a copied GitHub URL before passing it to gh', () => {
+    expect(normalizePullRequestSelector(
+      'https://github.com/pierrecomputer/pierre/pull/123/files?notification_referrer_id=abc#discussion_r1'
+    )).toBe('https://github.com/pierrecomputer/pierre/pull/123')
   })
 
   it('rejects invalid numeric selectors', () => {
@@ -476,13 +527,37 @@ describe('buildPullRequestPatchFromFiles', () => {
     ])
   })
 
-  it('skips the directories the rest of the app hides', () => {
+  it('keeps every file GitHub listed so files and patch agree', () => {
     const built = buildPullRequestPatchFromFiles([
-      { filename: 'node_modules/left-pad/index.js', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-a\n+b\n' },
+      { filename: 'dist/app.js', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-a\n+b\n' },
       { filename: 'src/app.ts', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-a\n+b\n' }
     ])
-    expect(built.files.map((file) => file.path)).toEqual(['src/app.ts'])
-    expect(built.patch).not.toContain('left-pad')
+    expect(built.files.map((file) => file.path)).toEqual(['dist/app.js', 'src/app.ts'])
+    expect(built.patch).toContain('dist/app.js')
+  })
+})
+
+describe('filesFromPatch', () => {
+  it('recovers every file GitHub truncated out of its own list', () => {
+    const patch = [
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n',
+      'diff --git a/old/name.ts b/new/name.ts\nrename from old/name.ts\nrename to new/name.ts\n--- a/old/name.ts\n+++ b/new/name.ts\n@@ -1 +1 @@\n-a\n+b\n',
+      'diff --git a/gone.ts b/gone.ts\ndeleted file mode 100644\n--- a/gone.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-only\n'
+    ].join('')
+    expect(filesFromPatch(patch)).toEqual([
+      { path: 'src/a.ts', additions: 1, deletions: 1 },
+      { path: 'new/name.ts', additions: 1, deletions: 1 },
+      { path: 'gone.ts', additions: 0, deletions: 1 }
+    ])
+  })
+
+  it('unescapes a quoted path and reports a binary section as no churn', () => {
+    const patch = 'diff --git "a/dir/a b.ts" "b/dir/a b.ts"\nBinary files a/dir/a b.ts and b/dir/a b.ts differ\n'
+    expect(filesFromPatch(patch)).toEqual([{ path: 'dir/a b.ts', additions: 0, deletions: 0 }])
+  })
+
+  it('returns nothing for an empty patch', () => {
+    expect(filesFromPatch('')).toEqual([])
   })
 })
 
@@ -694,6 +769,196 @@ describe('summarizeCheckRollup', () => {
   })
 })
 
+describe('chunkPathspecs', () => {
+  it('keeps a small list in one chunk and preserves order across chunks', () => {
+    expect(chunkPathspecs(['a', 'b', 'c'])).toEqual([['a', 'b', 'c']])
+    expect(chunkPathspecs(['aaa', 'bbb', 'ccc'], 8)).toEqual([['aaa', 'bbb'], ['ccc']])
+  })
+
+  it('never drops a path that is longer than the budget on its own', () => {
+    expect(chunkPathspecs(['short', 'a-very-long-path'], 8)).toEqual([['short'], ['a-very-long-path']])
+  })
+
+  it('stays under the argv budget that E2BIG was measured at', () => {
+    const paths = Array.from({ length: 20_000 }, (_unused, index) => `src/generated/module-${index}/index.ts`)
+    const chunks = chunkPathspecs(paths)
+    expect(chunks.flat()).toEqual(paths)
+    for (const chunk of chunks) {
+      expect(chunk.reduce((total, path) => total + path.length + 1, 0)).toBeLessThanOrEqual(128 * 1024)
+    }
+  })
+})
+
+describe('replaceStatusEntry', () => {
+  const tracked = (path: string): { path: string; status: 'modified' } => ({ path, status: 'modified' })
+  const untracked = (path: string): { path: string; status: 'untracked' } => ({ path, status: 'untracked' })
+
+  it('inserts a tracked entry in path order ahead of the untracked section', () => {
+    const statuses = [tracked('a.ts'), tracked('c.ts'), untracked('new.ts')]
+    expect(replaceStatusEntry(statuses, 'b.ts', tracked('b.ts'))).toEqual([
+      tracked('a.ts'), tracked('b.ts'), tracked('c.ts'), untracked('new.ts')
+    ])
+  })
+
+  it('replaces an existing entry in place and removes it when the file goes clean', () => {
+    const statuses = [tracked('a.ts'), tracked('b.ts')]
+    expect(replaceStatusEntry(statuses, 'a.ts', { path: 'a.ts', status: 'added' })).toEqual([
+      { path: 'a.ts', status: 'added' }, tracked('b.ts')
+    ])
+    expect(replaceStatusEntry(statuses, 'a.ts', null)).toEqual([tracked('b.ts')])
+  })
+
+  it('keeps untracked entries after the tracked ones', () => {
+    const statuses = [tracked('a.ts'), untracked('z.ts')]
+    expect(replaceStatusEntry(statuses, 'b.ts', untracked('b.ts'))).toEqual([
+      tracked('a.ts'), untracked('b.ts'), untracked('z.ts')
+    ])
+  })
+})
+
+describe('GitObjectReader', () => {
+  it('serves many reads from a single git process and reports blob type', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-reader-'))
+    try {
+      await initRepository(repositoryPath)
+      for (let index = 0; index < 40; index += 1) {
+        await writeFile(join(repositoryPath, `file-${index}.txt`), `value ${index}\n`, 'utf8')
+      }
+      await commitAll(repositoryPath, 'Initial commit')
+
+      const reader = new GitObjectReader(repositoryPath)
+      try {
+        const reads = await Promise.all(
+          Array.from({ length: 40 }, (_unused, index) => reader.read(`HEAD:file-${index}.txt`))
+        )
+        for (const [index, read] of reads.entries()) {
+          expect(read.missing).toBe(false)
+          expect(read.type).toBe('blob')
+          expect(read.oid).toMatch(/^[0-9a-f]{40}$/)
+          expect(read.contents?.toString('utf8')).toBe(`value ${index}\n`)
+        }
+        expect(reader.spawnCountForTests).toBe(1)
+      } finally {
+        reader.dispose()
+      }
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the stream aligned when an oversized object is skipped', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-reader-big-'))
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'small.txt'), 'small\n', 'utf8')
+      await writeFile(join(repositoryPath, 'big.bin'), Buffer.alloc(3 * 1024 * 1024, 0x61))
+      await commitAll(repositoryPath, 'Initial commit')
+
+      const reader = new GitObjectReader(repositoryPath)
+      try {
+        const [big, small, absent] = await Promise.all([
+          reader.read('HEAD:big.bin'),
+          reader.read('HEAD:small.txt'),
+          reader.read('HEAD:absent.txt')
+        ])
+        expect(big?.oversized).toBe(true)
+        expect(big?.contents).toBeNull()
+        // The record after an oversized one must still be the file that was asked for.
+        expect(small?.contents?.toString('utf8')).toBe('small\n')
+        expect(absent?.missing).toBe(true)
+        expect(reader.spawnCountForTests).toBe(1)
+      } finally {
+        reader.dispose()
+      }
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('PullRequestReviewCache', () => {
+  const review = (overrides: Record<string, unknown> = {}): PullRequestReview => ({
+    kind: 'github',
+    selector: '7',
+    commitId: 'oid-1',
+    viewerCanSubmitDecision: true,
+    pullRequest: {
+      number: 7,
+      title: 'Add a thing',
+      url: 'https://github.com/acme/app/pull/7',
+      state: 'open',
+      isDraft: false,
+      author: { login: 'author' },
+      headRefName: 'feature',
+      baseRefName: 'main',
+      reviewDecision: null,
+      updatedAt: '2026-08-17T00:00:00Z',
+      additions: 1,
+      deletions: 0,
+      changedFiles: 1
+    },
+    files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }],
+    patch: 'diff --git a/src/a.ts b/src/a.ts\n',
+    omittedFiles: [],
+    expectedFileCount: 1,
+    ...overrides
+  })
+
+  it('round-trips a review and misses on a different head oid', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'better-code-diff-pr-cache-'))
+    try {
+      const cache = new PullRequestReviewCache(join(directory, 'pr-cache'))
+      const url = 'https://github.com/acme/app/pull/7'
+      await cache.write(url, 'oid-1', review())
+
+      const hit = await cache.read(url, 'oid-1')
+      expect(hit?.patch).toBe('diff --git a/src/a.ts b/src/a.ts\n')
+      expect(hit?.files).toEqual([{ path: 'src/a.ts', additions: 1, deletions: 0 }])
+      // A force-push moves the head oid, which is the key, so the old entry can
+      // never be served for the new diff.
+      expect(await cache.read(url, 'oid-2')).toBeNull()
+      expect(await cache.read('https://github.com/acme/other/pull/7', 'oid-1')).toBeNull()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a corrupt entry as a miss and never writes an empty review', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'better-code-diff-pr-cache-bad-'))
+    try {
+      const cacheDirectory = join(directory, 'pr-cache')
+      const cache = new PullRequestReviewCache(cacheDirectory)
+      const url = 'https://github.com/acme/app/pull/7'
+      await cache.write(url, 'oid-1', review())
+      const [entryName] = (await readdir(cacheDirectory)).filter((name) => name.endsWith('.json'))
+      await writeFile(join(cacheDirectory, entryName ?? ''), '{ not json', 'utf8')
+      expect(await cache.read(url, 'oid-1')).toBeNull()
+
+      await cache.write(url, 'oid-3', review({ files: [] }))
+      expect(await cache.read(url, 'oid-3')).toBeNull()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('sweeps the oldest entries past the entry cap', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'better-code-diff-pr-cache-sweep-'))
+    try {
+      const cacheDirectory = join(directory, 'pr-cache')
+      const cache = new PullRequestReviewCache(cacheDirectory)
+      for (let index = 0; index < 24; index += 1) {
+        await cache.write(`https://github.com/acme/app/pull/${index}`, `oid-${index}`, review())
+      }
+      expect((await readdir(cacheDirectory)).filter((name) => name.endsWith('.json')).length)
+        .toBeLessThanOrEqual(20)
+      // The most recent write always survives its own sweep.
+      expect(await cache.read('https://github.com/acme/app/pull/23', 'oid-23')).not.toBeNull()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('RepositoryService', () => {
   it('treats an empty content search as cancellation before a folder is open', async () => {
     const repository = new RepositoryService()
@@ -725,12 +990,14 @@ describe('RepositoryService', () => {
 
       const repository = new RepositoryService()
       const snapshot = await repository.open(repositoryPath)
+      const refreshed = await repository.refresh()
       const comparison = await repository.getComparison('tracked.txt')
       const workingTreePatch = await repository.getWorkingTreePatch(['tracked.txt', 'untracked.txt'])
       const searchResults = await repository.searchContent('searchable')
 
       expect(snapshot.kind).toBe('git')
       expect(snapshot.paths).toEqual(['tracked.txt', 'untracked.txt'])
+      expect(refreshed.paths).toBe(snapshot.paths)
       expect(snapshot.statuses).toEqual([
         { path: 'tracked.txt', status: 'modified' },
         { path: 'untracked.txt', status: 'untracked' }
@@ -747,6 +1014,163 @@ describe('RepositoryService', () => {
         'untracked.txt'
       ])
     } finally {
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('renders a submodule as absent instead of a deleted commit object', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-submodule-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'value\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      const head = (await runGitAllowingDifferences(repositoryPath, 'rev-parse', 'HEAD')).trim()
+      await runGit(repositoryPath, 'update-index', '--add', '--cacheinfo', `160000,${head},sub`)
+      await commitIndex(repositoryPath, 'Add gitlink')
+
+      const snapshot = await repository.open(repositoryPath)
+      expect(snapshot.paths).toContain('sub')
+      const comparison = await repository.getComparison('sub')
+      expect(comparison.oldFile).toBeNull()
+      expect(comparison.newFile).toBeNull()
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('opens an unchanged tracked file as a file preview', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-clean-preview-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'README.md'), 'clean repository\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+
+      const snapshot = await repository.open(repositoryPath)
+      const comparison = await repository.getComparison('README.md')
+
+      expect(snapshot.statuses).toEqual([])
+      expect(comparison.mode).toBe('file')
+      expect(comparison.status).toBe('unchanged')
+      expect(comparison.newFile?.contents).toBe('clean repository\n')
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps tracked build output visible and consistent between a commit review files and patch', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-tracked-dist-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'seed.txt'), 'seed\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await mkdir(join(repositoryPath, 'dist'))
+      await writeFile(join(repositoryPath, 'dist', 'app.js'), 'console.log(1)\n', 'utf8')
+      await commitAll(repositoryPath, 'Ship build output')
+      const head = (await runGitAllowingDifferences(repositoryPath, 'rev-parse', 'HEAD')).trim()
+
+      const snapshot = await repository.open(repositoryPath)
+      expect(snapshot.paths).toContain('dist/app.js')
+      const review = await repository.getCommitReview(head)
+      expect(review.files.map((file) => file.path)).toEqual(['dist/app.js'])
+      expect(review.patch).toContain('dist/app.js')
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a cache key stable across an unrelated commit and a byte-identical rewrite', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-cachekey-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'stable.ts'), 'export const value = 1\n', 'utf8')
+      await writeFile(join(repositoryPath, 'other.ts'), 'export const other = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+
+      await repository.open(repositoryPath)
+      const before = await repository.getComparison('stable.ts')
+
+      await writeFile(join(repositoryPath, 'other.ts'), 'export const other = 2\n', 'utf8')
+      await commitAll(repositoryPath, 'Touch an unrelated file')
+      await repository.refresh()
+      const afterCommit = await repository.getComparison('stable.ts')
+      expect(afterCommit.oldFile?.cacheKey).toBe(before.oldFile?.cacheKey ?? '')
+
+      // A formatter that rewrites identical bytes must not invalidate a draft.
+      await writeFile(join(repositoryPath, 'stable.ts'), 'export const value = 1\n', 'utf8')
+      await repository.refresh()
+      const afterTouch = await repository.getComparison('stable.ts')
+      expect(afterTouch.newFile?.cacheKey).toBe(before.newFile?.cacheKey ?? '')
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('saves an already-modified file without rebuilding the whole snapshot', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-save-refresh-'))
+    const repository = new RepositoryService()
+    const selfWrites: string[] = []
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 2\n', 'utf8')
+
+      await repository.open(repositoryPath)
+      repository.setSelfWriteObserver((path) => selfWrites.push(path))
+      const before = repository.getSessionSnapshot()
+      const comparison = await repository.getComparison('value.ts')
+
+      const saved = await repository.saveWorkingFile({
+        path: 'value.ts',
+        contents: 'export const value = 3\n',
+        expectedCacheKey: comparison.newFile?.cacheKey ?? ''
+      })
+
+      expect(saved.newFile?.contents).toBe('export const value = 3\n')
+      expect(selfWrites).toEqual(['value.ts'])
+      // The file was already modified, so the status did not move and no
+      // whole-tree refresh was needed: the snapshot is the very same object.
+      expect(repository.getSessionSnapshot()).toBe(before)
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('updates the status in place when a clean file becomes modified', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-save-status-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 1\n', 'utf8')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 2\n', 'utf8')
+
+      const snapshot = await repository.open(repositoryPath)
+      expect(snapshot.statuses).toEqual([{ path: 'b.ts', status: 'modified' }])
+      const comparison = await repository.getComparison('a.ts')
+      await repository.saveWorkingFile({
+        path: 'a.ts',
+        contents: 'export const a = 2\n',
+        expectedCacheKey: comparison.newFile?.cacheKey ?? ''
+      })
+
+      expect(repository.getSessionSnapshot()?.statuses).toEqual([
+        { path: 'a.ts', status: 'modified' },
+        { path: 'b.ts', status: 'modified' }
+      ])
+      expect(repository.getSessionSnapshot()?.paths).toEqual(['a.ts', 'b.ts'])
+    } finally {
+      repository.dispose()
       await rm(repositoryPath, { recursive: true, force: true })
     }
   })
@@ -1220,7 +1644,7 @@ describe('parsePullRequestInboxResponse', () => {
   // GraphQL returns the enum spelling; the renderer contract is lowercase.
   it('lowercases the state so the contract matches the old search output', () => {
     const [entry] = parsePullRequestInboxResponse({ data: { assigned: { nodes: [node(7)] } } })
-    expect((entry?.pullRequest as { state?: unknown }).state).toBe('open')
+    expect((entry?.pullRequest as { state?: unknown } | undefined)?.state).toBe('open')
   })
 
   it('survives missing sections, non-array nodes, and non-object entries', () => {

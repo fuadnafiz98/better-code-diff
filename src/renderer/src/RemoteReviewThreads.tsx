@@ -75,7 +75,7 @@ export function RemoteReviewThreadCard({
           <textarea value={replyBody} rows={2} autoFocus
             aria-label={`Reply to ${author}`}
             placeholder="Reply on GitHub…" onChange={(event) => setReplyBody(event.target.value)} />
-          <div>
+          <div className="review-card-actions">
             <button type="button" onClick={() => { setComposing(false); setReplyBody('') }}>Cancel</button>
             <button className="primary" type="button" disabled={replyBody.trim() === '' || pending}
               onClick={() => {

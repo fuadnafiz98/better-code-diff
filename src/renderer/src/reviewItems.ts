@@ -47,6 +47,16 @@ export function mergeReviewItems<Metadata>(
   return [...itemsById.values()]
 }
 
+// A path set that changed keeps whatever it still contains: the viewer reconciles
+// the difference, where clearing the list first would have unmounted it.
+export function retainReviewItems<Metadata>(
+  items: readonly CodeViewItem<Metadata>[],
+  paths: readonly string[]
+): CodeViewItem<Metadata>[] {
+  const visiblePaths = new Set(paths)
+  return items.filter((item) => visiblePaths.has(pathFromReviewItemId(item.id)))
+}
+
 export function orderReviewItems<Metadata>(
   items: readonly CodeViewItem<Metadata>[],
   orderedPaths: readonly string[]

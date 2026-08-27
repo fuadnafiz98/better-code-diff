@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { RepositoryChangeEvent, RepositorySnapshot } from '../shared/contracts.js'
-import { collectChangedPaths, RepositoryWatcher } from './repositoryWatcher.js'
+import {
+  collectChangedPaths,
+  dropSelfWrites,
+  normalizeChangedPath,
+  RepositoryWatcher,
+  resolveLinkedGitDirectory
+} from './repositoryWatcher.js'
 
 function snapshot(overrides: Partial<RepositorySnapshot> = {}): RepositorySnapshot {
   return {
@@ -44,6 +50,72 @@ describe('collectChangedPaths', () => {
   })
 })
 
+describe('normalizeChangedPath', () => {
+  it('keeps the Git metadata that changes what the snapshot says', () => {
+    expect(normalizeChangedPath('.git/HEAD')).toBe('.git/HEAD')
+    expect(normalizeChangedPath('.git/index')).toBe('.git/index')
+    expect(normalizeChangedPath('.git/refs/heads/main')).toBe('.git/refs/heads/main')
+    expect(normalizeChangedPath('src/app.ts')).toBe('src/app.ts')
+    expect(normalizeChangedPath(null)).toBe('*')
+  })
+
+  it('drops lock files, save temporaries and generated directories', () => {
+    expect(normalizeChangedPath('.git/index.lock')).toBeNull()
+    expect(normalizeChangedPath('.git/refs/heads/main.lock')).toBeNull()
+    expect(normalizeChangedPath('src/.horus-save-1234')).toBeNull()
+    expect(normalizeChangedPath('node_modules/pkg/index.js')).toBeNull()
+    expect(normalizeChangedPath('.git/COMMIT_EDITMSG')).toBeNull()
+  })
+})
+
+describe('dropSelfWrites', () => {
+  it('drops a path the app announced and leaves everything else alone', () => {
+    const pending = new Set(['src/saved.ts', 'src/other.ts'])
+    const selfWrites = new Map([['src/saved.ts', 2_000]])
+    dropSelfWrites(pending, selfWrites, 1_000)
+    expect([...pending]).toEqual(['src/other.ts'])
+    expect(selfWrites.has('src/saved.ts')).toBe(true)
+  })
+
+  it('forgets an expired hint so a later external write is still reported', () => {
+    const pending = new Set(['src/saved.ts'])
+    const selfWrites = new Map([['src/saved.ts', 2_000]])
+    dropSelfWrites(pending, selfWrites, 2_000)
+    expect([...pending]).toEqual(['src/saved.ts'])
+    expect(selfWrites.size).toBe(0)
+  })
+})
+
+describe('resolveLinkedGitDirectory', () => {
+  it('resolves the gitdir pointer of a linked worktree and ignores a normal repository', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'better-code-diff-worktree-'))
+    try {
+      await writeFile(join(root, '.git'), `gitdir: ${join(root, 'real', 'worktrees', 'wt')}\n`, 'utf8')
+      expect(resolveLinkedGitDirectory(root)).toBe(join(root, 'real', 'worktrees', 'wt'))
+
+      const plain = await mkdtemp(join(tmpdir(), 'better-code-diff-plain-'))
+      try {
+        await mkdir(join(plain, '.git'))
+        expect(resolveLinkedGitDirectory(plain)).toBeNull()
+      } finally {
+        await rm(plain, { recursive: true, force: true })
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves a relative gitdir pointer against the worktree root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'better-code-diff-worktree-rel-'))
+    try {
+      await writeFile(join(root, '.git'), 'gitdir: ../shared/.git/worktrees/wt\n', 'utf8')
+      expect(resolveLinkedGitDirectory(root)).toBe(join(root, '..', 'shared', '.git', 'worktrees', 'wt'))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
 // A recursive fs.watch is armed asynchronously on macOS (it is backed by an
 // FSEvents stream), so a write issued right after start() can land before the
 // stream is listening and is then never reported at all. Waiting longer cannot
@@ -74,10 +146,16 @@ async function rewriteUntil(file: string, satisfied: () => boolean): Promise<boo
 }
 
 // Publishes triggered by the arming writes may still be in flight, and one
-// landing later would corrupt whatever the test asserts next.
+// landing later would corrupt whatever the test asserts next. Two equal samples
+// are not enough on a loaded machine, where FSEvents can coalesce and deliver
+// late, so quiet also has to last a minimum stretch of wall clock.
+const QUIET_MINIMUM_MS = WATCH_SETTLE_MS * 4
+
 async function waitForQuiet(count: () => number): Promise<void> {
   let previous = -1
-  while (previous !== count()) {
+  let quietSince = Date.now()
+  while (previous !== count() || Date.now() - quietSince < QUIET_MINIMUM_MS) {
+    if (previous !== count()) quietSince = Date.now()
     previous = count()
     await sleep(WATCH_SETTLE_MS)
   }
@@ -107,6 +185,7 @@ describe('RepositoryWatcher', () => {
       expect(await rewriteUntil(file, () => targeted() != null)).toBe(true)
       expect(errors).toEqual([])
       expect(targeted()?.changedPaths).toEqual(['src/existing.ts'])
+      expect(targeted()?.snapshot.paths).toBeUndefined()
     } finally {
       watcher.stop()
       await rm(root, { recursive: true, force: true })
@@ -140,15 +219,31 @@ describe('RepositoryWatcher', () => {
       events.length = 0
       await writeFile(file, 'while suspended\n', 'utf8')
       await sleep(WATCH_SETTLE_MS * 2)
-      expect(events).toEqual([])
+      // A stray publish left over from arming must not read as "the suspended
+      // watcher fired", so the assertion is about the file under test only.
+      const targeted = (): RepositoryChangeEvent[] =>
+        events.filter((event) => event.changedPaths.includes('src/existing.ts'))
+      expect(targeted()).toEqual([])
 
       watcher.setSuspended(false)
-      expect(await waitFor(() => events.length > 0)).toBe(true)
-      expect(events[0]?.changedPaths).toEqual(['src/existing.ts'])
+      expect(await waitFor(() => targeted().length > 0)).toBe(true)
+      expect(targeted()[0]?.changedPaths).toEqual(['src/existing.ts'])
       expect(errors).toEqual([])
     } finally {
       watcher.stop()
       await rm(root, { recursive: true, force: true })
     }
   }, WATCH_TEST_TIMEOUT_MS)
+})
+
+describe('normalizeChangedPath lock files', () => {
+  it('drops git\'s own lock files', () => {
+    expect(normalizeChangedPath('.git/refs/heads/main.lock')).toBeNull()
+    expect(normalizeChangedPath('.git/index.lock')).toBeNull()
+  })
+
+  it('keeps a project lockfile, which is a real change', () => {
+    expect(normalizeChangedPath('bun.lock')).toBe('bun.lock')
+    expect(normalizeChangedPath('crates/app/Cargo.lock')).toBe('crates/app/Cargo.lock')
+  })
 })

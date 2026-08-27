@@ -10,7 +10,6 @@ import {
   IconDiffSplit,
   IconDiffUnified,
   IconFileCode,
-  IconFiles,
   IconEye,
   IconFolder,
   IconGear,
@@ -312,9 +311,13 @@ export function SearchResults({
   )
 }
 
-export function ErrorBanner({ message, onDismiss }: { message: string; onDismiss(): void }): React.JSX.Element {
+export function ErrorBanner({ message, onDismiss, closing }: {
+  message: string
+  onDismiss(): void
+  closing?: boolean
+}): React.JSX.Element {
   return (
-    <div className="error-banner" role="alert">
+    <div className="error-banner" role="alert" data-state={closing === true ? 'closing' : undefined}>
       <IconWarningOctogonFill />
       <span>{message}</span>
       <button type="button" onClick={onDismiss}><IconX /><span className="sr-only">Dismiss</span></button>
@@ -402,18 +405,23 @@ export function Welcome({
 
 export interface FileEditControls {
   available: boolean
+  /** Why the Edit button is disabled: binary, oversized, or a review is open. */
+  unavailableReason: string | null
   startLabel: 'Edit' | 'Resume draft'
   mode: 'read' | 'edit' | 'preview'
   dirty: boolean
   saving: boolean
   canUndo: boolean
   canRedo: boolean
+  unsavedPaths: readonly string[]
   onStart(): void
   onModeChange(mode: 'edit' | 'preview'): void
   onUndo(): void
   onRedo(): void
   onCancel(): void
+  onRevert(): void
   onSave(): void
+  onOpenPath(path: string): void
 }
 
 interface DiffToolbarProps {
@@ -431,7 +439,6 @@ interface DiffToolbarProps {
   fileEdit: FileEditControls
   onCloseExternalReview?(): void
   onDiffStyleChange(style: DiffStyle): void
-  onWorkspaceViewChange(view: WorkspaceView): void
   onWordWrapToggle(): void
   onFoldUnchangedToggle(): void
 }
@@ -446,6 +453,22 @@ function formatStatus(status: FileComparison['status']): string {
     case 'untracked': return 'Untracked'
     default: return 'No changes'
   }
+}
+
+function UnsavedDraftsPill({ fileEdit, currentPath }: {
+  fileEdit: FileEditControls
+  currentPath: string | null
+}): React.JSX.Element | null {
+  const others = fileEdit.unsavedPaths.filter((path) => path !== currentPath)
+  const first = others[0]
+  if (first == null) return null
+  return (
+    <button type="button" className="file-edit-state dirty"
+      title={`Unsaved drafts:\n${others.join('\n')}`}
+      onClick={() => fileEdit.onOpenPath(first)}>
+      {others.length} unsaved
+    </button>
+  )
 }
 
 export function DiffToolbar({
@@ -463,7 +486,6 @@ export function DiffToolbar({
   fileEdit,
   onCloseExternalReview,
   onDiffStyleChange,
-  onWorkspaceViewChange,
   onWordWrapToggle,
   onFoldUnchangedToggle
 }: DiffToolbarProps): React.JSX.Element {
@@ -472,6 +494,9 @@ export function DiffToolbar({
     : isFilePreview
       ? selectedPath?.split('/').at(-1)
       : selectedPath
+  const showDiffLayout = isGitRepository && (workspaceView === 'multi' || !isFilePreview)
+  const showEditStart = (fileEdit.available && fileEdit.mode === 'read')
+    || (!fileEdit.available && fileEdit.unavailableReason != null && workspaceView === 'file')
 
   return (
     <div className="diff-toolbar">
@@ -498,15 +523,12 @@ export function DiffToolbar({
         </span>
       </div>
       <div className="diff-controls">
-        {fileEdit.available ? fileEdit.mode === 'read' ? (
-          <button className="file-edit-start" type="button" onClick={fileEdit.onStart}>
-            <IconPencil /><span>{fileEdit.startLabel}</span>
-          </button>
-        ) : (
+        {fileEdit.available && fileEdit.mode !== 'read' ? (
           <div className="file-edit-actions" role="group" aria-label="File editing">
             <span className={`file-edit-state ${fileEdit.dirty ? 'dirty' : ''}`} role="status">
               {fileEdit.dirty ? 'Unsaved' : 'Saved'}
             </span>
+            <UnsavedDraftsPill fileEdit={fileEdit} currentPath={selectedPath} />
             <div className="editor-option-controls file-history-controls" role="group" aria-label="Edit history">
               <button type="button" aria-label="Undo" title="Undo" disabled={!fileEdit.canUndo || fileEdit.saving} onClick={fileEdit.onUndo}>
                 <IconClockArrow />
@@ -523,47 +545,67 @@ export function DiffToolbar({
                 <IconEye /><span>Preview</span>
               </button>
             </div>
-            <button className="file-edit-cancel" type="button" onClick={fileEdit.onCancel} disabled={fileEdit.saving}>
-              <IconX /><span>Cancel</span>
+            <button className="file-edit-cancel" type="button" onClick={fileEdit.onRevert}
+              disabled={!fileEdit.dirty || fileEdit.saving}
+              title="Discard this draft and go back to the file on disk (undoable with ⌘Z)">
+              <IconClockArrow /><span>Revert</span>
+            </button>
+            <button className="file-edit-cancel" type="button" onClick={fileEdit.onCancel} disabled={fileEdit.saving}
+              title="Leave edit mode. An unsaved draft is kept and can be resumed.">
+              <IconX /><span>Close</span>
             </button>
             <button className="file-edit-save" type="button" onClick={fileEdit.onSave}
               aria-keyshortcuts="Meta+S Control+S" title="Save file (⌘S)"
               disabled={!fileEdit.dirty || fileEdit.saving}>
-              {fileEdit.saving ? <IconRefresh className="spin" /> : <IconCheck />}
-              <span>{fileEdit.saving ? 'Saving' : 'Save'}</span>
+              <span className="icon-swap" data-state={fileEdit.saving ? 'alt' : 'base'}>
+                <IconCheck /><IconRefresh className="spin" />
+              </span>
+              <span className="file-edit-save-label">{fileEdit.saving ? 'Saving' : 'Save'}</span>
             </button>
           </div>
         ) : null}
-        <div className="editor-option-controls" role="group" aria-label="Editor display options">
-          <button type="button" aria-label="Toggle word wrap" aria-pressed={wordWrap} className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle} title="Toggle word wrap">
-            <IconTypeWord />
-          </button>
-          {isGitRepository && (workspaceView === 'multi' || !isFilePreview) ? (
-            <button type="button" aria-label="Toggle unchanged context folding" aria-pressed={foldUnchanged} className={foldUnchanged ? 'active' : undefined} onClick={onFoldUnchangedToggle} title="Toggle unchanged context folding">
-              <IconCollapsedRow />
+        <div className="diff-display-controls">
+          {!fileEdit.available && fileEdit.unavailableReason != null && workspaceView === 'file' ? (
+            <button className="file-edit-start" type="button" disabled
+              title={fileEdit.unavailableReason} aria-describedby="file-edit-unavailable">
+              <IconPencil /><span>Edit</span>
+              <span id="file-edit-unavailable" hidden>{fileEdit.unavailableReason}</span>
             </button>
           ) : null}
+          {fileEdit.available && fileEdit.mode === 'read' ? (
+            <button className="file-edit-start" type="button" onClick={fileEdit.onStart}>
+              <IconPencil /><span>{fileEdit.startLabel}</span>
+            </button>
+          ) : null}
+          {showEditStart ? <span className="diff-control-divider" aria-hidden="true" /> : null}
+          <div className="editor-option-controls" role="group" aria-label="Editor display options">
+            <button type="button" aria-label="Toggle word wrap" aria-pressed={wordWrap}
+              data-tooltip="Word wrap" className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle}>
+              <IconTypeWord />
+            </button>
+            {showDiffLayout ? (
+              <button type="button" aria-label="Toggle unchanged context folding" aria-pressed={foldUnchanged}
+                data-tooltip="Context folding" className={foldUnchanged ? 'active' : undefined} onClick={onFoldUnchangedToggle}>
+                <IconCollapsedRow />
+              </button>
+            ) : null}
+          </div>
+          {showDiffLayout ? (
+            <>
+              <span className="diff-control-divider" aria-hidden="true" />
+              <div className="segmented-control diff-layout-control" role="group" aria-label="Diff layout">
+                <button type="button" aria-label="Split diff" aria-pressed={diffStyle === 'split'}
+                  data-tooltip="Split view" className={diffStyle === 'split' ? 'active' : undefined} onClick={() => onDiffStyleChange('split')}>
+                  <IconDiffSplit />
+                </button>
+                <button type="button" aria-label="Unified diff" aria-pressed={diffStyle === 'unified'}
+                  data-tooltip="Unified view" className={diffStyle === 'unified' ? 'active' : undefined} onClick={() => onDiffStyleChange('unified')}>
+                  <IconDiffUnified />
+                </button>
+              </div>
+            </>
+          ) : null}
         </div>
-        {onCloseExternalReview == null ? (
-          <div className="segmented-control workspace-view-control" role="group" aria-label="Review view">
-            <button type="button" aria-pressed={workspaceView === 'file'} className={workspaceView === 'file' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('file')}>
-              <IconFileCode />File
-            </button>
-            <button type="button" aria-pressed={workspaceView === 'multi'} className={workspaceView === 'multi' ? 'active' : undefined} onClick={() => onWorkspaceViewChange('multi')}>
-              <IconFiles />Multi-file
-            </button>
-          </div>
-        ) : null}
-        {isGitRepository && (workspaceView === 'multi' || !isFilePreview) ? (
-          <div className="segmented-control" role="group" aria-label="Diff layout">
-            <button type="button" aria-pressed={diffStyle === 'split'} className={diffStyle === 'split' ? 'active' : undefined} onClick={() => onDiffStyleChange('split')}>
-              <IconDiffSplit />Split
-            </button>
-            <button type="button" aria-pressed={diffStyle === 'unified'} className={diffStyle === 'unified' ? 'active' : undefined} onClick={() => onDiffStyleChange('unified')}>
-              <IconDiffUnified />Unified
-            </button>
-          </div>
-        ) : null}
       </div>
     </div>
   )

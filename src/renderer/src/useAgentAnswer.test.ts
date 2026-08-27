@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { mergeActivity } from './useAgentAnswer'
+import { EMPTY_ANSWER, mergeActivity, reduceAgentEvents } from './useAgentAnswer'
 
 describe('mergeActivity', () => {
   it('keeps one item while its lifecycle and output stream update', () => {
@@ -78,5 +78,49 @@ describe('mergeActivity', () => {
     expect(result[0]).toMatchObject({
       kind: 'file', title: 'Read file', detail: 'src/App.tsx', status: 'completed'
     })
+  })
+})
+
+describe('reduceAgentEvents', () => {
+  it('folds a batch exactly like the events folded one at a time', () => {
+    const events = [
+      { id: 'r', kind: 'text' as const, text: 'Hello ' },
+      { id: 'r', kind: 'activity' as const, activity: { id: 'a1', kind: 'file' as const, title: 'Read file', status: 'running' as const } },
+      { id: 'r', kind: 'text' as const, text: 'world.' },
+      { id: 'r', kind: 'activity' as const, activity: { id: 'a1', kind: 'file' as const, title: 'Read file', status: 'completed' as const } }
+    ]
+    const batched = reduceAgentEvents(EMPTY_ANSWER, events)
+    const oneByOne = events.reduce((state, event) => reduceAgentEvents(state, [event]), EMPTY_ANSWER)
+
+    // Wall-clock fields (startedAt/completedAt/durationMs) come from Date.now() and
+    // legitimately differ between a single batched fold and four sequential ones.
+    const withoutClock = (items: typeof batched.activity): unknown[] =>
+      items.map(({ startedAt: _s, completedAt: _c, durationMs: _d, ...rest }) => rest)
+
+    expect(batched.answer).toBe('Hello world.')
+    expect(batched.answer).toBe(oneByOne.answer)
+    expect(withoutClock(batched.activity)).toEqual(withoutClock(oneByOne.activity))
+    expect(batched.activity).toHaveLength(1)
+    expect(batched.activity[0]?.status).toBe('completed')
+  })
+
+  it('keeps the settled markdown identity across a batch so blocks can bail out', () => {
+    const first = reduceAgentEvents(EMPTY_ANSWER, [{ id: 'r', kind: 'text', text: 'Settled.\n\ntail' }])
+    const second = reduceAgentEvents(first, [{ id: 'r', kind: 'text', text: ' grows' }])
+
+    expect(second.parsed.settled[0]).toBe(first.parsed.settled[0]!)
+    expect(second.answer).toBe('Settled.\n\ntail grows')
+  })
+
+  it('ends the turn on the last event of the batch', () => {
+    const streaming = { ...EMPTY_ANSWER, streaming: true }
+    const failed = reduceAgentEvents(streaming, [
+      { id: 'r', kind: 'text', text: 'partial' },
+      { id: 'r', kind: 'error', text: 'Claude stopped responding.' }
+    ])
+
+    expect(failed.streaming).toBe(false)
+    expect(failed.error).toBe('Claude stopped responding.')
+    expect(failed.answer).toBe('partial')
   })
 })

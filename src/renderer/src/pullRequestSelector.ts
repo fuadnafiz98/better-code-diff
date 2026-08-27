@@ -1,8 +1,9 @@
+import { normalizeGitHubPullRequestUrl } from '../../shared/pullRequestUrl'
+
 export function parsePullRequestSelector(value: string): number | string | null {
   const trimmedValue = value.trim()
   const directMatch = /^#?(\d+)$/.exec(trimmedValue)
-  const urlMatch = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)(?:\/.*)?$/i.exec(trimmedValue)
-  if (directMatch == null && urlMatch != null) return trimmedValue
+  if (directMatch == null) return normalizeGitHubPullRequestUrl(trimmedValue)
   const rawNumber = directMatch?.[1]
   if (rawNumber == null) return null
   const number = Number(rawNumber)

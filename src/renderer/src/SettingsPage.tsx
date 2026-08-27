@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { flushSync } from 'react-dom'
 import { IconBraces, IconFileCode, IconGear, IconReload, IconX } from '@pierre/icons'
 
@@ -24,6 +24,7 @@ import {
   keybindingFromEvent,
   type AppCommand
 } from './keybindings'
+import { EDITOR_SHORTCUTS, findEditorKeymapConflicts } from './editor/editorKeymap'
 
 interface SettingsPageProps {
   preferences: AppPreferences
@@ -33,8 +34,33 @@ interface SettingsPageProps {
 
 type SettingsSection = 'appearance' | 'editor' | 'keyboard'
 
+const SETTINGS_EXIT_MS = 140
+
 export function SettingsPage({ preferences, onChange, onClose }: SettingsPageProps): React.JSX.Element {
   const [activeSection, setActiveSection] = useState<SettingsSection>('appearance')
+  const [closing, setClosing] = useState(false)
+  const dialogRef = useRef<HTMLDialogElement>(null)
+  const closeTimerRef = useRef(0)
+
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current
+    // showModal contains focus and dims the titlebar behind the scrim, which is
+    // what the overlay already looked like it was doing.
+    if (dialog != null && !dialog.open) dialog.showModal()
+    return () => {
+      window.clearTimeout(closeTimerRef.current)
+      if (dialog?.open) dialog.close()
+    }
+  }, [])
+
+  // The parent unmounts this surface, so the exit has to finish before it is told
+  // the overlay is closed.
+  const requestClose = useCallback(() => {
+    if (closeTimerRef.current !== 0) return
+    setClosing(true)
+    closeTimerRef.current = window.setTimeout(onClose, SETTINGS_EXIT_MS)
+  }, [onClose])
+
   const update = <Key extends keyof AppPreferences>(key: Key, value: AppPreferences[Key]): void => {
     const nextPreferences = { ...preferences, [key]: value }
     if (key !== 'editorTheme') {
@@ -58,9 +84,28 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
     () => findKeybindingConflicts(preferences.keybindings),
     [preferences.keybindings]
   )
+  // An app shortcut rebound onto ⌘F/⌘D/⌘⌥F/⌘Z/⌘/ only works outside the editor,
+  // because while the caret is in the editor its own command wins.
+  const editorConflicts = useMemo(() => {
+    const labels = new Map<AppCommand, string>()
+    for (const { command, shortcut, editorCommand } of findEditorKeymapConflicts(preferences.keybindings)) {
+      const hint = EDITOR_SHORTCUTS.find((entry) => entry.shortcut === shortcut)
+      labels.set(command, hint?.label ?? editorCommand)
+    }
+    return labels
+  }, [preferences.keybindings])
 
   return (
-    <section className="settings-page" aria-label="Settings">
+    <dialog
+      ref={dialogRef}
+      className="settings-page"
+      aria-label="Settings"
+      data-state={closing ? 'closing' : undefined}
+      onCancel={(event) => {
+        event.preventDefault()
+        requestClose()
+      }}
+    >
       <aside className="settings-sidebar">
         <header><IconGear /><strong>Settings</strong></header>
         <nav aria-label="Settings sections">
@@ -81,10 +126,10 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
                 ? 'Configure code rendering and comparison behavior.'
                 : 'Customize shortcuts for frequent actions.'}</p>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close settings" title="Close Settings"><IconX /></button>
+          <button className="icon-button" type="button" onClick={requestClose} aria-label="Close settings" title="Close Settings"><IconX /></button>
         </header>
 
-        <div className="settings-scroll">
+        <div className="settings-scroll" key={activeSection}>
           {activeSection === 'appearance' ? (
             <div className="settings-section">
               <section className="settings-block">
@@ -102,12 +147,15 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
               </section>
               <section className="settings-block settings-list-block">
                 <div className="settings-block-heading"><h2>Interface</h2></div>
-                <SettingRow label="Interface font" description="Used by the title bar, explorer, settings, and controls.">
+                <SettingRow controlId="interface-font" label="Interface font" description="Used by the title bar, explorer, settings, and controls.">
                   <SelectControl>
-                    <select name="interface-font" aria-label="Interface font" value={preferences.interfaceFont} onChange={(event) => update('interfaceFont', event.target.value as InterfaceFont)}>
+                    <select id="interface-font" name="interface-font" value={preferences.interfaceFont} onChange={(event) => update('interfaceFont', event.target.value as InterfaceFont)}>
                       {Object.entries(INTERFACE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
                     </select>
                   </SelectControl>
+                </SettingRow>
+                <SettingRow controlId="restore-last-folder" label="Reopen the last folder on launch" description="Only if it still exists; otherwise Horus starts on the welcome screen.">
+                  <Toggle id="restore-last-folder" checked={preferences.restoreLastFolder} label="Reopen the last folder on launch" onChange={(checked) => update('restoreLastFolder', checked)} />
                 </SettingRow>
               </section>
             </div>
@@ -121,19 +169,19 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
               </section>
               <section className="settings-block settings-list-block">
                 <div className="settings-block-heading"><h2>Typography</h2></div>
-                <SettingRow label="Code font" description="Fira Code is bundled with the app and does not depend on a system installation.">
+                <SettingRow controlId="code-font" label="Code font" description="Fira Code is bundled with the app and does not depend on a system installation.">
                   <SelectControl>
-                    <select name="code-font" aria-label="Code font" value={preferences.codeFont} onChange={(event) => update('codeFont', event.target.value as CodeFont)}>
+                    <select id="code-font" name="code-font" value={preferences.codeFont} onChange={(event) => update('codeFont', event.target.value as CodeFont)}>
                       {Object.entries(CODE_FONTS).map(([value, font]) => <option key={value} value={value}>{font.label}</option>)}
                     </select>
                   </SelectControl>
                 </SettingRow>
-                <SettingRow label="Font size" description={`${preferences.codeFontSize} pixels`}>
+                <SettingRow controlId="code-font-size" label="Font size" description={`${preferences.codeFontSize} pixels`}>
                   <RangeControl name="code-font-size" label="Code font size" min={10} max={20}
                     value={preferences.codeFontSize} onChange={(value) => update('codeFontSize', value)} />
                   <output>{preferences.codeFontSize}</output>
                 </SettingRow>
-                <SettingRow label="Line height" description={`${preferences.codeLineHeight} pixels`}>
+                <SettingRow controlId="code-line-height" label="Line height" description={`${preferences.codeLineHeight} pixels`}>
                   <RangeControl name="code-line-height" label="Code line height" min={16} max={32}
                     value={preferences.codeLineHeight} onChange={(value) => update('codeLineHeight', value)} />
                   <output>{preferences.codeLineHeight}</output>
@@ -141,9 +189,15 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
               </section>
               <section className="settings-block settings-list-block">
                 <div className="settings-block-heading"><h2>Comparison</h2></div>
-                <SettingRow label="Line numbers" description="Show line numbers in previews and comparisons."><Toggle checked={preferences.showLineNumbers} label="Show line numbers" onChange={(checked) => update('showLineNumbers', checked)} /></SettingRow>
-                <SettingRow label="Word wrap" description="Wrap long lines instead of using horizontal scrolling."><Toggle checked={preferences.wordWrap} label="Wrap long lines" onChange={(checked) => update('wordWrap', checked)} /></SettingRow>
-                <SettingRow label="Context folding" description="Collapse unchanged regions in Git comparisons."><Toggle checked={preferences.foldUnchanged} label="Fold unchanged regions" onChange={(checked) => update('foldUnchanged', checked)} /></SettingRow>
+                <SettingRow controlId="show-line-numbers" label="Line numbers" description="Show line numbers in previews and comparisons."><Toggle id="show-line-numbers" checked={preferences.showLineNumbers} label="Show line numbers" onChange={(checked) => update('showLineNumbers', checked)} /></SettingRow>
+                <SettingRow controlId="word-wrap" label="Word wrap" description="Wrap long lines instead of using horizontal scrolling."><Toggle id="word-wrap" checked={preferences.wordWrap} label="Wrap long lines" onChange={(checked) => update('wordWrap', checked)} /></SettingRow>
+                <SettingRow controlId="fold-unchanged" label="Context folding" description="Collapse unchanged regions in Git comparisons."><Toggle id="fold-unchanged" checked={preferences.foldUnchanged} label="Fold unchanged regions" onChange={(checked) => update('foldUnchanged', checked)} /></SettingRow>
+                <SettingRow controlId="autosave-on-blur" label="Save when focus leaves the editor" description="Optional. Disk conflicts still require your decision."><Toggle id="autosave-on-blur" checked={preferences.autosaveOnBlur} label="Save when focus leaves the editor" onChange={(checked) => update('autosaveOnBlur', checked)} /></SettingRow>
+                <SettingRow controlId="terminal-scrollback" label="Terminal scrollback" description={`${preferences.terminalScrollback.toLocaleString()} lines`}>
+                  <RangeControl name="terminal-scrollback" label="Terminal scrollback lines" min={1_000} max={50_000}
+                    step={1_000} value={preferences.terminalScrollback} onChange={(value) => update('terminalScrollback', value)} />
+                  <output>{preferences.terminalScrollback.toLocaleString()}</output>
+                </SettingRow>
               </section>
             </div>
           ) : null}
@@ -156,7 +210,9 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
                   {KEYBINDING_COMMANDS.map(({ command, label, description }) => (
                     <SettingRow key={command} label={label} description={description}>
                       <KeybindingRecorder command={command} keybinding={preferences.keybindings[command]}
-                        conflict={keybindingConflicts.has(command)} onChange={(keybinding) => update('keybindings', {
+                        conflict={keybindingConflicts.has(command)}
+                        editorConflict={editorConflicts.get(command)}
+                        onChange={(keybinding) => update('keybindings', {
                           ...preferences.keybindings, [command]: keybinding
                         })} />
                     </SettingRow>
@@ -167,7 +223,7 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
           ) : null}
         </div>
       </div>
-    </section>
+    </dialog>
   )
 }
 
@@ -185,10 +241,20 @@ function ThemeCard({ theme, selected, onSelect }: { theme: EditorTheme; selected
   )
 }
 
-function SettingRow({ label, description, children }: { label: string; description: string; children: React.ReactNode }): React.JSX.Element {
+// A row whose control is labelable gets a real <label for>, so the whole 68px
+// row activates it the way a macOS System Settings row does. Rows whose control
+// is a button pair (the keybinding recorder) keep the inert span.
+function SettingRow({ controlId, label, description, children }: {
+  controlId?: string
+  label: string
+  description: string
+  children: React.ReactNode
+}): React.JSX.Element {
   return (
     <div className="setting-row">
-      <span><strong>{label}</strong><small>{description}</small></span>
+      {controlId == null
+        ? <span><strong>{label}</strong><small>{description}</small></span>
+        : <label htmlFor={controlId}><strong>{label}</strong><small>{description}</small></label>}
       <span className="setting-control">{children}</span>
     </div>
   )
@@ -198,11 +264,13 @@ function KeybindingRecorder({
   command,
   keybinding,
   conflict,
+  editorConflict,
   onChange
 }: {
   command: AppCommand
   keybinding: string
   conflict: boolean
+  editorConflict?: string
   onChange(keybinding: string): void
 }): React.JSX.Element {
   const [recording, setRecording] = useState(false)
@@ -210,6 +278,11 @@ function KeybindingRecorder({
   return (
     <div className="keybinding-recorder">
       {conflict ? <span className="keybinding-conflict" role="status">Conflict</span> : null}
+      {!conflict && editorConflict != null ? (
+        <span className="keybinding-conflict" role="status" title={`The editor uses this for ${editorConflict}.`}>
+          Editor: {editorConflict}
+        </span>
+      ) : null}
       <button
         type="button"
         className={recording ? 'recording' : undefined}
@@ -247,23 +320,25 @@ function KeybindingRecorder({
 // Clearing the native appearance is what lets the thumb be a squircle, and it
 // also removes the platform fill, so the filled portion is handed to CSS as a
 // percentage instead.
-function RangeControl({ name, label, min, max, value, onChange }: {
+function RangeControl({ name, label, min, max, step, value, onChange }: {
   name: string
   label: string
   min: number
   max: number
+  step?: number
   value: number
   onChange(value: number): void
 }): React.JSX.Element {
   return (
     <input
       className="range-control"
+      id={name}
       name={name}
       aria-label={label}
       type="range"
       min={min}
       max={max}
-      step={1}
+      step={step ?? 1}
       value={value}
       style={{ '--range-progress': `${((value - min) / (max - min)) * 100}%` } as CSSProperties}
       onChange={(event) => onChange(Number(event.target.value))}
@@ -271,11 +346,12 @@ function RangeControl({ name, label, min, max, value, onChange }: {
   )
 }
 
-function Toggle({ checked, label, onChange }: { checked: boolean; label: string; onChange(checked: boolean): void }): React.JSX.Element {
+function Toggle({ id, checked, label, onChange }: { id: string; checked: boolean; label: string; onChange(checked: boolean): void }): React.JSX.Element {
   return (
     <input
       className="settings-toggle"
-      name={label.toLowerCase().replaceAll(' ', '-')}
+      id={id}
+      name={id}
       type="checkbox"
       checked={checked}
       aria-label={label}

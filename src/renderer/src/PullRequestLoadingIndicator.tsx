@@ -1,8 +1,9 @@
 import { IconInReview, IconRefresh } from '@pierre/icons'
 
-export function PullRequestLoadingIndicator(): React.JSX.Element {
+export function PullRequestLoadingIndicator({ closing }: { closing?: boolean }): React.JSX.Element {
   return (
-    <div className="pr-loading-indicator" role="status" aria-live="polite">
+    <div className="pr-loading-indicator" role="status" aria-live="polite"
+      data-state={closing === true ? 'closing' : undefined}>
       <span className="pr-loading-icon">
         <IconInReview />
         <IconRefresh className="spin" />

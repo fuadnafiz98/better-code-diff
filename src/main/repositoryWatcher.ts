@@ -1,24 +1,71 @@
-import { watch, type FSWatcher } from 'node:fs'
+import { existsSync, readFileSync, watch, type FSWatcher } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 
 import type { RepositoryChangeEvent, RepositorySnapshot } from '../shared/contracts.js'
 
 const CHANGE_DEBOUNCE_MS = 80
+// A commit or a rebase writes `.git/index` and the refs it moves several times in
+// a row. Measured over five commits in a temp repo the watcher accepted 36 events;
+// giving metadata-only batches their own longer window collapses them into one
+// flush without delaying a content edit, which still uses the short debounce.
+const METADATA_DEBOUNCE_MS = 350
+// An abandoned `.git/index.lock` must not freeze refreshes forever.
+const MAX_OPERATION_DEFERRAL_MS = 5_000
+// A save writes a sibling temp file and renames it over the target; without this
+// the temp file surfaces as an untracked path in whatever snapshot lands between
+// the write and the rename.
+const SELF_WRITE_PREFIX = '.horus-save-'
+const SELF_WRITE_WINDOW_MS = 1_000
+const OPERATION_MARKERS = ['index.lock', 'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD'] as const
 const EXCLUDED_SEGMENTS = new Set([
   '.cache', '.next', '.nuxt', '.output', '.parcel-cache', '.svelte-kit', '.turbo',
   '.vercel', '.vite', 'DerivedData', 'build', 'coverage', 'dist', 'node_modules',
   'out', 'target'
 ])
 
-function normalizeChangedPath(filename: string | Buffer | null): string | null {
+export function normalizeChangedPath(filename: string | Buffer | null): string | null {
   if (filename == null) return '*'
   const path = filename.toString().replaceAll('\\', '/').replace(/^\.\//, '')
   if (path === '') return null
   const segments = path.split('/')
+  // Lock files inside .git are git's own scratch space: `.git/refs/heads/main.lock`
+  // accounted for every fifth accepted event during a commit loop and never
+  // carries state. A project's bun.lock / Cargo.lock is a real change.
+  if (segments[0] === '.git' && path.endsWith('.lock')) return null
   if (segments.some((segment) => EXCLUDED_SEGMENTS.has(segment))) return null
+  if (segments.at(-1)?.startsWith(SELF_WRITE_PREFIX) === true) return null
   if (segments[0] !== '.git') return path
   return path === '.git/HEAD' || path === '.git/index' || path.startsWith('.git/refs/')
     ? path
     : null
+}
+
+// A linked worktree's `.git` is a file pointing at the real git directory, so the
+// recursive watch on the worktree root never sees HEAD, the index or refs move.
+export function resolveLinkedGitDirectory(root: string): string | null {
+  try {
+    const pointer = readFileSync(resolve(root, '.git'), 'utf8')
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(pointer)
+    const target = match?.[1]
+    if (target == null || target === '') return null
+    return isAbsolute(target) ? target : resolve(root, target)
+  } catch {
+    return null
+  }
+}
+
+// The app's own saves are announced before the rename lands, so the event they
+// produce carries no news. The window expires so a genuine external write to the
+// same path moments later is still reported.
+export function dropSelfWrites(
+  pendingPaths: Set<string>,
+  selfWrites: Map<string, number>,
+  now: number
+): void {
+  for (const [path, expiry] of selfWrites) {
+    if (expiry <= now) selfWrites.delete(path)
+    else pendingPaths.delete(path)
+  }
 }
 
 function statusSignature(snapshot: RepositorySnapshot): Map<string, string> {
@@ -87,7 +134,12 @@ export function collectChangedPaths(
 
 export class RepositoryWatcher {
   #watcher: FSWatcher | null = null
+  #gitDirectoryWatcher: FSWatcher | null = null
+  #gitDirectory: string | null = null
+  #selfWrites = new Map<string, number>()
+  #deferredSince = 0
   #snapshot: RepositorySnapshot | null = null
+  #publishedPaths: string[] | null = null
   #pendingPaths = new Set<string>()
   #timer: ReturnType<typeof setTimeout> | null = null
   #refreshing = false
@@ -104,23 +156,48 @@ export class RepositoryWatcher {
   start(snapshot: RepositorySnapshot): void {
     this.stop()
     this.#snapshot = snapshot
+    this.#publishedPaths = snapshot.paths
     const generation = this.#generation
+    const accept = (path: string | null): void => {
+      if (generation !== this.#generation || path == null) return
+      this.#pendingPaths.add(path)
+      this.#schedule(generation)
+    }
     try {
       this.#watcher = watch(snapshot.root, { recursive: true }, (_eventType, filename) => {
-        if (generation !== this.#generation) return
-        const path = normalizeChangedPath(filename)
-        if (path == null) return
-        this.#pendingPaths.add(path)
-        this.#schedule(generation)
+        accept(normalizeChangedPath(filename))
       })
       this.#watcher.on('error', this.reportError)
     } catch (error) {
       this.reportError(error)
     }
+
+    this.#gitDirectory = resolveLinkedGitDirectory(snapshot.root)
+    const gitDirectory = this.#gitDirectory
+    if (gitDirectory == null) return
+    try {
+      this.#gitDirectoryWatcher = watch(gitDirectory, { recursive: true }, (_eventType, filename) => {
+        accept(normalizeChangedPath(filename == null ? null : `.git/${filename.toString()}`))
+      })
+      this.#gitDirectoryWatcher.on('error', this.reportError)
+    } catch (error) {
+      this.reportError(error)
+    }
+  }
+
+  // Called before the rename that completes a save: the app already knows what it
+  // wrote, so refreshing on its own write costs a whole-tree status walk for
+  // nothing. The window is short so a genuine external edit is never swallowed.
+  expectSelfWrite(path: string): void {
+    this.#selfWrites.set(path, Date.now() + SELF_WRITE_WINDOW_MS)
   }
 
   sync(snapshot: RepositorySnapshot): void {
-    if (this.#snapshot?.root === snapshot.root) this.#snapshot = snapshot
+    if (this.#snapshot?.root !== snapshot.root) return
+    this.#snapshot = snapshot
+    // sync follows a snapshot returned directly to the renderer by an IPC
+    // mutation, so both processes already share this logical path revision.
+    this.#publishedPaths = snapshot.paths
   }
 
   setSuspended(suspended: boolean): void {
@@ -138,19 +215,34 @@ export class RepositoryWatcher {
     this.#generation += 1
     this.#watcher?.close()
     this.#watcher = null
+    this.#gitDirectoryWatcher?.close()
+    this.#gitDirectoryWatcher = null
+    this.#gitDirectory = null
     this.#snapshot = null
+    this.#publishedPaths = null
     this.#pendingPaths.clear()
+    this.#selfWrites.clear()
+    this.#deferredSince = 0
     if (this.#timer != null) clearTimeout(this.#timer)
     this.#timer = null
   }
 
-  #schedule(generation: number): void {
+  #schedule(generation: number, delay?: number): void {
     if (this.#suspended) return
     if (this.#timer != null) clearTimeout(this.#timer)
+    const metadataOnly = [...this.#pendingPaths].every((path) => path.startsWith('.git/'))
     this.#timer = setTimeout(() => {
       this.#timer = null
       void this.#flush(generation)
-    }, CHANGE_DEBOUNCE_MS)
+    }, delay ?? (metadataOnly && this.#pendingPaths.size > 0 ? METADATA_DEBOUNCE_MS : CHANGE_DEBOUNCE_MS))
+  }
+
+  // Refreshing in the middle of a commit, rebase or merge reads a half-written
+  // index and then has to do it all again when the operation lands.
+  #operationInProgress(): boolean {
+    const gitDirectory = this.#gitDirectory ?? (this.#snapshot == null ? null : resolve(this.#snapshot.root, '.git'))
+    if (gitDirectory == null) return false
+    return OPERATION_MARKERS.some((marker) => existsSync(resolve(gitDirectory, marker)))
   }
 
   async #flush(generation: number): Promise<void> {
@@ -160,7 +252,22 @@ export class RepositoryWatcher {
       return
     }
 
+    if (this.#operationInProgress()) {
+      const now = Date.now()
+      if (this.#deferredSince === 0) this.#deferredSince = now
+      if (now - this.#deferredSince < MAX_OPERATION_DEFERRAL_MS) {
+        this.#schedule(generation, METADATA_DEBOUNCE_MS)
+        return
+      }
+    }
+    this.#deferredSince = 0
+
     const previous = this.#snapshot
+    dropSelfWrites(this.#pendingPaths, this.#selfWrites, Date.now())
+    // Nothing left once the app's own writes are dropped, so the whole point of
+    // the hint would be lost by refreshing anyway.
+    if (this.#pendingPaths.size === 0) return
+
     const filesystemPaths = new Set(this.#pendingPaths)
     const previousPathSet = new Set(previous.paths)
     this.#pendingPaths.clear()
@@ -194,6 +301,18 @@ export class RepositoryWatcher {
 
   #publish(snapshot: RepositorySnapshot, changedPaths: string[]): void {
     this.#revision += 1
-    this.publish({ snapshot, changedPaths, revision: this.#revision })
+    const pathsChanged = this.#publishedPaths !== snapshot.paths
+    if (pathsChanged) this.#publishedPaths = snapshot.paths
+    const eventSnapshot = pathsChanged
+      ? snapshot
+      : {
+          root: snapshot.root,
+          name: snapshot.name,
+          kind: snapshot.kind,
+          branch: snapshot.branch,
+          head: snapshot.head,
+          statuses: snapshot.statuses
+        }
+    this.publish({ snapshot: eventSnapshot, changedPaths, revision: this.#revision })
   }
 }

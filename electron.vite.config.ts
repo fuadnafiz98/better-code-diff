@@ -43,6 +43,30 @@ function contentSecurityPolicyPlugin(): Plugin {
   }
 }
 
+// @pierre/diffs only reaches for shiki's WASM oniguruma engine when
+// preferredHighlighter is 'shiki-wasm' (highlighter/shared_highlighter.js:15,
+// worker/worker.js:1764); it defaults to 'shiki-js' and nothing here overrides
+// it, so the base64-inlined wasm chunk — 622,336 bytes in the last build — is
+// shipped and never fetched. The stub throws instead of resolving empty so a
+// future engine switch fails loudly at the import rather than deep inside shiki.
+function dropShikiWasmPlugin(): Plugin {
+  const stubId = '\0horus:shiki-wasm-stub'
+  return {
+    name: 'horus:drop-shiki-wasm',
+    // Vite's own resolver is a core plugin and wins over unenforced user
+    // plugins, so without 'pre' the specifier is already resolved by the time
+    // this runs and the chunk ships anyway.
+    enforce: 'pre',
+    resolveId(source) {
+      return source === 'shiki/wasm' ? stubId : null
+    },
+    load(id) {
+      if (id !== stubId) return null
+      return "throw new Error('shiki/wasm is stubbed out of this build; the highlighter uses the JS regex engine. Remove the horus:drop-shiki-wasm plugin to ship the oniguruma engine.')\n"
+    }
+  }
+}
+
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
@@ -70,13 +94,14 @@ export default defineConfig({
   },
   renderer: {
     root: resolve('src/renderer'),
-    plugins: [react(), contentSecurityPolicyPlugin()],
+    plugins: [react(), contentSecurityPolicyPlugin(), dropShikiWasmPlugin()],
     build: {
       minify: 'esbuild',
       cssMinify: 'esbuild'
     },
     worker: {
-      format: 'es'
+      format: 'es',
+      plugins: () => [dropShikiWasmPlugin()]
     }
   }
 })

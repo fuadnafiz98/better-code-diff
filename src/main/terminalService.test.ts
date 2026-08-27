@@ -105,7 +105,7 @@ describe('TerminalService', () => {
     const owner = fakeOwner(1)
     const otherOwner = fakeOwner(2)
     const service = new TerminalService(() => pty)
-    const session = service.create(owner, process.cwd(), 80, 24, '0.1.0')
+    const session = await service.create(owner, process.cwd(), 80, 24, '0.1.0')
 
     expect(pty.paused).toBe(true)
     pty.emitData('prompt')
@@ -124,11 +124,11 @@ describe('TerminalService', () => {
     expect(pty.killed).toBe(true)
   })
 
-  test('resizes, clears, reports exit, and rejects work after exit', () => {
+  test('resizes, clears, reports exit, and rejects work after exit', async () => {
     const pty = fakePty()
     const owner = fakeOwner(1)
     const service = new TerminalService(() => pty)
-    const session = service.create(owner, process.cwd(), 80, 24, '0.1.0')
+    const session = await service.create(owner, process.cwd(), 80, 24, '0.1.0')
 
     service.resize(owner.id, session.id, 120, 36)
     service.clear(owner.id, session.id)
@@ -143,5 +143,55 @@ describe('TerminalService', () => {
     service.resize(owner.id, session.id, 90, 20)
     expect(pty.writes).toHaveLength(0)
     expect({ columns: pty.cols, rows: pty.rows }).toEqual({ columns: 120, rows: 36 })
+  })
+
+  test('captures output emitted before the session is published', async () => {
+    const pty = fakePty()
+    const owner = fakeOwner(1)
+    // A subscription registered after the map insert would drop this chunk and
+    // dispose a null on kill; emitting from the spawn call proves the order.
+    const service = new TerminalService(() => {
+      queueMicrotask(() => pty.emitData('immediate'))
+      return pty
+    })
+
+    const session = await service.create(owner, process.cwd(), 80, 24, '0.1.0')
+    service.ready(owner.id, session.id)
+    pty.emitData(' flushed')
+    await Bun.sleep(15)
+
+    expect(owner.events.at(-1)?.payload).toEqual({ sessionId: session.id, data: 'immediate flushed' })
+    expect(() => { service.kill(owner.id, session.id) }).not.toThrow()
+  })
+
+  test('holds output while the dock is hidden and replays the tail on show', async () => {
+    const pty = fakePty()
+    const owner = fakeOwner(1)
+    const service = new TerminalService(() => pty)
+    const session = await service.create(owner, process.cwd(), 80, 24, '0.1.0')
+    service.ready(owner.id, session.id)
+
+    service.setVisible(owner.id, session.id, false)
+    pty.emitData('hidden output')
+    await Bun.sleep(15)
+    expect(owner.events).toHaveLength(0)
+
+    service.setVisible(owner.id, session.id, true)
+    expect(owner.events.at(-1)?.payload).toEqual({ sessionId: session.id, data: 'hidden output' })
+  })
+
+  test('caps what a hidden session buffers instead of growing without bound', async () => {
+    const pty = fakePty()
+    const owner = fakeOwner(1)
+    const service = new TerminalService(() => pty)
+    const session = await service.create(owner, process.cwd(), 80, 24, '0.1.0')
+    service.ready(owner.id, session.id)
+    service.setVisible(owner.id, session.id, false)
+
+    for (let index = 0; index < 12; index += 1) pty.emitData('x'.repeat(100_000))
+    service.setVisible(owner.id, session.id, true)
+
+    const payload = owner.events.at(-1)?.payload as TerminalDataEvent
+    expect(payload.data).toHaveLength(512 * 1_024)
   })
 })

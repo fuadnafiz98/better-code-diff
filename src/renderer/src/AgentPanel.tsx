@@ -14,6 +14,7 @@ import type {
 import {
   agentAttachmentId, formatAgentAttachment, type AgentAttachment
 } from './agentAttachments'
+import type { ConfirmRequest } from './ConfirmDialog'
 import type { MarkdownBlock } from './markdown'
 import { MarkdownContent } from './MarkdownContent'
 import type { AgentTurnRecord } from './useAgentAnswer'
@@ -47,6 +48,7 @@ interface AgentPanelProps {
   onModelChange(model: string): void
   onEffortChange(effort: string): void
   onAccessModeChange(accessMode: AgentAccessMode): void
+  onConfirm(request: ConfirmRequest): Promise<boolean>
   onRefreshStatuses(): void
   onLogin(provider: AgentProvider): void
   onApprovalDecision(requestId: string, decision: AgentApprovalDecision): void
@@ -74,7 +76,7 @@ export const AgentPanel = memo(function AgentPanel({
   startedAt, completedAt, provider, model, effort, accessMode, models, efforts,
   loadingModels, statuses, loadingStatuses, authenticatingProvider, statusError,
   attachments, contextLabel, onProviderChange, onModelChange, onEffortChange,
-  onAccessModeChange, onRefreshStatuses, onLogin, onApprovalDecision,
+  onAccessModeChange, onConfirm, onRefreshStatuses, onLogin, onApprovalDecision,
   onRemoveAttachment, onAsk, onCancel, onReset, onClose
 }: AgentPanelProps): React.JSX.Element {
   const [draft, setDraft] = useState('')
@@ -241,10 +243,15 @@ export const AgentPanel = memo(function AgentPanel({
               <AgentConfigField label="Access" controlId="agent-access">
                 <AgentSelect label="Access" name="agent-access" value={accessMode}
                   title={ACCESS_MODES[accessMode].description}
-                  onChange={(value) => {
+                  onChange={async (value) => {
                     const nextMode = value as AgentAccessMode
                     if (nextMode === 'full-access' && accessMode !== 'full-access' &&
-                        !window.confirm('Full access allows commands and file changes without approval until Horus restarts. Continue?')) return
+                        !(await onConfirm({
+                          title: 'Enable full access?',
+                          detail: 'The agent can run commands and change files without approval until Horus restarts.',
+                          confirmLabel: 'Enable full access',
+                          destructive: true
+                        }))) return
                     onAccessModeChange(nextMode)
                   }}>
                   {Object.entries(ACCESS_MODES).map(([value, option]) =>
@@ -323,7 +330,9 @@ function ProviderConnection({ provider, status, loading, authenticating, error, 
   )
 }
 
-function AgentTurn({ turn }: { turn: AgentTurnRecord }): React.JSX.Element {
+// Archived turns never change again, and their props keep identity, so an
+// answer streaming below them must not re-render the whole history per token.
+const AgentTurn = memo(function AgentTurn({ turn }: { turn: AgentTurnRecord }): React.JSX.Element {
   return (
     <article className="agent-turn archived">
       <p className="agent-question">{turn.question}</p>
@@ -339,7 +348,7 @@ function AgentTurn({ turn }: { turn: AgentTurnRecord }): React.JSX.Element {
       {turn.answer === '' ? null : <AnswerActions answer={turn.answer} />}
     </article>
   )
-}
+})
 
 function TurnMeta({ provider, model, effort, accessMode, running, startedAt, completedAt }: {
   provider: AgentProvider | null
@@ -465,7 +474,7 @@ function ActivityIcon({ kind }: { kind: AgentActivityKind }): React.JSX.Element 
   return <IconCheck aria-hidden="true" />
 }
 
-function AgentActivityTimeline({ items, streaming, liveLabel }: {
+const AgentActivityTimeline = memo(function AgentActivityTimeline({ items, streaming, liveLabel }: {
   items: readonly AgentActivityUpdate[]
   streaming: boolean
   liveLabel: string
@@ -482,15 +491,18 @@ function AgentActivityTimeline({ items, streaming, liveLabel }: {
       <span>{summary}</span><small>{items.length} {items.length === 1 ? 'step' : 'steps'}</small>
       <IconChevronSm className="agent-work-log-chevron" aria-hidden="true" />
     </summary>
-    <ol className="agent-activity" aria-label="Agent steps">
-      {items.map((item) => {
-        return <AgentActivityRow item={item} key={item.id} />
-      })}
-    </ol>
+    {/* The steps mount only while the timeline is open: a collapsed history of
+        20 turns would otherwise hold ~1,600 rows in the document, and every
+        reasoning delta would rewrite a text node nobody can see. */}
+    {open ? <ol className="agent-activity" aria-label="Agent steps">
+      {items.map((item) => <AgentActivityRow item={item} key={item.id} />)}
+    </ol> : null}
   </details>
-}
+})
 
-function AgentActivityRow({ item }: { item: AgentActivityUpdate }): React.JSX.Element {
+const AgentActivityRow = memo(function AgentActivityRow({ item }: {
+  item: AgentActivityUpdate
+}): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const expandable = (item.detail ?? '') !== '' || (item.output ?? '') !== ''
   const duration = item.durationMs == null || item.durationMs < 1_000 ? null : formatDuration(item.durationMs)
@@ -500,12 +512,12 @@ function AgentActivityRow({ item }: { item: AgentActivityUpdate }): React.JSX.El
       <summary><ActivityIcon kind={item.kind} /><span>{item.title}</span>
         <small>{duration ?? formatActivityStatus(item.status)}</small>
         <IconChevronSm className="agent-activity-chevron" aria-hidden="true" /></summary>
-      {item.detail == null || item.detail === '' ? null : <pre>{item.detail}</pre>}
-      {item.output == null || item.output === '' ? null : <pre className="output">{item.output}</pre>}
+      {!open || item.detail == null || item.detail === '' ? null : <pre>{item.detail}</pre>}
+      {!open || item.output == null || item.output === '' ? null : <pre className="output">{item.output}</pre>}
     </details> : <div className="agent-activity-summary"><ActivityIcon kind={item.kind} />
       <span>{item.title}</span><small>{duration ?? formatActivityStatus(item.status)}</small></div>}
   </li>
-}
+})
 
 function formatActivityStatus(status: AgentActivityUpdate['status']): string {
   if (status === 'waiting') return 'Approval'

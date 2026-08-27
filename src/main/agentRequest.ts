@@ -24,37 +24,42 @@ export interface AgentAskRequest {
   resumeSessionId?: string
 }
 
-type AgentAskDecoder = (value: unknown) => AgentAskRequest | null
+const AGENT_PROVIDERS = new Set<AgentAskRequest['provider']>(['claude', 'codex'])
+const AGENT_ACCESS_MODES = new Set<AgentAccessMode>(['review', 'auto', 'full-access'])
 
-// `effect` is the main process's largest dependency and this decode is the only
-// thing that needs it, so it loads on the first agent request rather than during
-// startup. Measured: importing it eagerly costs 143 ms and 24 MB of heap before
-// the window can even be created.
-let decoderPromise: Promise<AgentAskDecoder> | null = null
-
-async function loadDecoder(): Promise<AgentAskDecoder> {
-  const { Schema } = await import('effect')
-  const decode = Schema.decodeUnknownOption(Schema.Struct({
-    id: Schema.String,
-    provider: Schema.Literals(['claude', 'codex']),
-    model: Schema.String,
-    effort: Schema.String,
-    accessMode: Schema.Literals(['review', 'auto', 'full-access']),
-    prompt: Schema.String,
-    context: Schema.String,
-    resumeSessionId: Schema.optional(Schema.String)
-  }))
-  return (value) => {
-    const decoded = decode(value)
-    return decoded._tag === 'None' ? null : { ...decoded.value }
+// This is the renderer -> subprocess trust boundary, so the request is rebuilt
+// field by field instead of forwarded: a class instance, a prototype-polluted
+// payload or extra keys can never reach the CLI invocation. Replaces an
+// `effect` Schema.Struct decode that cost 35 MB of app size and 135 ms on the
+// first ask for exactly this check.
+function decodeAgentAskRequest(value: unknown): AgentAskRequest | null {
+  if (typeof value !== 'object' || value == null || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value) as unknown
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const candidate = value as Record<string, unknown>
+  const { id, provider, model, effort, accessMode, prompt, context, resumeSessionId } = candidate
+  if (typeof id !== 'string' || typeof model !== 'string' || typeof effort !== 'string' ||
+      typeof prompt !== 'string' || typeof context !== 'string') return null
+  if (typeof provider !== 'string' || !AGENT_PROVIDERS.has(provider as AgentAskRequest['provider'])) return null
+  if (typeof accessMode !== 'string' || !AGENT_ACCESS_MODES.has(accessMode as AgentAccessMode)) return null
+  if (resumeSessionId !== undefined && typeof resumeSessionId !== 'string') return null
+  return {
+    id,
+    provider: provider as AgentAskRequest['provider'],
+    model,
+    effort,
+    accessMode: accessMode as AgentAccessMode,
+    prompt,
+    context,
+    ...(resumeSessionId === undefined ? {} : { resumeSessionId })
   }
 }
 
 // Renderer input reaches the agent runner as `unknown`; a decode failure must
-// read as a refusal rather than a malformed subprocess invocation.
+// read as a refusal rather than a malformed subprocess invocation. The async
+// signature is kept because every caller already awaits it.
 export async function parseAgentAskRequest(value: unknown): Promise<AgentAskRequest> {
-  decoderPromise ??= loadDecoder()
-  const request = (await decoderPromise)(value)
+  const request = decodeAgentAskRequest(value)
   if (request == null) throw new Error('The agent request was not understood.')
   const prompt = request.prompt.trim()
   if (prompt === '') throw new Error('Ask the agent a question first.')
@@ -307,8 +312,16 @@ export function interpretAgentLine(
     return null
   }
   if (typeof parsed !== 'object' || parsed == null) return null
-  const envelope = parsed as Record<string, unknown>
+  return interpretAgentEnvelope(parsed as Record<string, unknown>, accessMode)
+}
 
+// The Claude SDK yields already-parsed messages, so that transport reads the
+// envelope directly instead of stringifying each token delta only to parse it
+// straight back.
+export function interpretAgentEnvelope(
+  envelope: Record<string, unknown>,
+  accessMode: AgentAccessMode = 'review'
+): AgentStreamChunk | null {
   if (typeof envelope.type === 'string' && (envelope.type.startsWith('thread.') || envelope.type.startsWith('turn.') || envelope.type.startsWith('item.'))) {
     return interpretCodexLine(envelope)
   }

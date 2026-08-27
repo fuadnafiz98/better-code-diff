@@ -19,13 +19,12 @@ import {
 import { CodeView, type CodeViewHandle, type CodeViewReactOptions } from '@pierre/diffs/react'
 import { IconCheck, IconChevronSm, IconCodeSearch, IconRefresh, IconWarningOctogonFill } from '@pierre/icons'
 
-import type { RemoteReviewThread, RepositoryChangeEvent, RepositoryReview } from '../../shared/contracts'
+import type { PullRequestConversation, RemoteReviewThread, RepositoryChangeEvent, RepositoryReview } from '../../shared/contracts'
 import type { DiffStyle } from './AppView'
-import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
 import { markReviewFileHydrated } from './reviewMetrics'
-import { COPY_FILE_PATH_CSS, reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
-import { DRAG_SELECTION_CSS, syncDragGuideLifecycle } from './dragSelection'
-import { SPLIT_DIFF_RESIZE_CSS, syncSplitDiffResizeLifecycle } from './splitDiffResize'
+import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
+import { syncDragGuideLifecycle } from './dragSelection'
+import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -39,7 +38,6 @@ import { ReviewSummary, type ReviewSummaryEntry } from './ReviewSummary'
 import { RemoteReviewThreadCard } from './RemoteReviewThreads'
 import {
   deriveAnnotatedReviewItems,
-  planAnnotatedReviewItemMutations,
   type AnnotatedReviewItemCache
 } from './annotatedReviewItems'
 import {
@@ -63,127 +61,26 @@ import type { ReviewCommand } from './keybindings'
 import {
   dropChangedViewedFiles,
   markViewedFile,
-  reviewFileSignature,
   type ViewedFileSignatures
 } from './viewedFileStorage'
+import { VIEWER_BASE_CSS } from './viewerCss'
+import { buildViewedPathsKey, parseViewedPathsKey } from './viewedPaths'
+import { PullRequestContext } from './PullRequestContext'
 
 const CODE_VIEW_CSS = `
-  *, *::before, *::after { corner-shape: squircle; }
-  button { touch-action: manipulation; transition: transform 100ms cubic-bezier(0.23, 1, 0.32, 1), background-color 100ms cubic-bezier(0.23, 1, 0.32, 1); }
-  button:active:not(:disabled) { transform: scale(0.96); }
-  [data-expand-button] { border-radius: 22% !important; corner-shape: squircle !important; }
-  [data-utility-button] { border-radius: 7px !important; corner-shape: squircle !important; }
-  [data-expand-button]:hover { background: var(--accent-soft); color: var(--path-text); }
-  button[data-review-collapse-button][data-review-collapse-button]:hover { background: var(--control-fill-hover) !important; color: var(--text) !important; }
-  button[data-review-collapse-button][data-review-collapse-button]:focus-visible { outline: 2px solid var(--focus) !important; outline-offset: 2px !important; }
-  button[data-review-collapse-button][data-review-collapse-button]:active { transform: scale(0.96) !important; }
-  [data-collapse-chevron] { width: 11px !important; height: 16px !important; z-index: 1; pointer-events: none; transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1); }
-  [data-review-collapse-button][aria-expanded="false"] [data-collapse-chevron] { transform: rotate(-90deg); }
-  [data-separator="line-info-basic"] { border-block: 1px solid var(--border); background: var(--control-fill); }
-  ${DRAG_SELECTION_CSS}
-  ${CENTERED_COLLAPSED_SEPARATOR_CSS}
-  ${SPLIT_DIFF_RESIZE_CSS}
-  ${COPY_FILE_PATH_CSS}
+  ${VIEWER_BASE_CSS}
+
+  [data-utility-button] { border-radius: var(--corner-compact) !important; corner-shape: squircle !important; }
 `
 
 const ACTIVE_PATH_SETTLE_MS = 80
-
-const COLLAPSE_BUTTON_SQUIRCLE = 'polygon(50% 2.34%, 74.25% 3.16%, 83.69% 5.66%, 90.06% 9.94%, 94.34% 16.31%, 96.84% 25.75%, 97.66% 50%, 96.84% 74.25%, 94.34% 83.69%, 90.06% 90.06%, 83.69% 94.34%, 74.25% 96.84%, 50% 97.66%, 25.75% 96.84%, 16.31% 94.34%, 9.94% 90.06%, 5.66% 83.69%, 3.16% 74.25%, 2.34% 50%, 3.16% 25.75%, 5.66% 16.31%, 9.94% 9.94%, 16.31% 5.66%, 25.75% 3.16%)'
-const COLLAPSE_BUTTON_STYLES = {
-  appearance: 'none',
-  width: '28px',
-  height: '28px',
-  display: 'grid',
-  flex: '0 0 28px',
-  placeItems: 'center',
-  position: 'relative',
-  marginInlineStart: '-3px',
-  boxSizing: 'border-box',
-  border: '0',
-  padding: '0',
-  background: 'var(--control-fill-selected)',
-  color: 'var(--text-secondary)',
-  cursor: 'pointer',
-  clipPath: COLLAPSE_BUTTON_SQUIRCLE
-} as const
-
-function applyImportantStyles(element: HTMLElement | SVGElement | null, styles: Readonly<Record<string, string>>): void {
-  if (element == null) return
-  for (const [property, value] of Object.entries(styles)) {
-    const cssProperty = property.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)
-    element.style.setProperty(cssProperty, value, 'important')
-  }
-}
-
-function enforceCollapseButtonSquircle(button: HTMLButtonElement | null): void {
-  applyImportantStyles(button, COLLAPSE_BUTTON_STYLES)
-}
-
-const VIEWED_TOGGLE_STYLES = {
-  minHeight: '28px',
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: '6px',
-  flex: '0 0 auto',
-  position: 'relative',
-  color: 'var(--text-secondary)',
-  fontSize: '10px',
-  lineHeight: '1',
-  paddingInlineEnd: '12px',
-  whiteSpace: 'nowrap',
-  cursor: 'pointer',
-  userSelect: 'none'
-} as const
-
-const VIEWED_INPUT_STYLES = {
-  appearance: 'none',
-  width: '1px',
-  height: '1px',
-  position: 'absolute',
-  overflow: 'hidden',
-  margin: '-1px',
-  border: '0',
-  padding: '0',
-  opacity: '0',
-  clipPath: 'inset(50%)'
-} as const
-
-function enforceViewedToggle(label: HTMLLabelElement | null): void {
-  applyImportantStyles(label, VIEWED_TOGGLE_STYLES)
-}
-
-function enforceViewedInput(input: HTMLInputElement | null): void {
-  applyImportantStyles(input, VIEWED_INPUT_STYLES)
-}
-
-function enforceViewedCheckbox(box: HTMLSpanElement | null, viewed: boolean): void {
-  applyImportantStyles(box, {
-    width: '15px',
-    height: '15px',
-    display: 'grid',
-    flex: '0 0 15px',
-    placeItems: 'center',
-    boxSizing: 'border-box',
-    border: `1px solid ${viewed ? 'var(--accent)' : 'var(--border-strong)'}`,
-    borderRadius: '5px',
-    background: viewed ? 'var(--accent)' : 'var(--control-fill)',
-    color: 'var(--accent-contrast)',
-    clipPath: COLLAPSE_BUTTON_SQUIRCLE
-  })
-  applyImportantStyles(box?.querySelector('svg') ?? null, {
-    width: '10px',
-    height: '10px',
-    display: 'block',
-    opacity: viewed ? '1' : '0',
-    transform: viewed ? 'scale(1)' : 'scale(0.72)'
-  })
-}
 
 interface MultiFileReviewProps {
   paths: readonly string[]
   diffStyle: DiffStyle
   preferences: AppPreferences
   repositoryReview?: RepositoryReview | null
+  pullRequestConversation?: PullRequestConversation | null
   repositoryChange: RepositoryChangeEvent | null
   scrollToReviewRevision: number
   navigationPath: string | null
@@ -203,7 +100,8 @@ interface MultiFileReviewProps {
   reviewCommand: { command: ReviewCommand; path: string; revision: number } | null
 }
 
-const SCROLL_RESTORE_MAX_FRAMES = 60
+const SCROLL_RESTORE_SETTLED_FRAMES = 3
+const SCROLL_RESTORE_TIMEOUT_MS = 800
 // Any of these means the reader took over; a pending restore must yield to them.
 const SCROLL_TAKEOVER_EVENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
 
@@ -232,8 +130,6 @@ interface AnnotatedReviewItemsOptions {
   pendingSelection: { id: string; range: CodeViewLineSelection['range'] } | null
   collapsedItemIds: ReadonlySet<string>
   annotationVersions: Readonly<Record<string, number>>
-  viewerRef: React.RefObject<CodeViewHandle<ReviewAnnotationMetadata> | null>
-  viewerJustMountedRef: React.RefObject<boolean>
 }
 
 function useAnnotatedReviewItems({
@@ -243,12 +139,10 @@ function useAnnotatedReviewItems({
   draftComment,
   pendingSelection,
   collapsedItemIds,
-  annotationVersions,
-  viewerRef,
-  viewerJustMountedRef
+  annotationVersions
 }: AnnotatedReviewItemsOptions): CodeViewItem<ReviewAnnotationMetadata>[] {
   const committedCacheRef = useRef<AnnotatedReviewItemCache>(new Map())
-  const previousItemsRef = useRef<ReadonlyMap<string, CodeViewItem<ReviewAnnotationMetadata>>>(new Map())
+  const committedItemsRef = useRef<CodeViewItem<ReviewAnnotationMetadata>[] | undefined>(undefined)
   const derivation = useMemo(() => deriveAnnotatedReviewItems({
     items: loadState.items,
     threadsByPath,
@@ -257,40 +151,24 @@ function useAnnotatedReviewItems({
     pendingSelection,
     collapsedItemIds,
     annotationVersions,
-    previousCache: committedCacheRef.current
+    previousCache: committedCacheRef.current,
+    previousItems: committedItemsRef.current
   }), [annotationVersions, collapsedItemIds, draftComment, loadState.items, pendingSelection, remoteThreadsByPath, threadsByPath])
 
   useLayoutEffect(() => {
     committedCacheRef.current = derivation.cache
-  }, [derivation.cache])
-
-  useEffect(() => {
-    const viewer = viewerRef.current
-    if (viewer == null) return
-    if (viewerJustMountedRef.current) {
-      viewerJustMountedRef.current = false
-      previousItemsRef.current = new Map(derivation.items.map((item) => [item.id, item]))
-      return
-    }
-    const mutations = planAnnotatedReviewItemMutations(
-      derivation.items,
-      previousItemsRef.current,
-      (id) => viewer.getItem(id) != null
-    )
-    for (const item of mutations.updates) viewer.updateItem(item)
-    if (mutations.additions.length > 0) viewer.addItems(mutations.additions)
-    previousItemsRef.current = mutations.nextItems
-  }, [derivation.items, viewerJustMountedRef, viewerRef])
+    committedItemsRef.current = derivation.items
+  }, [derivation.cache, derivation.items])
 
   return derivation.items
 }
 
 interface MultiFileViewerProps {
   paths: readonly string[]
-  pathsKey: string
   diffStyle: DiffStyle
   preferences: AppPreferences
   repositoryReview: RepositoryReview | null
+  pullRequestConversation: PullRequestConversation | null
   loadState: ReviewLoadState
   loading: boolean
   targetPathCount: number
@@ -310,7 +188,7 @@ interface MultiFileViewerProps {
   onSelectLines(selection: CodeViewLineSelection | null): void
   onCommentOnSelection(): void
   onAskAgentAboutSelection(): void
-  scrollContainerRef: React.RefObject<HTMLDivElement | null>
+  scrollContainerRef: React.Ref<HTMLDivElement>
   viewerRef: React.RefObject<CodeViewHandle<ReviewAnnotationMetadata> | null>
   onScrollPositionChange(scrollTop: number): void
   onVisiblePathChange(path: string): void
@@ -327,10 +205,10 @@ interface MultiFileViewerProps {
 
 const MultiFileViewer = memo(function MultiFileViewer({
   paths,
-  pathsKey,
   diffStyle,
   preferences,
   repositoryReview,
+  pullRequestConversation,
   loadState,
   loading,
   targetPathCount,
@@ -342,11 +220,9 @@ const MultiFileViewer = memo(function MultiFileViewer({
   viewedPaths,
   viewedCount,
   onToggleViewed,
-  remoteThreadsByPath,
   pendingRemoteThreadId,
   onReplyToRemoteThread,
   onResolveRemoteThread,
-  pendingSelection,
   onSelectLines,
   onCommentOnSelection,
   onAskAgentAboutSelection,
@@ -355,8 +231,6 @@ const MultiFileViewer = memo(function MultiFileViewer({
   onScrollPositionChange,
   onVisiblePathChange,
   setViewerRef,
-  setSelectedLines,
-  beginComment,
   toggleItemCollapsed,
   collapseAllFiles,
   expandAllFiles,
@@ -377,14 +251,14 @@ const MultiFileViewer = memo(function MultiFileViewer({
       threads.map((thread) => ({ path, thread }))
     ), [threadsByPath])
   const renderReviewSummary = useCallback(
-    () => <ReviewSummary entries={summaryEntries} />,
-    [summaryEntries]
+    () => <><PullRequestContext conversation={pullRequestConversation} /><ReviewSummary entries={summaryEntries} /></>,
+    [pullRequestConversation, summaryEntries]
   )
   const renderHeaderPrefix = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
     const expanded = !collapsedItemIds.has(item.id)
     const path = pathFromItemId(item.id)
     return (
-      <button ref={enforceCollapseButtonSquircle} type="button" data-review-collapse-button
+      <button type="button" data-review-collapse-button
         aria-expanded={expanded} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${path}`}
         title={`${expanded ? 'Collapse' : 'Expand'} file`} onClick={(event) => {
           event.stopPropagation()
@@ -401,18 +275,12 @@ const MultiFileViewer = memo(function MultiFileViewer({
     const path = pathFromItemId(item.id)
     const viewed = viewedPaths.has(path)
     return (
-      <label ref={enforceViewedToggle} data-review-viewed-toggle data-state={viewed ? 'checked' : 'unchecked'}
+      <label data-review-viewed-toggle data-state={viewed ? 'checked' : 'unchecked'}
         title={viewed ? 'Mark as not viewed' : 'Mark as viewed'}
         onClick={(event) => event.stopPropagation()}>
-        <input ref={enforceViewedInput} type="checkbox" checked={viewed} aria-label={`Mark ${path} as viewed`}
-          onFocus={(event) => applyImportantStyles(event.currentTarget.nextElementSibling as HTMLElement | null, {
-            outline: '2px solid rgba(120, 169, 255, 0.9)', outlineOffset: '2px'
-          })}
-          onBlur={(event) => applyImportantStyles(event.currentTarget.nextElementSibling as HTMLElement | null, {
-            outline: 'none', outlineOffset: '0'
-          })}
+        <input type="checkbox" checked={viewed} aria-label={`Mark ${path} as viewed`}
           onChange={() => onToggleViewed(path)} />
-        <span ref={(box) => enforceViewedCheckbox(box, viewed)} data-review-viewed-checkbox aria-hidden="true"><IconCheck /></span>
+        <span data-review-viewed-checkbox aria-hidden="true"><IconCheck /></span>
         <span>Viewed</span>
       </label>
     )
@@ -450,7 +318,9 @@ const MultiFileViewer = memo(function MultiFileViewer({
     '--diffs-font-features': '"calt" 1, "liga" 1'
   }) as CSSProperties, [preferences])
   const codeViewOptions = useMemo<CodeViewReactOptions<ReviewAnnotationMetadata>>(() => ({
-    theme: preferences.editorTheme, themeType: getEditorThemeType(preferences.editorTheme), diffStyle, diffIndicators: 'bars', lineDiffType: 'word-alt',
+    // No `theme`: the worker pool resolves it and re-renders every instance on a
+    // switch, so passing it here only forced a second full rebuild of the DOM.
+    themeType: getEditorThemeType(preferences.editorTheme), diffStyle, diffIndicators: 'bars', lineDiffType: 'word-alt',
     overflow: preferences.wordWrap ? 'wrap' : 'scroll', disableLineNumbers: !preferences.showLineNumbers,
     tokenizeMaxLineLength: 2_000, enableLineSelection: true, enableGutterUtility: true,
     onLineSelectionEnd: (range, context) => onSelectLines(range == null ? null : { id: context.item.id, range }),
@@ -469,36 +339,51 @@ const MultiFileViewer = memo(function MultiFileViewer({
       return { oldFile: comparison.oldFile, newFile: comparison.newFile } as Awaited<ReturnType<NonNullable<CodeViewReactOptions<ReviewAnnotationMetadata>['loadDiffFiles']>>>
     }} : {})
   }), [diffStyle, onSelectLines, preferences, repositoryReview])
-  const handleScroll = useCallback((scrollTop: number, viewer: NonNullable<ReturnType<CodeViewHandle<ReviewAnnotationMetadata>['getInstance']>>) => {
+  const handleScroll = useCallback((scrollTop: number) => {
     onScrollPositionChange(scrollTop)
     const backToTopVisible = scrollTop > BACK_TO_TOP_THRESHOLD
     if (backToTopVisible !== backToTopVisibleRef.current) {
       backToTopVisibleRef.current = backToTopVisible
       setShowBackToTop(backToTopVisible)
     }
-
-    const positions = viewer.getRenderedItems().flatMap((item) => {
-      const top = viewer.getTopForItem(item.id)
-      return top == null ? [] : [{ id: item.id, top }]
-    })
-    const activeId = findActiveReviewItemId(scrollTop, positions)
-    const activePath = activeId == null ? null : pathFromItemId(activeId)
-    if (activePath == null || activePath === visiblePathRef.current) return
-    visiblePathRef.current = activePath
-    if (visiblePathTimerRef.current != null) clearTimeout(visiblePathTimerRef.current)
+    // The rendered-item snapshot allocates an array plus an object per item in the
+    // render window, and the viewer calls this once per frame. Taking the sample on
+    // the settle the tree-follow already waits for costs one snapshot per 80 ms
+    // instead of one per frame, and the last scroll event always leaves one armed.
+    if (visiblePathTimerRef.current != null) return
     visiblePathTimerRef.current = setTimeout(() => {
       visiblePathTimerRef.current = null
+      const instance = viewerRef.current?.getInstance()
+      if (instance == null) return
+      const positions = instance.getRenderedItems().flatMap((item) => {
+        const top = instance.getTopForItem(item.id)
+        return top == null ? [] : [{ id: item.id, top }]
+      })
+      const activeId = findActiveReviewItemId(instance.getScrollTop(), positions)
+      const activePath = activeId == null ? null : pathFromItemId(activeId)
+      if (activePath == null || activePath === visiblePathRef.current) return
+      visiblePathRef.current = activePath
       onVisiblePathChange(activePath)
     }, ACTIVE_PATH_SETTLE_MS)
-  }, [onScrollPositionChange, onVisiblePathChange])
+  }, [onScrollPositionChange, onVisiblePathChange, viewerRef])
 
   if (paths.length === 0) return <div className="diff-state"><IconCodeSearch /><strong>No files to review</strong><span>This comparison has no visible changes.</span></div>
   if (loadState.items.length === 0 && loading) return <div className="diff-state"><IconRefresh className="spin" /><span>Loading repository review…</span></div>
+  if (loadState.items.length === 0) {
+    const emptyDetail = loadState.failedCount > 0
+      ? 'The changed files could not be loaded.'
+      : loadState.omittedFiles.length + loadState.skippedCount > 0
+        ? 'Every changed file is too large or binary to open here.'
+        : 'The review loaded, but its patch could not be parsed.'
+    return <div className="diff-state"><IconWarningOctogonFill /><strong>No diffs to display</strong><span>{emptyDetail}</span></div>
+  }
   const remainingPathCount = paths.length - targetPathCount
   // The pill keeps showing the reviewed count once loading settles: it is the
   // progress through the review, and fading it left an empty floating box behind.
   return <div className="multi-file-review">
-    <div className="multi-file-progress"><div role="status">
+    <div className="multi-file-progress" style={{
+      '--review-progress': loadState.items.length === 0 ? 0 : viewedCount / loadState.items.length
+    } as CSSProperties}><div role="status">
       <span>{loading
         ? `Loading ${loadState.loadedPaths.size} of ${targetPathCount}`
         : `${viewedCount} of ${loadState.items.length} reviewed`}</span>
@@ -513,8 +398,8 @@ const MultiFileViewer = memo(function MultiFileViewer({
       <button type="button" onClick={collapseAllFiles} disabled={collapsedItemIds.size === loadState.items.length}>Collapse all</button>
       <button type="button" onClick={expandAllFiles} disabled={collapsedItemIds.size === 0}>Expand all</button>
     </div></div>
-    <CodeView<ReviewAnnotationMetadata> key={pathsKey} ref={setViewerRef} containerRef={scrollContainerRef}
-      initialItems={annotatedItems} onScroll={handleScroll}
+    <CodeView<ReviewAnnotationMetadata> ref={setViewerRef} containerRef={scrollContainerRef}
+      items={annotatedItems} onScroll={handleScroll}
       options={codeViewOptions} selectedLines={selectedLines} onSelectedLinesChange={onSelectLines}
       renderCodeViewHeader={renderReviewSummary} renderHeaderPrefix={renderHeaderPrefix}
       renderHeaderMetadata={renderHeaderMetadata}
@@ -528,6 +413,7 @@ const MultiFileReview = memo(function MultiFileReview({
   diffStyle,
   preferences,
   repositoryReview = null,
+  pullRequestConversation = null,
   repositoryChange,
   scrollToReviewRevision,
   navigationPath,
@@ -548,7 +434,6 @@ const MultiFileReview = memo(function MultiFileReview({
 }: MultiFileReviewProps): React.JSX.Element {
   const viewerRef = useRef<CodeViewHandle<ReviewAnnotationMetadata> | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
-  const viewerJustMountedRef = useRef(false)
   const handledNavigationRevisionRef = useRef(navigationRevision)
   const restoredScrollPositionRef = useRef(false)
   const pathsKey = paths.join('\0')
@@ -636,7 +521,6 @@ const MultiFileReview = memo(function MultiFileReview({
   }, [bumpPathVersions])
   const setViewerRef = useCallback((viewer: CodeViewHandle<ReviewAnnotationMetadata> | null) => {
     viewerRef.current = viewer
-    viewerJustMountedRef.current = viewer != null
   }, [])
 
   useEffect(() => {
@@ -675,8 +559,9 @@ const MultiFileReview = memo(function MultiFileReview({
     // so a single scrollTo clamps early; retry until the target holds or the
     // user takes over scrolling.
     let frame = 0
-    let attempts = 0
+    let settledFrames = 0
     let cancelled = false
+    const startedAt = performance.now()
     const cancel = (): void => {
       cancelled = true
     }
@@ -686,11 +571,18 @@ const MultiFileReview = memo(function MultiFileReview({
       const viewer = viewerRef.current
       if (viewer == null) return
       const current = getViewerScrollTop(viewer)
-      if (current == null || Math.abs(current - restoreTarget) > 1) {
+      if (current != null && Math.abs(current - restoreTarget) <= 1) {
+        settledFrames += 1
+        // Late measurement can still move the target out from under a position that
+        // looked right, so hold it for a few frames before letting go.
+        if (settledFrames >= SCROLL_RESTORE_SETTLED_FRAMES) return
+      } else {
+        settledFrames = 0
         viewer.scrollTo({ type: 'position', position: restoreTarget, behavior: 'instant' })
       }
-      attempts += 1
-      if (attempts < SCROLL_RESTORE_MAX_FRAMES) frame = window.requestAnimationFrame(step)
+      // Bounded by elapsed time rather than a frame count, so a 120 Hz display does
+      // not give up in half the time.
+      if (performance.now() - startedAt < SCROLL_RESTORE_TIMEOUT_MS) frame = window.requestAnimationFrame(step)
     }
     step()
     return () => {
@@ -713,14 +605,14 @@ const MultiFileReview = memo(function MultiFileReview({
 
   // Stale entries are filtered out rather than deleted, so a file whose contents
   // changed reads as unviewed without writing to state during render.
-  const viewedPaths = useMemo(() => {
-    const paths = new Set<string>()
-    for (const [path, signature] of Object.entries(viewedFiles)) {
-      const item = itemsByPath.get(path)
-      if (item != null && reviewFileSignature(item) === signature) paths.add(path)
-    }
-    return paths
-  }, [itemsByPath, viewedFiles])
+  const viewedPathsKey = useMemo(
+    () => buildViewedPathsKey(itemsByPath, viewedFiles),
+    [itemsByPath, viewedFiles]
+  )
+  // Rebuilding the Set per load page changed `renderHeaderMetadata`'s identity, and
+  // CodeView memoizes its header portals on exactly that. Keying on the contents
+  // means the headers re-render when the viewed set moves and not before.
+  const viewedPaths = useMemo(() => parseViewedPathsKey(viewedPathsKey), [viewedPathsKey])
 
   const toggleViewed = useCallback((path: string) => {
     const item = itemsByPath.get(path)
@@ -747,14 +639,13 @@ const MultiFileReview = memo(function MultiFileReview({
     draftComment,
     pendingSelection,
     collapsedItemIds,
-    annotationVersions,
-    viewerRef,
-    viewerJustMountedRef
+    annotationVersions
   })
 
   return <MultiFileViewer
-    paths={stablePaths} pathsKey={pathsKey} diffStyle={diffStyle} preferences={preferences}
-    repositoryReview={repositoryReview} loadState={loadState} loading={loading}
+    paths={stablePaths} diffStyle={diffStyle} preferences={preferences}
+    repositoryReview={repositoryReview} pullRequestConversation={pullRequestConversation}
+    loadState={loadState} loading={loading}
     targetPathCount={targetPathCount} onLoadMore={loadMoreFiles}
     selectedLines={selectedLines} annotatedItems={annotatedItems} threadsByPath={threadsByPath}
     collapsedItemIds={collapsedItemIds} viewedPaths={viewedPaths}

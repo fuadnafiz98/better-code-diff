@@ -10,6 +10,7 @@ import {
   mergeReviewItems,
   orderReviewItems,
   pathFromReviewItemId as pathFromItemId,
+  retainReviewItems,
   reviewItemId as itemId
 } from './reviewItems'
 import { resetReviewFileMetrics, setLoadedReviewItemCount } from './reviewMetrics'
@@ -34,10 +35,83 @@ const EMPTY_LOAD_STATE: ReviewLoadState = {
 
 export const FOLDER_REVIEW_PAGE_SIZE = 50
 
+// A streamed pull request review whose fetch dies mid-flight leaves
+// `expectedFileCount` above what actually arrived, and `loading` then stays true
+// for the rest of the session: permanent spinner, no scroll restore, no pill.
+// The fetch collapses the count on both of its own exits, so this only has to
+// cover the case where neither runs.
+export const STREAM_STALL_MS = 25_000
+
+export interface ReviewProgressInput {
+  /** GitHub's own file count for a streamed review; null for anything else. */
+  streamingFileCount: number | null
+  /** Files the streamed review has actually delivered so far. */
+  streamedFileCount: number
+  /** True once the stream has gone quiet for longer than the stall window. */
+  streamStalled: boolean
+  hasExternalReview: boolean
+  loadedPathCount: number
+  stablePathCount: number
+  paged: boolean
+  loadLimit: number
+}
+
+export interface ReviewProgress {
+  loading: boolean
+  targetPathCount: number
+}
+
+export function reviewProgress({
+  streamingFileCount,
+  streamedFileCount,
+  streamStalled,
+  hasExternalReview,
+  loadedPathCount,
+  stablePathCount,
+  paged,
+  loadLimit
+}: ReviewProgressInput): ReviewProgress {
+  // A streamed review knows how many files to expect before it has them, so the
+  // count it is climbing towards is GitHub's, not what has arrived.
+  const targetPathCount = streamingFileCount != null
+    ? Math.max(streamingFileCount, stablePathCount)
+    : paged
+      ? Math.min(loadLimit, stablePathCount)
+      : stablePathCount
+  const loading = !hasExternalReview
+    ? loadedPathCount < targetPathCount
+    : streamingFileCount != null && !streamStalled && streamedFileCount < streamingFileCount
+  return { loading, targetPathCount }
+}
+
 interface ParsedPatchCache {
   key: string
   length: number
+  /** The bytes immediately before `length`, i.e. the seam an append slices from. */
+  tail: string
   items: CodeViewItem<ReviewAnnotationMetadata>[]
+}
+
+const PATCH_SEAM_SAMPLE = 4_096
+
+function patchSeam(patch: string): string {
+  return patch.length <= PATCH_SEAM_SAMPLE ? patch : patch.slice(patch.length - PATCH_SEAM_SAMPLE)
+}
+
+/**
+ * Whether the incremental tail parse can trust `parsed.length` as an offset into
+ * `patch`. Comparing lengths alone assumed the stream can only ever append: a page
+ * re-emitted with different bytes would have been sliced mid-hunk and parsed into
+ * silently wrong items, so the seam the slice starts at is checked too.
+ */
+export function canAppendPatch(
+  parsed: Pick<ParsedPatchCache, 'key' | 'length' | 'tail'>,
+  key: string,
+  patch: string
+): boolean {
+  return parsed.key === key
+    && patch.length >= parsed.length
+    && patch.startsWith(parsed.tail, parsed.length - parsed.tail.length)
 }
 
 interface ExternalReviewItems {
@@ -60,6 +134,21 @@ interface ReviewLoadStateApi {
   loadMoreFiles(): void
 }
 
+export function reviewLoadStateFromExternalItems(
+  items: CodeViewItem<ReviewAnnotationMetadata>[],
+  stablePaths: readonly string[],
+  omittedFiles: ReviewLoadState['omittedFiles']
+): ReviewLoadState {
+  return {
+    items,
+    loadedPaths: new Set(stablePaths),
+    omittedFiles,
+    failedCount: 0,
+    skippedCount: Math.max(0, stablePaths.length - items.length - omittedFiles.length),
+    paged: false
+  }
+}
+
 export function useReviewLoadState({
   pathsKey,
   stablePaths,
@@ -69,36 +158,35 @@ export function useReviewLoadState({
 }: ReviewLoadStateOptions): ReviewLoadStateApi {
   const loadedPathsKeyRef = useRef<string | null>(null)
   const loadedPageCountRef = useRef(0)
-  const [loadState, setLoadState] = useState<ReviewLoadState>(EMPTY_LOAD_STATE)
+  const [folderLoadState, setFolderLoadState] = useState<ReviewLoadState>(EMPTY_LOAD_STATE)
   const [pagination, setPagination] = useState({ key: '', limit: FOLDER_REVIEW_PAGE_SIZE })
   const loadLimit = pagination.key === pathsKey ? pagination.limit : FOLDER_REVIEW_PAGE_SIZE
-  // A streamed pull request review knows how many files to expect before it has
-  // them, so the count it is climbing towards is GitHub's, not what has arrived.
   const streamingFileCount = repositoryReview?.kind === 'github'
     ? repositoryReview.expectedFileCount
     : null
-  const targetPathCount = streamingFileCount != null
-    ? Math.max(streamingFileCount, stablePaths.length)
-    : loadState.paged
-      ? Math.min(loadLimit, stablePaths.length)
-      : stablePaths.length
-  const loading = repositoryReview == null
-    ? loadState.loadedPaths.size < targetPathCount
-    : streamingFileCount != null && repositoryReview.files.length < streamingFileCount
+  const streamedFileCount = repositoryReview?.files.length ?? 0
+  // The key moves whenever the stream makes progress, which restarts the timer;
+  // it only fires when nothing has arrived for the whole window.
+  const streamKey = repositoryReview?.kind === 'github'
+    ? `${repositoryReview.selector}:${streamedFileCount}:${streamingFileCount}`
+    : null
+  const [stalledStreamKey, setStalledStreamKey] = useState<string | null>(null)
+  const streamStalled = streamKey != null && stalledStreamKey === streamKey
+
   const loadMoreFiles = useCallback(() => {
     setPagination({ key: pathsKey, limit: loadLimit + FOLDER_REVIEW_PAGE_SIZE })
   }, [loadLimit, pathsKey])
 
   // Streaming appends to the patch, so only the new tail is parsed. Re-parsing the
   // whole document on every page turned a 13 MB review into quadratic work.
-  const parsedPatchRef = useRef<ParsedPatchCache>({ key: '', length: 0, items: [] })
+  const parsedPatchRef = useRef<ParsedPatchCache>({ key: '', length: 0, tail: '', items: [] })
   const externalReview = useMemo<ExternalReviewItems | null>(() => {
     if (repositoryReview == null) return null
     const key = repositoryReview.kind === 'github'
       ? `pr-${repositoryReview.pullRequest.number}-${repositoryReview.pullRequest.updatedAt}`
       : repositoryReview.id
     const parsed = parsedPatchRef.current
-    const appended = parsed.key === key && repositoryReview.patch.length >= parsed.length
+    const appended = canAppendPatch(parsed, key, repositoryReview.patch)
     const pending = appended ? repositoryReview.patch.slice(parsed.length) : repositoryReview.patch
     const pendingItems = pending === ''
       ? []
@@ -107,45 +195,65 @@ export function useReviewLoadState({
     // file or lose one.
     const items = appended ? mergeReviewItems(parsed.items, pendingItems) : pendingItems
     return {
-      cache: { key, length: repositoryReview.patch.length, items },
+      cache: {
+        key,
+        length: repositoryReview.patch.length,
+        tail: patchSeam(repositoryReview.patch),
+        items
+      },
       items: orderReviewItems(items, stablePaths)
     }
   }, [repositoryReview, stablePaths])
-  const externalReviewItems = externalReview?.items ?? null
-
   useEffect(() => {
     if (externalReview != null) parsedPatchRef.current = externalReview.cache
   }, [externalReview])
+  const externalReviewItems = externalReview?.items ?? null
+  const externalLoadState = useMemo(() => {
+    if (externalReviewItems == null) return null
+    return reviewLoadStateFromExternalItems(
+      externalReviewItems,
+      stablePaths,
+      repositoryReview?.omittedFiles ?? []
+    )
+  }, [externalReviewItems, repositoryReview, stablePaths])
+  const loadState = externalLoadState ?? folderLoadState
+  const { loading, targetPathCount } = reviewProgress({
+    streamingFileCount,
+    streamedFileCount,
+    streamStalled,
+    hasExternalReview: repositoryReview != null,
+    loadedPathCount: loadState.loadedPaths.size,
+    stablePathCount: stablePaths.length,
+    paged: loadState.paged,
+    loadLimit
+  })
+
+  useEffect(() => {
+    if (streamKey == null || !loading) return
+    const timer = setTimeout(() => setStalledStreamKey(streamKey), STREAM_STALL_MS)
+    return () => clearTimeout(timer)
+  }, [loading, streamKey])
 
   useEffect(() => {
     let cancelled = false
-    if (externalReviewItems != null) {
-      setLoadState({
-        items: externalReviewItems,
-        loadedPaths: new Set(stablePaths),
-        omittedFiles: repositoryReview?.omittedFiles ?? [],
-        failedCount: 0,
-        // Omitted files are already counted as omitted; without this they were also
-        // reported as skipped, so the progress pill showed the same number twice.
-        skippedCount: Math.max(
-          0,
-          stablePaths.length - externalReviewItems.length - (repositoryReview?.omittedFiles.length ?? 0)
-        ),
-        paged: false
-      })
-      return
-    }
+    if (externalReviewItems != null) return
     const isNewPathSet = loadedPathsKeyRef.current !== pathsKey
     loadedPathsKeyRef.current = pathsKey
     if (isNewPathSet) {
       loadedPageCountRef.current = 0
-      setLoadState(EMPTY_LOAD_STATE)
+      // Whatever is on screen stays there while the new patch is fetched. Emptying
+      // the list dropped the viewer to its loading state, and returning from that
+      // remounted it — the reader lost their scroll position and every file had to
+      // be highlighted again, on every `git add` and every new untracked file.
+      setFolderLoadState((current) => current.items.length === 0
+        ? EMPTY_LOAD_STATE
+        : { ...EMPTY_LOAD_STATE, items: retainReviewItems(current.items, stablePaths) })
     }
 
     async function loadComparisons(): Promise<void> {
       const repository = window.repository
       if (repository == null) {
-        setLoadState({
+        setFolderLoadState({
           ...EMPTY_LOAD_STATE,
           loadedPaths: new Set(stablePaths),
           failedCount: stablePaths.length
@@ -162,7 +270,7 @@ export function useReviewLoadState({
             `working-tree-${Date.now()}`
           ), stablePaths)
           if (items.length > 0 || stablePaths.length === 0) {
-            setLoadState({
+            setFolderLoadState({
               items,
               loadedPaths: new Set(stablePaths),
               omittedFiles: workingTreePatch.omittedFiles,
@@ -196,7 +304,7 @@ export function useReviewLoadState({
         loadedPageCountRef.current = pageStart + start + batchPaths.length
 
         startTransition(() => {
-          setLoadState((current) => {
+          setFolderLoadState((current) => {
             const loadedPaths = new Set(current.loadedPaths)
             const incomingItems: CodeViewItem<ReviewAnnotationMetadata>[] = []
             let failedCount = current.failedCount
@@ -260,7 +368,7 @@ export function useReviewLoadState({
       if (cancelled) return
       startTransition(() => {
         onPathsReloaded(results.map((result) => result.path))
-        setLoadState((current) => {
+        setFolderLoadState((current) => {
           const replacements = new Map(results.map((result) => [itemId(result.path), result.item]))
           const nextItems = current.items.flatMap((item) => {
             if (!replacements.has(item.id)) return [item]

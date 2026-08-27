@@ -1,11 +1,10 @@
 import { access } from 'node:fs/promises'
 import { constants as fileConstants } from 'node:fs'
 import { spawn } from 'node:child_process'
-import {
-  query as queryClaude,
-  type CanUseTool,
-  type Options as ClaudeOptions,
-  type PermissionMode
+import type {
+  CanUseTool,
+  Options as ClaudeOptions,
+  PermissionMode
 } from '@anthropic-ai/claude-agent-sdk'
 
 import type {
@@ -22,7 +21,7 @@ import {
   AGENT_READ_ONLY_TOOLS,
   AGENT_REVIEW_TOOLS,
   createAgentTextReader,
-  interpretAgentLine,
+  interpretAgentEnvelope,
   parseAgentAskRequest,
   type AgentAskRequest
 } from './agentRequest.js'
@@ -33,8 +32,28 @@ const CLAUDE_CANDIDATES = [
   '/usr/local/bin/claude'
 ] as const
 const CODEX_CANDIDATES = ['/opt/homebrew/bin/codex', '/usr/local/bin/codex'] as const
-const MAX_AGENT_RUNTIME_MS = 300_000
+// An agentic turn that reads files and runs tests routinely passes five minutes
+// of wall clock while streaming the whole way, so what is capped is silence.
+const AGENT_IDLE_TIMEOUT_MS = 120_000
+const MAX_AGENT_RUNTIME_MS = 1_800_000
 const AGENT_STATUS_TIMEOUT_MS = 10_000
+// Probing a provider costs a `--version` plus an auth spawn (measured 0.44 s for
+// claude); the panel opens often enough that repeating that per open is the
+// latency users read as "the agent is slow to start".
+const AGENT_STATUS_TTL_MS = 30_000
+const AGENT_MODELS_TTL_MS = 600_000
+
+type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
+
+// The SDK is 1.4 MB of JavaScript: importing it statically costs ~79 ms and
+// ~16 MB of heap in every cold start, before the window exists, even for the
+// runs where the agent is never opened.
+let claudeSdkPromise: Promise<ClaudeSdk> | null = null
+
+function loadClaudeSdk(): Promise<ClaudeSdk> {
+  claudeSdkPromise ??= import('@anthropic-ai/claude-agent-sdk')
+  return claudeSdkPromise
+}
 
 export type AgentEvent = AgentStreamEvent
 
@@ -88,10 +107,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 async function* idleClaudeInput(): AsyncGenerator<never, void, unknown> {
-  await new Promise<never>(() => {})
+  yield await new Promise<never>(() => {})
 }
 
 async function listClaudeModels(executable: string, cwd: string): Promise<AgentModelCatalog['claude']> {
+  const { query: queryClaude } = await loadClaudeSdk()
   const runtime = queryClaude({
     prompt: idleClaudeInput(),
     options: {
@@ -205,11 +225,15 @@ async function getProviderStatus(provider: AgentProvider): Promise<AgentProvider
   const candidates = provider === 'claude' ? CLAUDE_CANDIDATES : CODEX_CANDIDATES
   const fallback = provider === 'claude' ? 'claude' : 'codex'
   const executable = await resolveExecutable(candidates, fallback)
-  const version = await executableVersion(executable)
+  // The version probe and the auth probe are independent spawns; running them
+  // together halves the wall time the panel waits on.
+  const [version, result] = await Promise.all([
+    executableVersion(executable),
+    runProcess(executable, provider === 'claude' ? ['auth', 'status'] : ['login', 'status'])
+      .catch((error: unknown) => error instanceof Error ? error : new Error(`Could not check ${provider}.`))
+  ])
   try {
-    const result = await runProcess(executable, provider === 'claude'
-      ? ['auth', 'status']
-      : ['login', 'status'])
+    if (result instanceof Error) throw result
     if (provider === 'claude') {
       const parsed = JSON.parse(result.stdout) as Record<string, unknown>
       const authenticated = parsed.loggedIn === true
@@ -248,6 +272,48 @@ async function getProviderStatus(provider: AgentProvider): Promise<AgentProvider
   }
 }
 
+const AGENT_TEXT_COALESCE_MS = 16
+
+// One IPC message per token delta is 30-80 sends, setStates and full-transcript
+// renders a second. Text is the only event kind that concatenates, so it is
+// batched to about a frame; every other kind is sent immediately, after the text
+// that preceded it, so the transcript order is preserved.
+export function coalesceAgentTextEvents(send: (event: AgentEvent) => void): {
+  emit(event: AgentEvent): void
+  flush(): void
+} {
+  let pendingId: string | null = null
+  let pendingText = ''
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  const flush = (): void => {
+    if (timer != null) {
+      clearTimeout(timer)
+      timer = null
+    }
+    if (pendingId == null) return
+    const payload: AgentEvent = { id: pendingId, kind: 'text', text: pendingText }
+    pendingId = null
+    pendingText = ''
+    send(payload)
+  }
+
+  return {
+    emit(event) {
+      if (event.kind === 'text' && event.text != null) {
+        if (pendingId !== event.id) flush()
+        pendingId = event.id
+        pendingText += event.text
+        timer ??= setTimeout(flush, AGENT_TEXT_COALESCE_MS)
+        return
+      }
+      flush()
+      send(event)
+    },
+    flush
+  }
+}
+
 export class AgentService {
   #active = new Map<string, { close(): void }>()
   // Reused across turns: starting the app-server also starts the user's MCP
@@ -258,13 +324,27 @@ export class AgentService {
     agentRequestId: string
     resolve(decision: AgentApprovalDecision): void
   }>()
+  // Model discovery starts a codex app-server and a Claude runtime; the panel is
+  // toggled far more often than the installed models change.
+  #models = new Map<string, { catalog: AgentModelCatalog; expires: number }>()
+  #statuses = new Map<AgentProvider, { value: AgentProviderStatus; expires: number }>()
+
+  async #providerStatus(provider: AgentProvider, force = false): Promise<AgentProviderStatus> {
+    const cached = this.#statuses.get(provider)
+    if (!force && cached != null && cached.expires > Date.now()) return cached.value
+    const value = await getProviderStatus(provider)
+    this.#statuses.set(provider, { value, expires: Date.now() + AGENT_STATUS_TTL_MS })
+    return value
+  }
 
   async getModels(cwd: string): Promise<AgentModelCatalog> {
+    const cached = this.#models.get(cwd)
+    if (cached != null && cached.expires > Date.now()) return cached.catalog
     const [claudeExecutable, codexExecutable] = await Promise.all([
       resolveExecutable(CLAUDE_CANDIDATES, 'claude'),
       resolveExecutable(CODEX_CANDIDATES, 'codex')
     ])
-    let codex: AgentModelCatalog['codex'] = [{
+    const fallbackCodex: AgentModelCatalog['codex'] = [{
       id: 'default',
       label: 'Codex default',
       description: 'Uses the default model in your Codex configuration.',
@@ -272,22 +352,28 @@ export class AgentService {
       defaultEffort: 'high',
       default: true
     }]
-    try {
-      const discovered = await this.#codex.listModels(codexExecutable, cwd)
-      if (discovered.length > 0) codex = discovered
-    } catch {}
-    let claude = CLAUDE_MODELS
-    try {
-      const discovered = await listClaudeModels(claudeExecutable, cwd)
-      if (discovered.length > 0) claude = discovered
-    } catch {}
-    return { claude, codex }
+    // Both providers are asked at once: they are separate processes, and running
+    // them in sequence made panel-open wait for the slower one twice over.
+    const [codex, claude] = await Promise.all([
+      this.#codex.listModels(codexExecutable, cwd)
+        .then((discovered) => discovered.length > 0 ? discovered : fallbackCodex)
+        .catch(() => fallbackCodex),
+      listClaudeModels(claudeExecutable, cwd)
+        .then((discovered) => discovered.length > 0 ? discovered : CLAUDE_MODELS)
+        .catch(() => CLAUDE_MODELS)
+    ])
+    const catalog: AgentModelCatalog = { claude, codex }
+    this.#models.set(cwd, { catalog, expires: Date.now() + AGENT_MODELS_TTL_MS })
+    return catalog
   }
 
-  async getStatuses(): Promise<AgentProviderStatuses> {
+  async getStatuses(providerValue?: unknown): Promise<AgentProviderStatuses> {
+    // A sign-in poll names the provider it is waiting for; the other one keeps
+    // its cached answer instead of spawning two more probes per tick.
+    const refreshed = providerValue === 'claude' || providerValue === 'codex' ? providerValue : null
     const [claude, codex] = await Promise.all([
-      getProviderStatus('claude'),
-      getProviderStatus('codex')
+      this.#providerStatus('claude', refreshed === 'claude'),
+      this.#providerStatus('codex', refreshed === 'codex')
     ])
     return { claude, codex }
   }
@@ -297,6 +383,8 @@ export class AgentService {
       throw new Error('The agent provider is not valid.')
     }
     const provider: AgentProvider = providerValue
+    this.#statuses.delete(provider)
+    this.#models.clear()
     const executable = await resolveExecutable(
       provider === 'claude' ? CLAUDE_CANDIDATES : CODEX_CANDIDATES,
       provider
@@ -341,7 +429,7 @@ export class AgentService {
   }
 
   cancelAll(): void {
-    for (const id of [...this.#active.keys()]) this.cancel(id)
+    for (const id of this.#active.keys()) this.cancel(id)
     this.#codexRequests.clear()
     for (const pending of this.#pendingApprovals.values()) pending.resolve('decline')
     this.#pendingApprovals.clear()
@@ -540,6 +628,7 @@ export class AgentService {
       }
     }
 
+    const { query: queryClaude } = await loadClaudeSdk()
     const runtime = queryClaude({
       prompt: composeAgentPrompt(request.prompt, request.context),
       options: {
@@ -561,18 +650,31 @@ export class AgentService {
       }
     })
     this.#active.set(request.id, runtime)
-    let timedOut = false
-    const timeout = setTimeout(() => {
-      timedOut = true
-      runtime.close()
-    }, MAX_AGENT_RUNTIME_MS)
+    // The cap is on silence, not on length: the timer is re-armed by every
+    // message, and only the absolute ceiling ends a turn that is still talking.
+    const deadline = Date.now() + MAX_AGENT_RUNTIME_MS
+    const expiry: { reason: 'idle' | 'limit' | null; timer: ReturnType<typeof setTimeout> | null } = {
+      reason: null,
+      timer: null
+    }
+    const armTimeout = (): void => {
+      if (expiry.timer != null) clearTimeout(expiry.timer)
+      const remaining = deadline - Date.now()
+      const reachedLimit = remaining <= AGENT_IDLE_TIMEOUT_MS
+      expiry.timer = setTimeout(() => {
+        expiry.reason = reachedLimit ? 'limit' : 'idle'
+        runtime.close()
+      }, Math.max(0, reachedLimit ? remaining : AGENT_IDLE_TIMEOUT_MS))
+    }
+    armTimeout()
     const readText = createAgentTextReader()
     let failure: string | null = null
     let emittedSessionId: string | null = null
     try {
       for await (const message of runtime) {
         if (!this.#active.has(request.id)) return
-        const chunk = interpretAgentLine(JSON.stringify(message), request.accessMode)
+        armTimeout()
+        const chunk = interpretAgentEnvelope(message as unknown as Record<string, unknown>, request.accessMode)
         if (chunk == null) continue
         for (const activity of chunk.activities ?? (chunk.activity == null ? [] : [chunk.activity])) {
           emit({ id: request.id, kind: 'activity', activity })
@@ -593,7 +695,7 @@ export class AgentService {
         }
       }
     } finally {
-      clearTimeout(timeout)
+      if (expiry.timer != null) clearTimeout(expiry.timer)
       runtime.close()
       this.#active.delete(request.id)
       for (const [approvalId, pending] of this.#pendingApprovals) {
@@ -602,8 +704,14 @@ export class AgentService {
         pending.resolve('decline')
       }
     }
-    emit(timedOut
-      ? { id: request.id, kind: 'error', text: 'Claude took too long to answer.' }
+    emit(expiry.reason != null
+      ? {
+          id: request.id,
+          kind: 'error',
+          text: expiry.reason === 'idle'
+            ? 'Claude stopped responding.'
+            : 'Claude reached the maximum turn length.'
+        }
       : failure == null
         ? { id: request.id, kind: 'done' }
         : { id: request.id, kind: 'error', text: failure })
@@ -623,7 +731,11 @@ export class AgentService {
       ? await resolveExecutable(CLAUDE_CANDIDATES, 'claude')
       : await resolveExecutable(CODEX_CANDIDATES, 'codex')
 
-    const status = await getProviderStatus(request.provider)
+    // A cached "connected" is trusted — the provider's own error surfaces if the
+    // token expired — but a cached refusal is re-probed before it blocks a user
+    // who has just signed in.
+    const cached = await this.#providerStatus(request.provider)
+    const status = cached.authenticated ? cached : await this.#providerStatus(request.provider, true)
     if (!status.authenticated) {
       throw new Error(`${request.provider === 'claude' ? 'Claude Code' : 'Codex'} is not connected. Select Sign in in the agent panel.`)
     }

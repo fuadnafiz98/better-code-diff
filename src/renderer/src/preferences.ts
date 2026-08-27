@@ -22,8 +22,16 @@ export interface AppPreferences {
   showLineNumbers: boolean
   wordWrap: boolean
   foldUnchanged: boolean
+  autosaveOnBlur: boolean
+  terminalScrollback: number
+  restoreLastFolder: boolean
   keybindings: KeybindingMap
+  // Bumped when a default shortcut is retired, so the migration that drops the
+  // old default from storage runs once instead of on every load.
+  keybindingsVersion: number
 }
+
+export const KEYBINDINGS_VERSION = 2
 
 export const CODE_FONTS: Record<CodeFont, { label: string; fontFamily: string }> = {
   'fira-code': {
@@ -87,7 +95,11 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   showLineNumbers: true,
   wordWrap: false,
   foldUnchanged: true,
-  keybindings: DEFAULT_KEYBINDINGS
+  autosaveOnBlur: false,
+  terminalScrollback: 5_000,
+  restoreLastFolder: true,
+  keybindings: DEFAULT_KEYBINDINGS,
+  keybindingsVersion: KEYBINDINGS_VERSION
 }
 
 const STORAGE_KEY = 'better-code-diff:preferences:v1'
@@ -114,18 +126,46 @@ export function loadPreferences(): AppPreferences {
         : DEFAULT_PREFERENCES.showLineNumbers,
       wordWrap: typeof parsed.wordWrap === 'boolean' ? parsed.wordWrap : DEFAULT_PREFERENCES.wordWrap,
       foldUnchanged: typeof parsed.foldUnchanged === 'boolean' ? parsed.foldUnchanged : DEFAULT_PREFERENCES.foldUnchanged,
-      keybindings: loadKeybindings(parsed.keybindings)
+      autosaveOnBlur: typeof parsed.autosaveOnBlur === 'boolean'
+        ? parsed.autosaveOnBlur
+        : DEFAULT_PREFERENCES.autosaveOnBlur,
+      terminalScrollback: clampNumber(
+        parsed.terminalScrollback,
+        1_000,
+        50_000,
+        DEFAULT_PREFERENCES.terminalScrollback
+      ),
+      restoreLastFolder: typeof parsed.restoreLastFolder === 'boolean'
+        ? parsed.restoreLastFolder
+        : DEFAULT_PREFERENCES.restoreLastFolder,
+      keybindings: loadKeybindings(parsed.keybindings, parsed.keybindingsVersion),
+      keybindingsVersion: KEYBINDINGS_VERSION
     }
   } catch {
     return DEFAULT_PREFERENCES
   }
 }
 
-function loadKeybindings(value: Partial<KeybindingMap> | undefined): KeybindingMap {
+// ⌘⌥F now belongs to the editor's find-in-selection, so the fold shortcut moved
+// to ⌘⌥U. Anyone who never rebound it kept the old default in localStorage.
+const RETIRED_DEFAULT_KEYBINDINGS: Partial<Record<keyof KeybindingMap, string>> = {
+  toggleFoldUnchanged: 'Meta+Alt+KeyF'
+}
+
+export function loadKeybindings(
+  value: Partial<KeybindingMap> | undefined,
+  savedVersion: number | undefined
+): KeybindingMap {
   if (value == null || typeof value !== 'object') return DEFAULT_KEYBINDINGS
+  // The retired defaults are dropped exactly once. Without the version check,
+  // deliberately binding fold back onto ⌘⌥F would be undone on every launch.
+  const migrating = savedVersion !== KEYBINDINGS_VERSION
   const keybindings = { ...DEFAULT_KEYBINDINGS }
   for (const command of Object.keys(DEFAULT_KEYBINDINGS) as Array<keyof KeybindingMap>) {
-    if (typeof value[command] === 'string') keybindings[command] = value[command]
+    const saved = value[command]
+    if (typeof saved !== 'string') continue
+    if (migrating && saved === RETIRED_DEFAULT_KEYBINDINGS[command]) continue
+    keybindings[command] = saved
   }
   return keybindings
 }

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 
-import { createAgentTextReader, interpretAgentLine, parseAgentAskRequest } from './agentRequest.js'
+import {
+  createAgentTextReader,
+  interpretAgentEnvelope,
+  interpretAgentLine,
+  parseAgentAskRequest
+} from './agentRequest.js'
 
 function readAll(lines: readonly string[]): string {
   const read = createAgentTextReader()
@@ -55,6 +60,11 @@ describe('interpretAgentLine', () => {
     expect(interpretAgentLine('   ')).toBeNull()
     expect(interpretAgentLine('{not json')).toBeNull()
   })
+
+  it('reads an already-parsed envelope the same way as its serialized form', () => {
+    const envelope = { type: 'stream_event', event: { delta: { text: 'a' } } }
+    expect(interpretAgentEnvelope(envelope)).toEqual(interpretAgentLine(JSON.stringify(envelope)))
+  })
 })
 
 describe('parseAgentAskRequest', () => {
@@ -89,6 +99,64 @@ describe('parseAgentAskRequest', () => {
       ...valid,
       model: '--dangerously-skip-permissions'
     })).rejects.toThrow('selected agent model')
+  })
+
+  it('rejects anything that is not a plain object', async () => {
+    for (const value of [null, undefined, 'request', 42, [valid], new Date()]) {
+      await expect(parseAgentAskRequest(value)).rejects.toThrow('not understood')
+    }
+  })
+
+  it('rejects a missing or mistyped field on every required key', async () => {
+    for (const key of ['id', 'model', 'effort', 'prompt', 'context'] as const) {
+      await expect(parseAgentAskRequest({ ...valid, [key]: 7 })).rejects.toThrow('not understood')
+      const missing: Record<string, unknown> = { ...valid }
+      delete missing[key]
+      await expect(parseAgentAskRequest(missing)).rejects.toThrow('not understood')
+    }
+  })
+
+  it('rejects an unknown access mode and a non-string session id', async () => {
+    await expect(parseAgentAskRequest({ ...valid, accessMode: 'root' })).rejects.toThrow('not understood')
+    await expect(parseAgentAskRequest({ ...valid, resumeSessionId: 7 })).rejects.toThrow('not understood')
+  })
+
+  it('rejects an id that is blank or long enough to be a payload', async () => {
+    await expect(parseAgentAskRequest({ ...valid, id: '  ' })).rejects.toThrow('could not be identified')
+    await expect(parseAgentAskRequest({ ...valid, id: 'x'.repeat(129) })).rejects.toThrow('could not be identified')
+  })
+
+  it('rejects an effort that is not a plain token', async () => {
+    await expect(parseAgentAskRequest({ ...valid, effort: 'high; rm -rf /' })).rejects.toThrow('reasoning effort')
+  })
+
+  it('drops extra keys instead of forwarding them to the CLI', async () => {
+    const parsed = await parseAgentAskRequest({ ...valid, cwd: '/etc', argv: ['--print'] })
+
+    expect(parsed).toEqual(valid)
+    expect('cwd' in parsed).toBe(false)
+  })
+
+  it('refuses a swapped prototype and ignores a polluted __proto__ key', async () => {
+    await expect(parseAgentAskRequest({ ...valid, __proto__: { provider: 'codex' } }))
+      .rejects.toThrow('not understood')
+
+    const polluted = JSON.parse(
+      `{"__proto__":{"accessMode":"full-access"},${JSON.stringify(valid).slice(1)}`
+    ) as unknown
+    expect(await parseAgentAskRequest(polluted)).toEqual(valid)
+    expect(({} as { accessMode?: string }).accessMode).toBeUndefined()
+  })
+
+  it('trims the prompt and caps the context the renderer sends', async () => {
+    const parsed = await parseAgentAskRequest({
+      ...valid,
+      prompt: '  Explain  ',
+      context: 'c'.repeat(500_000)
+    })
+
+    expect(parsed.prompt).toBe('Explain')
+    expect(parsed.context).toHaveLength(400_000)
   })
 })
 

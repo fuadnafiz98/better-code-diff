@@ -2,9 +2,66 @@ import { describe, expect, test } from 'bun:test'
 
 import type { CodeViewItem } from '@pierre/diffs'
 
-import { deriveAnnotatedReviewItems, planAnnotatedReviewItemMutations } from './annotatedReviewItems'
-import { findActiveReviewItemId, mergeReviewItems, orderReviewItems } from './reviewItems'
-import type { ReviewAnnotationMetadata } from './ReviewComments'
+import {
+  annotationSignature,
+  deriveAnnotatedReviewItems,
+  planAnnotatedReviewItemMutations
+} from './annotatedReviewItems'
+import {
+  createPatchReviewItems,
+  findActiveReviewItemId,
+  mergeReviewItems,
+  orderReviewItems,
+  retainReviewItems
+} from './reviewItems'
+import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
+import type { RemoteReviewThread } from '../../shared/contracts'
+
+describe('createPatchReviewItems', () => {
+  test('parses a GitHub unified diff into CodeView items on the same tick', () => {
+    const patch = [
+      'diff --git a/src/value.ts b/src/value.ts',
+      'index 1111111..2222222 100644',
+      '--- a/src/value.ts',
+      '+++ b/src/value.ts',
+      '@@ -1,3 +1,4 @@',
+      ' export const value = 1',
+      '-export const next = 2',
+      '+export const next = 3',
+      '+export const extra = 4',
+      ' export const keep = 5',
+      'diff --git a/README.md b/README.md',
+      'new file mode 100644',
+      'index 0000000..3333333',
+      '--- /dev/null',
+      '+++ b/README.md',
+      '@@ -0,0 +1 @@',
+      '+# Review notes'
+    ].join('\n') + '\n'
+
+    const items = createPatchReviewItems(patch, 'pr-1092')
+    expect(items.map((item) => item.id)).toEqual(['review:src/value.ts', 'review:README.md'])
+    expect(items.every((item) => item.type === 'diff')).toBe(true)
+  })
+
+  test('parses a files-API rebuilt patch that only has hunks plus git headers', () => {
+    const patch = [
+      'diff --git a/src/page.tsx b/src/page.tsx',
+      '--- a/src/page.tsx',
+      '+++ b/src/page.tsx',
+      '@@ -10,2 +10,3 @@',
+      '   return (',
+      '-    <main />',
+      '+    <main>',
+      '+      <h1>Ready</h1>',
+      '    </main>'
+    ].join('\n') + '\n'
+
+    const items = createPatchReviewItems(patch, 'pr-files-api')
+    expect(items).toHaveLength(1)
+    expect(items[0]?.id).toBe('review:src/page.tsx')
+  })
+})
 
 describe('multi-file review items', () => {
   test('replaces duplicate IDs instead of passing duplicates to CodeView', () => {
@@ -61,6 +118,219 @@ describe('multi-file review items', () => {
     )
     expect(mutations.additions).toHaveLength(0)
     expect(mutations.updates).toEqual([next.items[25]!])
+    expect(mutations.removedIds).toEqual([])
+    expect(mutations.appendOnly).toBe(true)
+  })
+})
+
+describe('annotated review item versions', () => {
+  const fileItem = (contents: string): CodeViewItem<ReviewAnnotationMetadata> => ({
+    id: 'review:file.ts',
+    type: 'file',
+    file: { name: 'file.ts', contents, cacheKey: contents }
+  }) as CodeViewItem<ReviewAnnotationMetadata>
+  const common = {
+    threadsByPath: {},
+    remoteThreadsByPath: new Map(),
+    draftComment: null,
+    pendingSelection: null,
+    collapsedItemIds: new Set<string>(),
+    annotationVersions: {}
+  }
+
+  // CodeView.syncItemRecord treats an unchanged version as "keep what you have"
+  // and drops the update, so a re-parsed file needs a new version to reach it.
+  test('bumps the version when the same file is re-parsed with unchanged annotations', () => {
+    const initial = deriveAnnotatedReviewItems({ ...common, items: [fileItem('old')], previousCache: new Map() })
+    const next = deriveAnnotatedReviewItems({
+      ...common,
+      items: [fileItem('new')],
+      previousCache: initial.cache,
+      previousItems: initial.items
+    })
+    expect(next.items[0]).not.toBe(initial.items[0])
+    expect(next.items[0]!.version).not.toBe(initial.items[0]!.version)
+  })
+
+  test('keeps the items array identity when nothing changed', () => {
+    const items = [fileItem('same')]
+    const initial = deriveAnnotatedReviewItems({ ...common, items, previousCache: new Map() })
+    const next = deriveAnnotatedReviewItems({
+      ...common,
+      items,
+      remoteThreadsByPath: new Map(),
+      previousCache: initial.cache,
+      previousItems: initial.items
+    })
+    expect(next.items).toBe(initial.items)
+    expect(next.cache).toBe(initial.cache)
+  })
+
+  test('rebuilds when a remote thread arrives with the same identity-different shape', () => {
+    const items = [fileItem('same')]
+    const thread = (body: string): RemoteReviewThread => ({
+      id: 'thread-1',
+      path: 'file.ts',
+      line: 4,
+      startLine: null,
+      side: 'RIGHT',
+      resolved: false,
+      outdated: false,
+      comments: [{ id: 'comment-1', body, authorLogin: 'octocat', createdAt: '2026-01-01' }]
+    })
+    const initial = deriveAnnotatedReviewItems({
+      ...common,
+      items,
+      remoteThreadsByPath: new Map([['file.ts', [thread('looks good')]]]),
+      previousCache: new Map()
+    })
+    const unchanged = deriveAnnotatedReviewItems({
+      ...common,
+      items,
+      remoteThreadsByPath: new Map([['file.ts', [thread('looks good')]]]),
+      previousCache: initial.cache,
+      previousItems: initial.items
+    })
+    expect(unchanged.items).toBe(initial.items)
+
+    const edited = deriveAnnotatedReviewItems({
+      ...common,
+      items,
+      remoteThreadsByPath: new Map([['file.ts', [thread('looks bad!')]]]),
+      previousCache: initial.cache,
+      previousItems: initial.items
+    })
+    expect(edited.items).not.toBe(initial.items)
+    expect(edited.items[0]!.version).not.toBe(initial.items[0]!.version)
+  })
+})
+
+describe('annotationSignature', () => {
+  const range = { start: 1, end: 2, side: 'additions' as const }
+
+  test('separates an in-place body edit of the same length', () => {
+    const thread = (body: string): ReviewThread => ({
+      id: 'thread-1', body, lineNumber: 1, range, replies: [], resolved: false
+    })
+    expect(annotationSignature([thread('aaaa')], [], null, null, false, 0))
+      .not.toBe(annotationSignature([thread('aaab')], [], null, null, false, 0))
+  })
+
+  test('separates resolve, collapse and the draft range', () => {
+    const thread: ReviewThread = {
+      id: 'thread-1', body: 'note', lineNumber: 1, range, replies: [], resolved: false
+    }
+    const base = annotationSignature([thread], [], null, null, false, 0)
+    expect(annotationSignature([{ ...thread, resolved: true }], [], null, null, false, 0)).not.toBe(base)
+    expect(annotationSignature([thread], [], null, null, true, 0)).not.toBe(base)
+    expect(annotationSignature([thread], [], range, null, false, 0)).not.toBe(base)
+    expect(annotationSignature([thread], [], null, range, false, 0)).not.toBe(base)
+    expect(annotationSignature([thread], [], null, null, false, 1)).not.toBe(base)
+  })
+
+  test('catches an edit at either end of a long body', () => {
+    const long = (body: string): ReviewThread[] => [{
+      id: 'thread-1', body, lineNumber: 1, range, replies: [], resolved: false
+    }]
+    const filler = 'x'.repeat(400)
+    const base = annotationSignature(long(`head${filler}tail`), [], null, null, false, 0)
+    expect(annotationSignature(long(`HEAD${filler}tail`), [], null, null, false, 0)).not.toBe(base)
+    expect(annotationSignature(long(`head${filler}TAIL`), [], null, null, false, 0)).not.toBe(base)
+    expect(annotationSignature(long(`head${filler}tail!`), [], null, null, false, 0)).not.toBe(base)
+  })
+
+  test('is stable across identity-different but equal input', () => {
+    const thread = (): ReviewThread => ({
+      id: 'thread-1', body: 'note', lineNumber: 1, range, replies: [{ id: 'r1', body: 'ack' }], resolved: false
+    })
+    expect(annotationSignature([thread()], [], null, null, false, 0))
+      .toBe(annotationSignature([thread()], [], null, null, false, 0))
+  })
+})
+
+describe('planAnnotatedReviewItemMutations', () => {
+  const item = (path: string): CodeViewItem<ReviewAnnotationMetadata> => ({
+    id: `review:${path}`,
+    type: 'file',
+    file: { name: path, contents: path, cacheKey: path }
+  }) as CodeViewItem<ReviewAnnotationMetadata>
+
+  const previousMap = (items: readonly CodeViewItem<ReviewAnnotationMetadata>[]) =>
+    new Map(items.map((entry) => [entry.id, entry]))
+
+  test('treats a pure append as append-only', () => {
+    const first = item('a.ts')
+    const second = item('b.ts')
+    const mutations = planAnnotatedReviewItemMutations(
+      [first, second],
+      previousMap([first]),
+      (id) => id === first.id
+    )
+    expect(mutations.appendOnly).toBe(true)
+    expect(mutations.additions).toEqual([second])
+    expect(mutations.removedIds).toEqual([])
+  })
+
+  test('reports a departed file and stops being append-only', () => {
+    const first = item('a.ts')
+    const second = item('b.ts')
+    const mutations = planAnnotatedReviewItemMutations(
+      [second],
+      previousMap([first, second]),
+      () => true
+    )
+    expect(mutations.removedIds).toEqual([first.id])
+    expect(mutations.appendOnly).toBe(false)
+  })
+
+  test('is not append-only when a file joins the middle of the review', () => {
+    const first = item('a.ts')
+    const inserted = item('b.ts')
+    const last = item('c.ts')
+    const mutations = planAnnotatedReviewItemMutations(
+      [first, inserted, last],
+      previousMap([first, last]),
+      (id) => id !== inserted.id
+    )
+    expect(mutations.additions).toEqual([inserted])
+    expect(mutations.removedIds).toEqual([])
+    expect(mutations.appendOnly).toBe(false)
+  })
+
+  test('is not append-only when the existing files are reordered', () => {
+    const first = item('a.ts')
+    const second = item('b.ts')
+    const mutations = planAnnotatedReviewItemMutations(
+      [second, first],
+      previousMap([first, second]),
+      () => true
+    )
+    expect(mutations.removedIds).toEqual([])
+    expect(mutations.appendOnly).toBe(false)
+  })
+})
+
+describe('retainReviewItems', () => {
+  const item = (path: string): CodeViewItem => ({
+    id: `review:${path}`,
+    type: 'file',
+    file: { name: path, contents: path, cacheKey: path }
+  }) as CodeViewItem
+
+  test('keeps the items whose path is still part of the review', () => {
+    const kept = item('a.ts')
+    const dropped = item('b.ts')
+    expect(retainReviewItems([kept, dropped], ['a.ts', 'c.ts'])).toEqual([kept])
+  })
+
+  test('keeps review order rather than path order', () => {
+    const first = item('b.ts')
+    const second = item('a.ts')
+    expect(retainReviewItems([first, second], ['a.ts', 'b.ts'])).toEqual([first, second])
+  })
+
+  test('drops everything when no path survives', () => {
+    expect(retainReviewItems([item('a.ts')], [])).toEqual([])
   })
 })
 

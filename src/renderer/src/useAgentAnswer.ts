@@ -6,11 +6,12 @@ import type {
   AgentApprovalDecision,
   AgentApprovalRequest,
   AgentProvider,
+  AgentStreamEvent,
   AgentUsageUpdate
 } from '../../shared/contracts'
 import { getErrorMessage } from './repositoryApi'
 import {
-  advanceStreamingMarkdown,
+  appendStreamingMarkdown,
   EMPTY_STREAMING_MARKDOWN,
   type MarkdownBlock,
   type StreamingMarkdown
@@ -19,7 +20,7 @@ import { markAgentStreamEvent } from './reviewMetrics'
 
 const MAX_ANSWER_LENGTH = 200_000
 
-interface AgentAnswerState {
+export interface AgentAnswerState {
   answer: string
   streaming: boolean
   error: string | null
@@ -79,7 +80,7 @@ const MAX_ACTIVITY_ITEMS = 80
 const MAX_ACTIVITY_DETAIL_LENGTH = 20_000
 const MAX_ACTIVITY_OUTPUT_LENGTH = 12_000
 
-const EMPTY_ANSWER: AgentAnswerState = {
+export const EMPTY_ANSWER: AgentAnswerState = {
   answer: '',
   streaming: false,
   error: null,
@@ -118,56 +119,100 @@ function archiveTurn(state: AgentAnswerState): AgentTurnRecord | null {
   }
 }
 
+// Folded outside the component so a whole frame's worth of events costs one
+// state update, and so the folding itself is unit-testable.
+export function reduceAgentEvent(current: AgentAnswerState, event: AgentStreamEvent): AgentAnswerState {
+  if (event.kind === 'session') {
+    return { ...current, sessionId: event.sessionId ?? current.sessionId }
+  }
+  if (event.kind === 'text') {
+    // A long answer is truncated from the front so the panel cannot grow
+    // without bound during a very long stream; the cut lands on a settled block
+    // boundary so the parse stays incremental afterwards.
+    const parsed = appendStreamingMarkdown(current.parsed, event.text ?? '', MAX_ANSWER_LENGTH)
+    return { ...current, answer: parsed.source, parsed }
+  }
+  if (event.kind === 'activity') {
+    if (event.activity == null) return current
+    return { ...current, activity: mergeActivity(current.activity, event.activity) }
+  }
+  if (event.kind === 'usage') {
+    if (event.usage == null) return current
+    return { ...current, usage: mergeUsage(current.usage, event.usage) }
+  }
+  if (event.kind === 'approval') {
+    if (event.approval == null) return current
+    return {
+      ...current,
+      approvals: [...current.approvals.filter((approval) =>
+        approval.requestId !== event.approval?.requestId), event.approval]
+    }
+  }
+  if (event.kind === 'error') {
+    return {
+      ...current,
+      streaming: false,
+      approvals: [],
+      error: event.text ?? 'The agent failed to answer.',
+      completedAt: Date.now()
+    }
+  }
+  return { ...current, streaming: false, approvals: [], completedAt: Date.now() }
+}
+
+export function reduceAgentEvents(
+  current: AgentAnswerState,
+  events: readonly AgentStreamEvent[]
+): AgentAnswerState {
+  // Strictly in arrival order: text and activity interleave, and folding them
+  // out of order would reorder the transcript.
+  let next = current
+  for (const event of events) next = reduceAgentEvent(next, event)
+  return next
+}
+
 export function useAgentAnswer(): AgentAnswerApi {
   const [state, setState] = useState<AgentAnswerState>(EMPTY_ANSWER)
   const requestIdRef = useRef<string | null>(null)
+  const queueRef = useRef<AgentStreamEvent[]>([])
+  const frameRef = useRef(0)
 
   useEffect(() => {
     const repository = window.repository
     if (repository == null) return
-    return repository.onAgentEvent((event) => {
+    // At 30-80 stream events a second, one setState per event is 30-80 renders
+    // of the whole transcript per second. Batching to a frame keeps the commit
+    // rate at the frame rate no matter how fast the model streams.
+    const flush = (): void => {
+      frameRef.current = 0
+      const events = queueRef.current
+      if (events.length === 0) return
+      queueRef.current = []
+      setState((current) => reduceAgentEvents(current, events))
+    }
+    const unsubscribe = repository.onAgentEvent((event) => {
       if (event.id !== requestIdRef.current) return
       markAgentStreamEvent()
-      setState((current) => {
-        if (event.kind === 'session') {
-          return { ...current, sessionId: event.sessionId ?? current.sessionId }
-        }
-        if (event.kind === 'text') {
-          // A long answer is truncated from the front so the panel cannot grow
-          // without bound during a very long stream.
-          const next = `${current.answer}${event.text ?? ''}`
-          const answer = next.length > MAX_ANSWER_LENGTH ? next.slice(-MAX_ANSWER_LENGTH) : next
-          return { ...current, answer, parsed: advanceStreamingMarkdown(current.parsed, answer) }
-        }
-        if (event.kind === 'activity') {
-          if (event.activity == null) return current
-          return { ...current, activity: mergeActivity(current.activity, event.activity) }
-        }
-        if (event.kind === 'usage') {
-          if (event.usage == null) return current
-          return { ...current, usage: mergeUsage(current.usage, event.usage) }
-        }
-        if (event.kind === 'approval') {
-          if (event.approval == null) return current
-          return {
-            ...current,
-            approvals: [...current.approvals.filter((approval) =>
-              approval.requestId !== event.approval?.requestId), event.approval]
-          }
-        }
-        if (event.kind === 'error') {
-          return {
-            ...current,
-            streaming: false,
-            approvals: [],
-            error: event.text ?? 'The agent failed to answer.',
-            completedAt: Date.now()
-          }
-        }
-        return { ...current, streaming: false, approvals: [], completedAt: Date.now() }
-      })
+      queueRef.current.push(event)
+      // A terminal state or a permission prompt is what the user is waiting on,
+      // so those land in the same tick instead of on the next frame.
+      if (event.kind === 'done' || event.kind === 'error' || event.kind === 'approval') {
+        if (frameRef.current !== 0) window.cancelAnimationFrame(frameRef.current)
+        flush()
+      } else if (frameRef.current === 0) {
+        frameRef.current = window.requestAnimationFrame(flush)
+      }
       if (event.kind === 'done' || event.kind === 'error') requestIdRef.current = null
     })
+    return () => {
+      unsubscribe()
+      if (frameRef.current !== 0) window.cancelAnimationFrame(frameRef.current)
+      // Nothing is left to render the answer, and the CLI would otherwise run to
+      // its own timeout spending plan tokens on a transcript nobody will read.
+      const runningId = requestIdRef.current
+      requestIdRef.current = null
+      if (runningId != null) void window.repository?.cancelAgent(runningId)
+    }
   }, [])
 
   const ask = useCallback((options: {
@@ -321,8 +366,8 @@ export function mergeUsage(
         ...update.rateLimits
       ]
   return {
-    ...(current ?? {}),
+    ...current,
     ...update,
-    ...(rateLimits == null ? {} : { rateLimits })
+    ...(rateLimits != null && { rateLimits })
   }
 }

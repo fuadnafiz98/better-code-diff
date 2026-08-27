@@ -1,20 +1,43 @@
 import { lazy, Suspense } from 'react'
+import { IconSparkles, IconX } from '@pierre/icons'
 
 import type { useAgentSession } from './useAgentSession'
+import type { ConfirmRequest } from './ConfirmDialog'
 
 const AgentPanel = lazy(async () => ({ default: (await import('./AgentPanel')).AgentPanel }))
 
 interface AgentDockProps {
   session: ReturnType<typeof useAgentSession>
   contextLabel: string
+  confirm(request: ConfirmRequest): Promise<boolean>
+}
+
+// The chunk's fallback: the same header the panel renders, so the column does
+// not appear as an empty 420px box and the close button works immediately.
+function AgentDockShell({ onClose }: { onClose(): void }): React.JSX.Element {
+  return (
+    <aside className="agent-dock pending" aria-label="Agent">
+      <header className="agent-dock-header">
+        <div className="agent-dock-title">
+          <IconSparkles aria-hidden="true" />
+          <span>Agent</span>
+        </div>
+        <div className="agent-dock-header-actions">
+          <button type="button" onClick={onClose} aria-label="Close agent panel" title="Close">
+            <IconX />
+          </button>
+        </div>
+      </header>
+    </aside>
+  )
 }
 
 // Keeps the panel's wiring next to the panel: the workspace only decides where
 // the column sits, not how the conversation is plumbed together.
-export function AgentDock({ session, contextLabel }: AgentDockProps): React.JSX.Element | null {
+export function AgentDock({ session, contextLabel, confirm }: AgentDockProps): React.JSX.Element | null {
   if (!session.open) return null
   return (
-    <Suspense fallback={<aside className="agent-dock" />}>
+    <Suspense fallback={<AgentDockShell onClose={session.toggle} />}>
       <AgentPanel
         blocks={session.answer.blocks}
         answer={session.answer.answer}
@@ -44,6 +67,7 @@ export function AgentDock({ session, contextLabel }: AgentDockProps): React.JSX.
         onModelChange={session.setModel}
         onEffortChange={session.setEffort}
         onAccessModeChange={session.setAccessMode}
+        onConfirm={confirm}
         onRefreshStatuses={session.refreshStatuses}
         onLogin={session.login}
         onApprovalDecision={session.answer.respondToApproval}

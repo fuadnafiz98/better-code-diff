@@ -1,5 +1,6 @@
 import { memo, useCallback, useLayoutEffect, useRef, useState } from 'react'
 
+import { withResistance } from './rubberband'
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MAX_SIDEBAR_WIDTH,
@@ -46,14 +47,35 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
     saveSidebarWidth(width)
   }, [])
 
+  // Mapping pointer X straight onto the width snaps the divider to the pointer on
+  // the first frame, by however far from its edge the 5px handle was grabbed.
+  // Carrying the grab offset keeps the drag 1:1 from the moment it starts.
+  const dragRef = useRef<{ pointerX: number; width: number } | null>(null)
+
+  // Past a bound the pointer keeps moving while a hard clamp freezes the divider,
+  // which reads as the app hanging. Resistance during the drag says "nothing more
+  // here"; the value that is committed on release is still hard-clamped.
   const resizeFromPointer = useCallback((resizer: HTMLDivElement, pointerX: number) => {
     const workspace = getWorkspace(resizer)
-    if (workspace == null) return
+    const drag = dragRef.current
+    if (workspace == null || drag == null) return
     const bounds = workspace.getBoundingClientRect()
-    const width = clampSidebarWidth(pointerX - bounds.left, bounds.width)
-    liveWidthRef.current = width
-    applyWidth(workspace, width)
+    const raw = drag.width + (pointerX - drag.pointerX)
+    const maximum = clampSidebarWidth(MAX_SIDEBAR_WIDTH, bounds.width)
+    liveWidthRef.current = clampSidebarWidth(raw, bounds.width)
+    applyWidth(workspace, Math.round(withResistance(raw, MIN_SIDEBAR_WIDTH, maximum, bounds.width)))
   }, [])
+
+  const endDrag = useCallback((resizer: HTMLDivElement) => {
+    if (dragRef.current == null) return
+    dragRef.current = null
+    const workspace = getWorkspace(resizer)
+    if (workspace == null) return
+    delete workspace.dataset.resizing
+    // The overshoot has to be written back or the sidebar stays stretched.
+    applyWidth(workspace, liveWidthRef.current)
+    commitWidth(liveWidthRef.current)
+  }, [commitWidth])
 
   return (
     <div
@@ -74,27 +96,26 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
         event.preventDefault()
         event.currentTarget.setPointerCapture(event.pointerId)
         workspace.dataset.resizing = 'sidebar'
-        resizeFromPointer(event.currentTarget, event.clientX)
+        dragRef.current = { pointerX: event.clientX, width: liveWidthRef.current }
       }}
       onPointerMove={(event) => {
         if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
         resizeFromPointer(event.currentTarget, event.clientX)
       }}
       onPointerUp={(event) => {
-        if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
-        const workspace = getWorkspace(event.currentTarget)
-        event.currentTarget.releasePointerCapture(event.pointerId)
-        if (workspace != null) delete workspace.dataset.resizing
-        commitWidth(liveWidthRef.current)
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId)
+        }
+        endDrag(event.currentTarget)
       }}
-      onPointerCancel={(event) => {
-        const workspace = getWorkspace(event.currentTarget)
-        if (workspace != null) delete workspace.dataset.resizing
-        commitWidth(liveWidthRef.current)
-      }}
+      onPointerCancel={(event) => endDrag(event.currentTarget)}
+      // Losing capture without a pointerup would otherwise strand the col-resize
+      // cursor on the whole workspace and drop the width the user dragged to.
+      onLostPointerCapture={(event) => endDrag(event.currentTarget)}
       onDoubleClick={(event) => {
         const workspace = getWorkspace(event.currentTarget)
         if (workspace == null) return
+        dragRef.current = null
         applyWidth(workspace, DEFAULT_SIDEBAR_WIDTH)
         commitWidth(DEFAULT_SIDEBAR_WIDTH)
       }}

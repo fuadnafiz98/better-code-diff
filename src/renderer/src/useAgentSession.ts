@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type {
   AgentAccessMode,
@@ -76,6 +76,11 @@ const DEFAULT_CATALOG: AgentModelCatalog = {
 }
 
 const AGENT_SETTINGS_KEY = 'horus:agent-settings:v2'
+// Sign-in happens in a browser the app cannot see, so it is polled — but an
+// abandoned sign-in used to poll two CLI probes a second forever.
+const AUTH_POLL_START_MS = 2_000
+const AUTH_POLL_MAX_MS = 30_000
+const AUTH_POLL_GIVE_UP_MS = 120_000
 const DEFAULT_STATUSES: AgentProviderStatuses = {
   claude: {
     provider: 'claude',
@@ -172,12 +177,12 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     return () => { active = false }
   }, [open])
 
-  const refreshStatuses = useCallback(() => {
+  const probeStatuses = useCallback((only: AgentProvider | null) => {
     const repository = window.repository
     if (repository == null) return
     setLoadingStatuses(true)
     setStatusError(null)
-    void repository.getAgentStatuses()
+    void repository.getAgentStatuses(only ?? undefined)
       .then((next) => {
         setStatuses(next)
         if (authenticatingProvider != null && next[authenticatingProvider].authenticated) {
@@ -188,6 +193,8 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
       .finally(() => setLoadingStatuses(false))
   }, [authenticatingProvider])
 
+  const refreshStatuses = useCallback(() => { probeStatuses(null) }, [probeStatuses])
+
   useEffect(() => {
     if (!open) return
     refreshStatuses()
@@ -195,9 +202,24 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
 
   useEffect(() => {
     if (!open || authenticatingProvider == null) return
-    const timer = window.setInterval(refreshStatuses, 2_000)
-    return () => window.clearInterval(timer)
-  }, [authenticatingProvider, open, refreshStatuses])
+    // Only the provider being signed into is re-probed, the interval backs off,
+    // and an unfinished sign-in stops asking instead of spawning forever.
+    let delay = AUTH_POLL_START_MS
+    let timer = 0
+    const startedAt = Date.now()
+    const poll = (): void => {
+      if (Date.now() - startedAt > AUTH_POLL_GIVE_UP_MS) {
+        setAuthenticatingProvider(null)
+        setStatusError('Still waiting for sign-in. Finish it in your browser, then check the connection.')
+        return
+      }
+      probeStatuses(authenticatingProvider)
+      delay = Math.min(delay * 2, AUTH_POLL_MAX_MS)
+      timer = window.setTimeout(poll, delay)
+    }
+    timer = window.setTimeout(poll, delay)
+    return () => window.clearTimeout(timer)
+  }, [authenticatingProvider, open, probeStatuses])
 
   const login = useCallback((nextProvider: AgentProvider) => {
     const repository = window.repository
@@ -235,6 +257,14 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     setAttachments((current) => current.filter((attachment) => agentAttachmentId(attachment) !== id))
   }, [])
 
+  // The review context is a re-joined copy of the whole patch; reading it from a
+  // ref keeps `ask` stable while an answer streams, instead of rebuilding this
+  // callback on every token.
+  const contextRef = useRef(context)
+  useEffect(() => {
+    contextRef.current = context
+  }, [context])
+
   const ask = useCallback((prompt: string) => {
     // The agent reads the repository itself, so the attachment is passed as a
     // file and line reference rather than as a second copy of those lines.
@@ -244,11 +274,11 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
       effort,
       accessMode,
       prompt: describeAgentAttachments(attachments, prompt),
-      context,
+      context: contextRef.current,
       question: prompt
     })
     setAttachments([])
-  }, [accessMode, answer, attachments, context, effort, model, provider])
+  }, [accessMode, answer, attachments, effort, model, provider])
 
   const toggle = useCallback(() => setOpen((current) => !current), [])
   const close = useCallback(() => setOpen(false), [])

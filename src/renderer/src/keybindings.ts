@@ -6,7 +6,6 @@ export type AppCommand =
   | 'toggleSidebar'
   | 'toggleWordWrap'
   | 'toggleFoldUnchanged'
-  | 'toggleMultiFile'
   | 'toggleTerminal'
   | 'openSettings'
 
@@ -19,8 +18,10 @@ export const DEFAULT_KEYBINDINGS: KeybindingMap = {
   searchContent: 'Meta+Shift+KeyF',
   toggleSidebar: 'Meta+KeyB',
   toggleWordWrap: 'Alt+KeyZ',
-  toggleFoldUnchanged: 'Meta+Alt+KeyF',
-  toggleMultiFile: 'Meta+Shift+KeyM',
+  // Not ⌘⌥F: that is the editor's own find-and-replace panel, and while the
+  // caret is in the editor the editor wins, so the fold toggle would only work
+  // some of the time.
+  toggleFoldUnchanged: 'Meta+Alt+KeyU',
   toggleTerminal: 'Meta+KeyJ',
   openSettings: 'Meta+Comma'
 }
@@ -34,7 +35,6 @@ export const KEYBINDING_COMMANDS: ReadonlyArray<{
   { command: 'toggleSidebar', label: 'Toggle explorer', description: 'Show or hide the file explorer.' },
   { command: 'toggleWordWrap', label: 'Toggle word wrap', description: 'Wrap or scroll long code lines.' },
   { command: 'toggleFoldUnchanged', label: 'Toggle context folding', description: 'Fold or expand unchanged diff regions.' },
-  { command: 'toggleMultiFile', label: 'Toggle review view', description: 'Switch between file and multi-file review.' },
   { command: 'toggleTerminal', label: 'Toggle terminal', description: 'Show or hide the project terminal.' },
   { command: 'goToFile', label: 'Search repository', description: 'Search file names and repository content together.' },
   { command: 'searchContent', label: 'Search repository (alternate)', description: 'Open the same unified search with the code-search shortcut.' },

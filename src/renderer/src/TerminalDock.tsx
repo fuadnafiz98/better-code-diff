@@ -16,15 +16,20 @@ import {
   IconX
 } from '@pierre/icons'
 import { FitAddon } from '@xterm/addon-fit'
+import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 
 import type { TerminalSession } from '../../shared/contracts'
 import type { EditorThemeType } from './preferences'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
-import { clampTerminalHeight, resizedTerminalHeight } from './terminalPanel'
+import { clampTerminalHeight, resistedTerminalHeight, resizedTerminalHeight } from './terminalPanel'
 
 type TerminalStatus = 'starting' | 'running' | 'exited' | 'failed'
+
+// A window resize should still re-fit, but not once per animation frame: each
+// fit reflows the whole scrollback and sends a SIGWINCH to the shell.
+const RESIZE_FIT_DELAY_MS = 80
 
 export interface TerminalDockHandle {
   focus(): void
@@ -38,6 +43,7 @@ interface TerminalDockProps {
   fontFamily: string
   fontSize: number
   lineHeight: number
+  scrollback: number
   themeType: EditorThemeType
   shortcutLabel: string
   onClose(): void
@@ -199,6 +205,134 @@ function TerminalHeader({
   )
 }
 
+interface TerminalInstanceOptions {
+  containerRef: React.RefObject<HTMLDivElement | null>
+  terminalRef: React.RefObject<Terminal | null>
+  fitRef: React.RefObject<(() => void) | null>
+  sessionIdRef: React.RefObject<string | null>
+  statusRef: React.RefObject<TerminalStatus>
+  dragRef: React.RefObject<{ pointerId: number; startY: number; startHeight: number } | null>
+  settingsRef: React.RefObject<{
+    fontFamily: string
+    fontSize: number
+    lineHeight: number
+    scrollback: number
+    themeType: EditorThemeType
+  }>
+  onTitleChange(title: string): void
+  restart(resetBuffer: boolean): Promise<void>
+}
+
+// Owns the xterm instance itself: construction, renderer, fitting and every
+// subscription, so the dock component is left with the session lifecycle.
+function useTerminalInstance({
+  containerRef,
+  terminalRef,
+  fitRef,
+  sessionIdRef,
+  statusRef,
+  dragRef,
+  settingsRef,
+  onTitleChange,
+  restart: restartTerminal
+}: TerminalInstanceOptions): void {
+  const restart = useEffectEvent(restartTerminal)
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (container == null) return
+    const initialSettings = settingsRef.current
+    const terminal = new Terminal({
+      allowProposedApi: false,
+      cursorBlink: false,
+      cursorInactiveStyle: 'outline',
+      cursorStyle: 'bar',
+      drawBoldTextInBrightColors: true,
+      fontFamily: initialSettings.fontFamily,
+      fontSize: initialSettings.fontSize,
+      fontWeight: '400',
+      fontWeightBold: '600',
+      lineHeight: initialSettings.lineHeight,
+      macOptionIsMeta: true,
+      minimumContrastRatio: 4.5,
+      rightClickSelectsWord: true,
+      scrollback: initialSettings.scrollback,
+      scrollOnUserInput: true,
+      smoothScrollDuration: 0,
+      theme: themeFor(initialSettings.themeType)
+    })
+    const fitAddon = new FitAddon()
+    terminal.loadAddon(fitAddon)
+    terminal.open(container)
+    terminalRef.current = terminal
+
+    // xterm's core ships only the DOM renderer, which paints every visible row
+    // as styled elements on the same thread as React and the diff worker pool.
+    let webgl: WebglAddon | null = null
+    try {
+      const addon = new WebglAddon()
+      addon.onContextLoss(() => {
+        // Losing the GPU context is recoverable: disposing the addon puts the
+        // DOM renderer back rather than leaving a blank terminal.
+        if (webgl === addon) webgl = null
+        addon.dispose()
+      })
+      terminal.loadAddon(addon)
+      webgl = addon
+    } catch {
+      // No usable WebGL2 context; the DOM renderer stays in place.
+    }
+
+    let fitFrame = 0
+    let fitTimer = 0
+    const fit = (): void => {
+      window.cancelAnimationFrame(fitFrame)
+      fitFrame = window.requestAnimationFrame(() => {
+        if (container.clientWidth > 0 && container.clientHeight > 0) fitAddon.fit()
+      })
+    }
+    fitRef.current = fit
+    fit()
+    const resizeObserver = new ResizeObserver(() => {
+      // The drag moves the container every frame; it gets one fit on release.
+      if (dragRef.current != null) return
+      window.clearTimeout(fitTimer)
+      fitTimer = window.setTimeout(fit, RESIZE_FIT_DELAY_MS)
+    })
+    resizeObserver.observe(container)
+    const inputSubscription = terminal.onData((data) => {
+      const sessionId = sessionIdRef.current
+      if (sessionId != null) requireRepositoryApi().writeTerminal(sessionId, data)
+    })
+    const resizeSubscription = terminal.onResize(({ cols, rows }) => {
+      const sessionId = sessionIdRef.current
+      if (sessionId != null) requireRepositoryApi().resizeTerminal(sessionId, cols, rows)
+    })
+    const titleSubscription = terminal.onTitleChange(onTitleChange)
+    const keySubscription = terminal.onKey(({ domEvent }) => {
+      if (domEvent.key !== 'Enter' || sessionIdRef.current != null) return
+      if (statusRef.current === 'exited' || statusRef.current === 'failed') {
+        void restart(true)
+      }
+    })
+
+    return () => {
+      resizeObserver.disconnect()
+      window.cancelAnimationFrame(fitFrame)
+      window.clearTimeout(fitTimer)
+      inputSubscription.dispose()
+      resizeSubscription.dispose()
+      titleSubscription.dispose()
+      keySubscription.dispose()
+      // Before the terminal: disposing the renderer after its terminal throws.
+      webgl?.dispose()
+      terminal.dispose()
+      terminalRef.current = null
+      fitRef.current = null
+    }
+  }, [containerRef, dragRef, fitRef, onTitleChange, sessionIdRef, settingsRef, statusRef, terminalRef])
+}
+
 export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(function TerminalDock({
   open,
   projectName,
@@ -207,6 +341,7 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
   fontFamily,
   fontSize,
   lineHeight,
+  scrollback,
   themeType,
   shortcutLabel,
   onClose,
@@ -222,7 +357,7 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
   const generationRef = useRef(0)
   const startingRef = useRef(false)
   const statusRef = useRef<TerminalStatus>('starting')
-  const initialSettingsRef = useRef({ fontFamily, fontSize, lineHeight, themeType })
+  const initialSettingsRef = useRef({ fontFamily, fontSize, lineHeight, scrollback, themeType })
   const resizeFrameRef = useRef(0)
   const dragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null)
   const [session, setSession] = useState<TerminalSession | null>(null)
@@ -278,8 +413,6 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
       if (generationRef.current === generation) startingRef.current = false
     }
   }, [updateStatus])
-  const startTerminalEvent = useEffectEvent(startTerminal)
-
   useImperativeHandle(ref, () => ({
     focus: () => {
       fitRef.current?.()
@@ -318,72 +451,25 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
     }
   }, [updateStatus])
 
+  useTerminalInstance({
+    containerRef,
+    terminalRef,
+    fitRef,
+    sessionIdRef,
+    statusRef,
+    dragRef,
+    settingsRef: initialSettingsRef,
+    onTitleChange: setProcessTitle,
+    restart: startTerminal
+  })
+
+  // A closed dock keeps its shell running, so main holds that output instead of
+  // shipping it to a renderer that would parse and paint it for nobody.
   useEffect(() => {
-    const container = containerRef.current
-    if (container == null) return
-    const initialSettings = initialSettingsRef.current
-    const terminal = new Terminal({
-      allowProposedApi: false,
-      cursorBlink: false,
-      cursorInactiveStyle: 'outline',
-      cursorStyle: 'bar',
-      drawBoldTextInBrightColors: true,
-      fontFamily: initialSettings.fontFamily,
-      fontSize: initialSettings.fontSize,
-      fontWeight: '400',
-      fontWeightBold: '600',
-      lineHeight: initialSettings.lineHeight,
-      macOptionIsMeta: true,
-      minimumContrastRatio: 4.5,
-      rightClickSelectsWord: true,
-      scrollback: 10_000,
-      scrollOnUserInput: true,
-      smoothScrollDuration: 0,
-      theme: themeFor(initialSettings.themeType)
-    })
-    const fitAddon = new FitAddon()
-    terminal.loadAddon(fitAddon)
-    terminal.open(container)
-    terminalRef.current = terminal
-
-    let fitFrame = 0
-    const fit = (): void => {
-      window.cancelAnimationFrame(fitFrame)
-      fitFrame = window.requestAnimationFrame(() => {
-        if (container.clientWidth > 0 && container.clientHeight > 0) fitAddon.fit()
-      })
-    }
-    fitRef.current = fit
-    fit()
-    const resizeObserver = new ResizeObserver(fit)
-    resizeObserver.observe(container)
-    const inputSubscription = terminal.onData((data) => {
-      const sessionId = sessionIdRef.current
-      if (sessionId != null) requireRepositoryApi().writeTerminal(sessionId, data)
-    })
-    const resizeSubscription = terminal.onResize(({ cols, rows }) => {
-      const sessionId = sessionIdRef.current
-      if (sessionId != null) requireRepositoryApi().resizeTerminal(sessionId, cols, rows)
-    })
-    const titleSubscription = terminal.onTitleChange(setProcessTitle)
-    const keySubscription = terminal.onKey(({ domEvent }) => {
-      if (domEvent.key === 'Enter' && sessionIdRef.current == null && statusRef.current === 'exited') {
-        void startTerminalEvent(true)
-      }
-    })
-
-    return () => {
-      resizeObserver.disconnect()
-      window.cancelAnimationFrame(fitFrame)
-      inputSubscription.dispose()
-      resizeSubscription.dispose()
-      titleSubscription.dispose()
-      keySubscription.dispose()
-      terminal.dispose()
-      terminalRef.current = null
-      fitRef.current = null
-    }
-  }, [])
+    const sessionId = session?.id
+    if (sessionId == null) return
+    requireRepositoryApi().setTerminalVisibility(sessionId, open)
+  }, [open, session])
 
   useEffect(() => {
     const terminal = terminalRef.current
@@ -391,13 +477,18 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
     terminal.options.fontFamily = fontFamily
     terminal.options.fontSize = fontSize
     terminal.options.lineHeight = lineHeight
+    terminal.options.scrollback = scrollback
     terminal.options.theme = themeFor(themeType)
     fitRef.current?.()
-  }, [fontFamily, fontSize, lineHeight, themeType])
+  }, [fontFamily, fontSize, lineHeight, scrollback, themeType])
 
   useEffect(() => {
     if (!open) return
-    if (sessionIdRef.current == null && !startingRef.current && status !== 'exited') {
+    // 'failed' is excluded deliberately: startTerminal flips status back to
+    // 'starting' on entry, so retrying from here spun failure into a spawn loop.
+    // Recovery goes through Restart or Enter instead.
+    if (sessionIdRef.current == null && !startingRef.current &&
+        status !== 'exited' && status !== 'failed') {
       void startTerminal(false)
     }
     const firstFrame = window.requestAnimationFrame(() => {
@@ -434,7 +525,7 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
   const continueResize = (event: PointerEvent<HTMLDivElement>): void => {
     const drag = dragRef.current
     if (drag == null || drag.pointerId !== event.pointerId) return
-    const nextHeight = resizedTerminalHeight(drag.startHeight, drag.startY, event.clientY, window.innerHeight)
+    const nextHeight = resistedTerminalHeight(drag.startHeight, drag.startY, event.clientY, window.innerHeight)
     window.cancelAnimationFrame(resizeFrameRef.current)
     resizeFrameRef.current = window.requestAnimationFrame(() => onHeightChange(nextHeight))
   }
@@ -451,6 +542,8 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
     onHeightChange(nextHeight)
     onHeightCommit(nextHeight)
     onResizingChange(false)
+    // The one fit of the drag, after the released height is committed.
+    fitRef.current?.()
   }
 
   const statusLabel = terminalStatusLabel(status, session?.shell, exitCode)

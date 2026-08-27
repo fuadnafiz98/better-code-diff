@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from 'bun:test'
 
 import {
   buildPerformanceChart,
-  buildMemorySparkline,
   clearMemorySamples,
   findNearestSampleIndex,
   formatSpan,
@@ -48,6 +47,15 @@ describe('memoryTrendPerHour', () => {
     }))
     expect(memoryTrendPerHour([...ramp, ...settled])).toBeCloseTo(0, 5)
   })
+
+  it('does not report a leak for one transient final spike', () => {
+    const stable = series(80, 500, 0)
+    stable[stable.length - 1] = {
+      ...stable[stable.length - 1]!,
+      workingSetMegabytes: 900
+    }
+    expect(memoryTrendPerHour(stable)).toBeCloseTo(0, 5)
+  })
 })
 
 describe('formatTrendPerHour', () => {
@@ -65,24 +73,6 @@ describe('formatSpan', () => {
     expect(formatSpan(9 * 60_000)).toBe('9 min')
     expect(formatSpan(120 * 60_000)).toBe('2 h')
     expect(formatSpan(95 * 60_000)).toBe('1 h 35 min')
-  })
-})
-
-describe('buildMemorySparkline', () => {
-  it('returns null until two samples exist', () => {
-    expect(buildMemorySparkline(series(1, 500, 1), 100, 40)).toBeNull()
-  })
-
-  it('spans the full box and plots against elapsed time', () => {
-    const geometry = buildMemorySparkline(series(3, 500, 10), 100, 40)
-    expect(geometry?.low).toBe(500)
-    expect(geometry?.high).toBe(520)
-    expect(geometry?.line).toBe('M0.0,40.0L50.0,20.0L100.0,0.0')
-    expect(geometry?.area.endsWith('L100.0,40.0Z')).toBe(true)
-  })
-
-  it('draws a flat series down the middle', () => {
-    expect(buildMemorySparkline(series(2, 500, 0), 100, 40)?.line).toBe('M0.0,20.0L100.0,20.0')
   })
 })
 
@@ -124,10 +114,22 @@ describe('findNearestSampleIndex', () => {
 })
 
 describe('recordMemorySample', () => {
-  it('keeps samples in order and caps the history', () => {
+  it('keeps a rolling recent history', () => {
     for (const sample of series(1_300, 100, 1)) recordMemorySample(sample)
     const history = getMemorySamples()
-    expect(history.length).toBe(1_200)
+    expect(history.length).toBe(401)
+    expect(history[0]?.workingSetMegabytes).toBe(999)
     expect(history[history.length - 1]?.workingSetMegabytes).toBe(1_399)
+  })
+
+  it('starts a new series after a sampling gap', () => {
+    recordMemorySample(series(1, 500, 0)[0]!)
+    recordMemorySample({
+      atMs: 31_000,
+      workingSetMegabytes: 510,
+      rendererPrivateMegabytes: 250
+    })
+    expect(getMemorySamples()).toHaveLength(1)
+    expect(getMemorySamples()[0]?.workingSetMegabytes).toBe(510)
   })
 })

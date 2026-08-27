@@ -28,6 +28,15 @@ export interface RepositorySearchController {
   changeQuery(query: string): void
   handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void
   selectResult(path: string): void
+  dismiss(): void
+}
+
+// The popover covers most of the workspace, so a click into the diff has to close
+// it. Only clicks inside the field or the results themselves keep it open.
+export function isInsideSearchSurface(target: EventTarget | null): boolean {
+  if (!(target instanceof Node)) return false
+  const element = target instanceof Element ? target : target.parentElement
+  return element?.closest('#repository-search-results, .global-search') != null
 }
 
 export function useRepositorySearch(
@@ -39,15 +48,24 @@ export function useRepositorySearch(
   const [contentResults, setContentResults] = useState<ContentSearchResult[]>([])
   const [searchingContent, setSearchingContent] = useState(false)
   const [activeResultIndex, setActiveResultIndex] = useState(-1)
+  const [dismissed, setDismissed] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const contentRequestRef = useRef(0)
   const previousScheduledQueryRef = useRef('')
   const deferredQuery = useDeferredValue(query)
-  const indexedPaths = useMemo(() => createFileSearchIndex(snapshot?.paths ?? []), [snapshot])
+  const snapshotPaths = snapshot?.paths
+  // Keyed on the whole snapshot this rebuilt one object per repository path on
+  // every watcher tick. `paths` keeps its identity across ticks that only moved
+  // statuses, and a session that never searches never builds the index at all.
+  const searching = deferredQuery.trim() !== ''
+  const indexedPaths = useMemo(
+    () => searching ? createFileSearchIndex(snapshotPaths ?? []) : [],
+    [searching, snapshotPaths]
+  )
   const fileResults = useMemo(() => {
-    if (snapshot == null || deferredQuery.trim() === '') return []
+    if (snapshot == null || !searching) return []
     return rankFilePaths(indexedPaths, deferredQuery, FILE_SEARCH_RESULT_LIMIT)
-  }, [deferredQuery, indexedPaths, snapshot])
+  }, [deferredQuery, indexedPaths, searching, snapshot])
   const resultPaths = useMemo(
     () => [...fileResults, ...contentResults.map((result) => result.path)],
     [contentResults, fileResults]
@@ -66,8 +84,11 @@ export function useRepositorySearch(
   const changeQuery = useCallback((nextQuery: string) => {
     setQuery(nextQuery)
     setContentResults([])
+    setDismissed(false)
     setActiveResultIndex(nextQuery.trim() === '' ? -1 : 0)
   }, [])
+
+  const dismiss = useCallback(() => setDismissed(true), [])
 
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {
     const direction = getSearchNavigationDirection(event)
@@ -122,17 +143,21 @@ export function useRepositorySearch(
     return () => window.clearTimeout(timeout)
   }, [onError, query])
 
-  return {
+  // A bare object literal here defeated `memo(AppLayout)` and `memo(AgentSessionLayout)`
+  // on every App render, so both boundaries cost a 40-key compare and saved nothing.
+  return useMemo(() => ({
     query,
     fileResults,
     contentResults,
     searchingContent,
-    isOpen: snapshot != null && query.trim().length > 0,
+    isOpen: snapshot != null && query.trim().length > 0 && !dismissed,
     activeResultIndex: resolvedActiveIndex,
     inputRef,
     setActiveResultIndex,
     changeQuery,
     handleKeyDown,
-    selectResult
-  }
+    selectResult,
+    dismiss
+  }), [changeQuery, contentResults, dismiss, dismissed, fileResults, handleKeyDown, query,
+    resolvedActiveIndex, searchingContent, selectResult, snapshot])
 }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { IconCheck, IconCodeComments, IconCopy } from '@pierre/icons'
 
 import { formatSelectedRange, type ReviewThread } from './ReviewComments'
@@ -16,18 +16,30 @@ export function formatReviewCommentsForAgent(entries: readonly ReviewSummaryEntr
   return `Please address these code review comments:\n\n${comments.join('\n\n')}`
 }
 
+const COPY_STATE_MS = { copied: 1_600, failed: 2_400 } as const
+
 export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntry[] }): React.JSX.Element | null {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const resetTimerRef = useRef(0)
+
+  useEffect(() => () => window.clearTimeout(resetTimerRef.current), [])
 
   if (entries.length === 0) return null
+
+  // Failure needs the same lifecycle as success: a terminal error state is a dead
+  // end, with no signal that retrying is even possible.
+  const settle = (state: 'copied' | 'failed'): void => {
+    window.clearTimeout(resetTimerRef.current)
+    setCopyState(state)
+    resetTimerRef.current = window.setTimeout(() => setCopyState('idle'), COPY_STATE_MS[state])
+  }
 
   const copyComments = async (): Promise<void> => {
     try {
       await navigator.clipboard.writeText(formatReviewCommentsForAgent(entries))
-      setCopyState('copied')
-      window.setTimeout(() => setCopyState('idle'), 1_600)
+      settle('copied')
     } catch {
-      setCopyState('failed')
+      settle('failed')
     }
   }
 
@@ -35,7 +47,7 @@ export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntr
     <section className="review-summary" aria-label="Review comments summary">
       <header>
         <div><IconCodeComments /><strong>Review notes</strong><span>{entries.length}</span></div>
-        <button type="button" onClick={() => void copyComments()}>
+        <button type="button" data-copy-state={copyState} onClick={() => void copyComments()}>
           <span className="icon-swap copy-icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
             <IconCopy /><IconCheck />
           </span>

@@ -11,6 +11,11 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     container-type: inline-size;
   }
 
+  [data-separator="line-info-basic"] {
+    border-block: 0;
+    background: transparent;
+  }
+
   [data-separator="line-info-basic"] [data-separator-wrapper] {
     width: 100cqi;
     grid-template-columns: 32px minmax(0, 1fr) 32px;
@@ -28,7 +33,7 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
      strip, broken by the count. */
   [data-separator="line-info-basic"] [data-separator-content] {
     justify-content: center;
-    gap: 12px;
+    gap: 8px;
     padding-inline: 12px;
     background: inherit;
   }
@@ -38,33 +43,80 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     content: "";
     flex: 1 1 0;
     height: 1px;
-    background: var(--border);
+    background: color-mix(in srgb, var(--border) 72%, transparent);
   }
 
   [data-separator="line-info-basic"] [data-unmodified-lines] {
     flex: 0 1 auto;
     max-width: 46ch;
-    border: 1px solid var(--border-strong);
-    border-radius: 999px;
-    corner-shape: squircle;
-    padding: 1px 10px;
-    background: var(--panel);
-    color: var(--muted);
+    border: 0;
+    border-radius: 0;
+    padding-inline: 4px;
+    background: transparent;
+    color: var(--faint);
     font-family: var(--font-ui);
     font-size: 10.5px;
     font-weight: 570;
     line-height: 16px;
     font-variant-numeric: tabular-nums;
-    transition:
-      border-color 100ms cubic-bezier(0.23, 1, 0.32, 1),
-      color 100ms cubic-bezier(0.23, 1, 0.32, 1);
   }
 
   /* Hovering the seam says it can be opened, which is otherwise discoverable only
      by finding the 32px chevron parked at the edge. */
   [data-separator="line-info-basic"]:hover [data-unmodified-lines] {
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
-    color: var(--text);
+    color: var(--text-secondary);
+  }
+
+  /* Keep the vendor's full 32px allocation as the pointer target while drawing
+     the ghost affordance two pixels inside it. Multi-button rows can therefore
+     keep their vendor-managed split without a forced height. */
+  [data-separator="line-info-basic"] [data-expand-button] {
+    position: relative;
+    min-width: 32px;
+    border-block: 0;
+    border-right: 0;
+    background: transparent;
+    color: var(--faint);
+  }
+
+  [data-separator="line-info-basic"] [data-expand-button]::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border-radius: var(--corner-compact);
+    background: transparent;
+    pointer-events: none;
+  }
+
+  [data-separator="line-info-basic"] [data-expand-button]:hover {
+    background: transparent;
+    color: var(--text-secondary);
+  }
+
+  [data-separator="line-info-basic"] [data-expand-button]:hover::before {
+    background: var(--control-fill-hover);
+  }
+
+  [data-separator="line-info-basic"] [data-expand-button] [data-icon] {
+    position: relative;
+  }
+
+  @media (pointer: fine) {
+    [data-separator="line-info-basic"] [data-separator-wrapper][data-separator-multi-button] {
+      grid-template-rows: 100%;
+    }
+
+    [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-up] {
+      grid-area: 1 / 1;
+    }
+
+    [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-down] {
+      grid-area: 1 / 2;
+    }
+
+    [data-separator="line-info-basic"] [data-separator-multi-button] [data-separator-content] {
+      grid-area: 1 / 3 / 2 / 4;
+    }
   }
 
   /* Centring the label means it overflows its own gutter column, so that column
