@@ -83,6 +83,15 @@ const TREE_STYLES = `
 
   [data-type="item"] {
     border-radius: var(--corner-compact);
+    transition: background-color var(--duration-base) var(--ease-in-out);
+  }
+
+  /* The tree marks pointer-focused rows with data-item-focused, which makes its
+     focus outline jump between rows on every click. Keep the outline for
+     keyboard navigation, where it communicates focus, and let pointer clicks
+     use the stable selection fill. */
+  [data-type="item"][data-item-focused="true"]:not(:focus-visible)::before {
+    content: none;
   }
 
   [data-file-tree-search-input] {

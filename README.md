@@ -6,17 +6,18 @@ Horus is a local-first desktop application for exploring projects and reviewing 
 
 - Open Git repositories and ordinary folders.
 - Browse a virtualized project tree with file-type icons and Git status markers.
-- Review modified, added, deleted, renamed, and untracked files.
-- View changes in split or unified diff mode.
-- Review all changed files in a multi-file view.
-- Find files quickly with fuzzy path search.
-- Search file contents with the bundled ripgrep binary.
-- Reopen recently used folders.
+- Review the working tree, a GitHub pull request, a local branch compare, or a single commit.
+- View changes in split or unified diff, as a multi-file review or one file at a time.
+- Comment locally, and reply to GitHub review threads when `gh` is authenticated.
+- Edit working-tree files in place, with a project terminal and an agent dock.
+- Find files quickly with fuzzy path search, and search contents with the bundled ripgrep binary.
+- Restore the last folder, watched working-tree changes, and per-review viewed state.
 - Customize the interface and code fonts.
-- Use binary-file and large-file safeguards to keep the interface responsive.
 - Keep filesystem and Git access in Electron’s main process behind a narrow preload API.
 
 Git is optional. Non-Git folders open in read-only preview mode.
+
+Where the product should go next is in [IDEAS.md](IDEAS.md).
 
 ## Requirements
 
@@ -100,10 +101,10 @@ The renderer does not use Node.js or access the filesystem directly. Git command
 
 ## Current limitations
 
+- There is one review at a time: opening a pull request replaces the working-tree view.
+- Markdown files are shown as source. PR bodies and agent answers are rendered; repository documents are not.
 - Text diffs are not rendered for binary files.
 - Files larger than 2 MB are not rendered in the diff surface.
-- Git comparison currently targets `HEAD` versus the working tree.
-- File watching and automatic incremental refresh are not implemented yet.
 
 ## License
 

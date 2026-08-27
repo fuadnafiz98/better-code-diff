@@ -9,7 +9,9 @@ import {
 } from './annotatedReviewItems'
 import {
   createPatchReviewItems,
+  findCollapseFollowItemId,
   findActiveReviewItemId,
+  findNextUnreadReviewItemId,
   mergeReviewItems,
   orderReviewItems,
   retainReviewItems
@@ -348,5 +350,31 @@ describe('multi-file explorer synchronization', () => {
   test('changes the active item after crossing a file boundary', () => {
     expect(findActiveReviewItemId(600, positions)).toBe('review:second.ts')
     expect(findActiveReviewItemId(1_080, positions)).toBe('review:third.ts')
+  })
+
+  test('aligns the next file only when the active file is collapsed', () => {
+    const items = positions.map(({ id }) => ({ id }))
+    expect(findCollapseFollowItemId('review:first.ts', 'review:first.ts', items))
+      .toBe('review:second.ts')
+    expect(findCollapseFollowItemId('review:first.ts', 'review:second.ts', items))
+      .toBeNull()
+    expect(findCollapseFollowItemId('review:third.ts', 'review:third.ts', items))
+      .toBeNull()
+  })
+
+  test('advances from a viewed file to the next unread file', () => {
+    const items = positions.map(({ id }) => ({ id }))
+    expect(findNextUnreadReviewItemId(
+      'review:first.ts',
+      'review:first.ts',
+      items,
+      new Set(['second.ts'])
+    )).toBe('review:third.ts')
+    expect(findNextUnreadReviewItemId(
+      'review:second.ts',
+      'review:first.ts',
+      items,
+      new Set()
+    )).toBeNull()
   })
 })

@@ -76,6 +76,30 @@ export interface ReviewItemPosition {
   top: number
 }
 
+export function findCollapseFollowItemId(
+  activeItemId: string | null,
+  collapsingItemId: string,
+  items: readonly Pick<CodeViewItem, 'id'>[]
+): string | null {
+  if (activeItemId !== collapsingItemId) return null
+  const collapsingIndex = items.findIndex((item) => item.id === collapsingItemId)
+  return collapsingIndex < 0 ? null : items[collapsingIndex + 1]?.id ?? null
+}
+
+export function findNextUnreadReviewItemId(
+  activeItemId: string | null,
+  viewedItemId: string,
+  items: readonly Pick<CodeViewItem, 'id'>[],
+  viewedPaths: ReadonlySet<string>
+): string | null {
+  if (activeItemId !== viewedItemId) return null
+  const viewedIndex = items.findIndex((item) => item.id === viewedItemId)
+  if (viewedIndex < 0) return null
+  return items.slice(viewedIndex + 1).find(
+    (item) => !viewedPaths.has(pathFromReviewItemId(item.id))
+  )?.id ?? null
+}
+
 export function findActiveReviewItemId(
   scrollTop: number,
   positions: readonly ReviewItemPosition[],

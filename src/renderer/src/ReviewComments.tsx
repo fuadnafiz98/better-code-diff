@@ -52,10 +52,14 @@ export function SelectionActions({
 }: SelectionActionsProps): React.JSX.Element {
   return (
     <div className="selection-actions" role="group" aria-label={`Actions for ${formatSelectedRange(range)}`}>
-      <span className="selection-actions-range">{formatSelectedRange(range)}</span>
-      <button type="button" onClick={onComment}><IconCommentAdd />Add comment</button>
-      <button type="button" onClick={onAskAgent}>
-        <IconSparkles />Add to Chat<kbd>⌘I</kbd>
+      <span className="selection-actions-range" title={formatSelectedRange(range)}>
+        {formatCompactSelectedRange(range)}
+      </span>
+      <button type="button" onClick={onComment} aria-label="Add comment" title="Add comment">
+        <IconCommentAdd />Comment
+      </button>
+      <button type="button" onClick={onAskAgent} aria-label="Add selection to Chat" title="Add selection to Chat (⌘I)">
+        <IconSparkles />Chat<kbd aria-hidden="true">⌘I</kbd>
       </button>
       <button className="selection-actions-dismiss" type="button" onClick={onDismiss}
         aria-label="Clear selection" title="Clear selection"><IconX /></button>
@@ -69,12 +73,27 @@ interface DraftCommentProps {
   onSave(body: string): void
 }
 
-export function formatSelectedRange(range: SelectedLineRange): string {
+function selectedRangeParts(range: SelectedLineRange): {
+  first: number
+  last: number
+  side: 'old' | 'new' | null
+} {
   const side = range.side === 'deletions' ? 'old' : range.side === 'additions' ? 'new' : null
-  // Dragging upward reports the anchor first, so the ends are ordered for display.
   const first = Math.min(range.start, range.end)
   const last = Math.max(range.start, range.end)
+  return { first, last, side }
+}
+
+export function formatSelectedRange(range: SelectedLineRange): string {
+  // Dragging upward reports the anchor first, so the ends are ordered for display.
+  const { first, last, side } = selectedRangeParts(range)
   const lines = first === last ? `Line ${first}` : `Lines ${first}–${last}`
+  return side == null ? lines : `${lines} · ${side}`
+}
+
+export function formatCompactSelectedRange(range: SelectedLineRange): string {
+  const { first, last, side } = selectedRangeParts(range)
+  const lines = first === last ? `${first}` : `${first}–${last}`
   return side == null ? lines : `${lines} · ${side}`
 }
 
@@ -107,7 +126,7 @@ export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): Re
         }}
         placeholder="Leave a review comment…"
         aria-label="Review comment"
-        rows={3}
+        rows={2}
       />
       <div className="review-card-actions">
         <span>⌘ Enter to save</span>
@@ -164,7 +183,7 @@ export function ReviewThreadCard({
 
       {editing ? (
         <div className="review-edit-area">
-          <textarea aria-label="Edit review comment" value={editBody} onChange={(event) => setEditBody(event.target.value)} rows={3} />
+          <textarea aria-label="Edit review comment" value={editBody} onChange={(event) => setEditBody(event.target.value)} rows={2} />
           <div className="review-card-actions">
             <button type="button" onClick={() => { setEditBody(thread.body); setEditing(false) }}><IconX />Cancel</button>
             <button className="primary" type="button" onClick={saveEdit}><IconCheck />Save</button>

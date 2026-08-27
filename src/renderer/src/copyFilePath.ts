@@ -34,7 +34,7 @@ export function copyTextToClipboard(text: string): Promise<boolean> {
 }
 
 /**
- * Double-clicking a file name in a diff header copies its path. Only listeners
+ * Clicking a file name in a diff header copies its path. Only listeners
  * are attached here: writing into the item's rendered subtree during a render
  * pass desynchronizes the viewer's height accounting.
  */
@@ -59,19 +59,17 @@ export function syncCopyFilePathLifecycle(
 
   const binding: CopyPathBinding = { onCopied, teardown: () => undefined }
 
-  const onDoubleClick = (event: Event): void => {
+  const onClick = (event: Event): void => {
     const name = nameFromEvent(event)
     if (name == null) return
     event.preventDefault()
     event.stopPropagation()
-    // The browser has already selected the word under the pointer by now, and
-    // leaving that selection behind reads as if the copy did not happen.
     window.getSelection()?.removeAllRanges()
     void copyTextToClipboard(name).then((success) => binding.onCopied(name, success))
   }
 
-  root.addEventListener('dblclick', onDoubleClick, true)
-  binding.teardown = () => root.removeEventListener('dblclick', onDoubleClick, true)
+  root.addEventListener('click', onClick, true)
+  binding.teardown = () => root.removeEventListener('click', onClick, true)
   bindings.set(node, binding)
 }
 

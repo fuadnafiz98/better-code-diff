@@ -11,6 +11,7 @@ import {
   type SetStateAction
 } from 'react'
 import {
+  type CodeView as CodeViewInstance,
   type CodeViewItem,
   type CodeViewLineSelection,
   type DiffLineAnnotation,
@@ -25,6 +26,7 @@ import { markReviewFileHydrated } from './reviewMetrics'
 import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { syncDragGuideLifecycle } from './dragSelection'
 import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
+import { isGutterDoubleClick } from './gutterCommentShortcut'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -41,7 +43,9 @@ import {
   type AnnotatedReviewItemCache
 } from './annotatedReviewItems'
 import {
+  findCollapseFollowItemId,
   findActiveReviewItemId,
+  findNextUnreadReviewItemId,
   pathFromReviewItemId as pathFromItemId,
   reviewItemId as itemId
 } from './reviewItems'
@@ -122,6 +126,14 @@ function scrollToReviewTop(viewer: CodeViewHandle<ReviewAnnotationMetadata> | nu
   viewer?.scrollTo({ type: 'position', position: 0, behavior: 'smooth-auto' })
 }
 
+function findActiveRenderedItemId(viewer: CodeViewInstance<ReviewAnnotationMetadata>): string | null {
+  const positions = viewer.getRenderedItems().flatMap((item) => {
+    const top = viewer.getTopForItem(item.id)
+    return top == null ? [] : [{ id: item.id, top }]
+  })
+  return findActiveReviewItemId(viewer.getScrollTop(), positions)
+}
+
 interface AnnotatedReviewItemsOptions {
   loadState: ReviewLoadState
   threadsByPath: Record<string, ReviewThread[]>
@@ -187,14 +199,13 @@ interface MultiFileViewerProps {
   pendingSelection: { id: string; range: CodeViewLineSelection['range'] } | null
   onSelectLines(selection: CodeViewLineSelection | null): void
   onCommentOnSelection(): void
+  onBeginComment(selection: CodeViewLineSelection): void
   onAskAgentAboutSelection(): void
   scrollContainerRef: React.Ref<HTMLDivElement>
   viewerRef: React.RefObject<CodeViewHandle<ReviewAnnotationMetadata> | null>
   onScrollPositionChange(scrollTop: number): void
   onVisiblePathChange(path: string): void
   setViewerRef(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): void
-  setSelectedLines(selection: CodeViewLineSelection | null): void
-  beginComment(selection: CodeViewLineSelection): void
   toggleItemCollapsed(item: CodeViewItem<ReviewAnnotationMetadata>): void
   collapseAllFiles(): void
   expandAllFiles(): void
@@ -225,6 +236,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
   onResolveRemoteThread,
   onSelectLines,
   onCommentOnSelection,
+  onBeginComment,
   onAskAgentAboutSelection,
   scrollContainerRef,
   viewerRef,
@@ -242,9 +254,15 @@ const MultiFileViewer = memo(function MultiFileViewer({
   const backToTopVisibleRef = useRef(false)
   const visiblePathRef = useRef<string | null>(null)
   const visiblePathTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const collapseFollowFrameRef = useRef(0)
+  const previousGutterActivationRef = useRef<{
+    selection: CodeViewLineSelection
+    timestamp: number
+  } | null>(null)
 
   useEffect(() => () => {
     if (visiblePathTimerRef.current != null) clearTimeout(visiblePathTimerRef.current)
+    window.cancelAnimationFrame(collapseFollowFrameRef.current)
   }, [])
   const summaryEntries = useMemo<ReviewSummaryEntry[]>(() =>
     Object.entries(threadsByPath).flatMap(([path, threads]) =>
@@ -254,6 +272,28 @@ const MultiFileViewer = memo(function MultiFileViewer({
     () => <><PullRequestContext conversation={pullRequestConversation} /><ReviewSummary entries={summaryEntries} /></>,
     [pullRequestConversation, summaryEntries]
   )
+  const handleToggleItemCollapsed = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
+    window.cancelAnimationFrame(collapseFollowFrameRef.current)
+    collapseFollowFrameRef.current = 0
+
+    const viewer = viewerRef.current?.getInstance()
+    const followItemId = collapsedItemIds.has(item.id) || viewer == null
+      ? null
+      : findCollapseFollowItemId(findActiveRenderedItemId(viewer), item.id, annotatedItems)
+
+    toggleItemCollapsed(item)
+    if (followItemId == null) return
+
+    collapseFollowFrameRef.current = window.requestAnimationFrame(() => {
+      collapseFollowFrameRef.current = 0
+      viewerRef.current?.scrollTo({
+        type: 'item',
+        id: followItemId,
+        align: 'start',
+        behavior: 'instant'
+      })
+    })
+  }, [annotatedItems, collapsedItemIds, toggleItemCollapsed, viewerRef])
   const renderHeaderPrefix = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
     const expanded = !collapsedItemIds.has(item.id)
     const path = pathFromItemId(item.id)
@@ -262,12 +302,12 @@ const MultiFileViewer = memo(function MultiFileViewer({
         aria-expanded={expanded} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${path}`}
         title={`${expanded ? 'Collapse' : 'Expand'} file`} onClick={(event) => {
           event.stopPropagation()
-          toggleItemCollapsed(item)
+          handleToggleItemCollapsed(item)
         }}>
         <IconChevronSm data-collapse-chevron aria-hidden="true" />
       </button>
     )
-  }, [collapsedItemIds, toggleItemCollapsed])
+  }, [collapsedItemIds, handleToggleItemCollapsed])
   // Viewed belongs in the header's metadata slot on the trailing edge. Rendered
   // in the prefix slot it shared a narrow box with the collapse button and
   // wrapped onto a second line under the chevron.
@@ -324,7 +364,16 @@ const MultiFileViewer = memo(function MultiFileViewer({
     overflow: preferences.wordWrap ? 'wrap' : 'scroll', disableLineNumbers: !preferences.showLineNumbers,
     tokenizeMaxLineLength: 2_000, enableLineSelection: true, enableGutterUtility: true,
     onLineSelectionEnd: (range, context) => onSelectLines(range == null ? null : { id: context.item.id, range }),
-    onGutterUtilityClick: (range, context) => onSelectLines({ id: context.item.id, range }),
+    onGutterUtilityClick: (range, context) => {
+      const selection = { id: context.item.id, range }
+      const timestamp = performance.now()
+      const opensComment = isGutterDoubleClick(previousGutterActivationRef.current, selection, timestamp)
+      previousGutterActivationRef.current = opensComment ? null : { selection, timestamp }
+      onSelectLines(selection)
+      // CodeView reports selection-end after this callback. Starting the draft
+      // on the next microtask lets that report finish before the action bar is cleared.
+      if (opensComment) queueMicrotask(() => onBeginComment(selection))
+    },
     onPostRender: (node, _instance, phase, context) => {
       syncDragGuideLifecycle(node, phase, (range) => onSelectLines({ id: context.item.id, range }))
       syncSplitDiffResizeLifecycle(node, phase)
@@ -338,7 +387,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
       markReviewFileHydrated(fileDiff.name)
       return { oldFile: comparison.oldFile, newFile: comparison.newFile } as Awaited<ReturnType<NonNullable<CodeViewReactOptions<ReviewAnnotationMetadata>['loadDiffFiles']>>>
     }} : {})
-  }), [diffStyle, onSelectLines, preferences, repositoryReview])
+  }), [diffStyle, onBeginComment, onSelectLines, preferences, repositoryReview])
   const handleScroll = useCallback((scrollTop: number) => {
     onScrollPositionChange(scrollTop)
     const backToTopVisible = scrollTop > BACK_TO_TOP_THRESHOLD
@@ -347,19 +396,15 @@ const MultiFileViewer = memo(function MultiFileViewer({
       setShowBackToTop(backToTopVisible)
     }
     // The rendered-item snapshot allocates an array plus an object per item in the
-    // render window, and the viewer calls this once per frame. Taking the sample on
-    // the settle the tree-follow already waits for costs one snapshot per 80 ms
-    // instead of one per frame, and the last scroll event always leaves one armed.
-    if (visiblePathTimerRef.current != null) return
+    // render window, and the viewer calls this once per frame. Restarting this
+    // timer makes it a trailing debounce: a fast fling produces one tree update
+    // after it settles instead of making the sidebar selection jump every 80 ms.
+    if (visiblePathTimerRef.current != null) clearTimeout(visiblePathTimerRef.current)
     visiblePathTimerRef.current = setTimeout(() => {
       visiblePathTimerRef.current = null
       const instance = viewerRef.current?.getInstance()
       if (instance == null) return
-      const positions = instance.getRenderedItems().flatMap((item) => {
-        const top = instance.getTopForItem(item.id)
-        return top == null ? [] : [{ id: item.id, top }]
-      })
-      const activeId = findActiveReviewItemId(instance.getScrollTop(), positions)
+      const activeId = findActiveRenderedItemId(instance)
       const activePath = activeId == null ? null : pathFromItemId(activeId)
       if (activePath == null || activePath === visiblePathRef.current) return
       visiblePathRef.current = activePath
@@ -434,6 +479,7 @@ const MultiFileReview = memo(function MultiFileReview({
 }: MultiFileReviewProps): React.JSX.Element {
   const viewerRef = useRef<CodeViewHandle<ReviewAnnotationMetadata> | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
+  const viewedAdvanceFrameRef = useRef(0)
   const handledNavigationRevisionRef = useRef(navigationRevision)
   const restoredScrollPositionRef = useRef(false)
   const pathsKey = paths.join('\0')
@@ -479,11 +525,13 @@ const MultiFileReview = memo(function MultiFileReview({
     setPendingSelection(selection)
     handleSelectedLinesChange(selection)
   }, [handleSelectedLinesChange])
-  const commentOnSelection = useCallback(() => {
-    if (pendingSelection == null) return
-    beginComment(pendingSelection)
+  const beginCommentAtSelection = useCallback((selection: CodeViewLineSelection) => {
+    beginComment(selection)
     setPendingSelection(null)
-  }, [beginComment, pendingSelection])
+  }, [beginComment])
+  const commentOnSelection = useCallback(() => {
+    if (pendingSelection != null) beginCommentAtSelection(pendingSelection)
+  }, [beginCommentAtSelection, pendingSelection])
   const askAgentAboutSelection = useCallback(() => {
     if (pendingSelection == null) return
     const { start, end } = pendingSelection.range
@@ -615,14 +663,42 @@ const MultiFileReview = memo(function MultiFileReview({
   const viewedPaths = useMemo(() => parseViewedPathsKey(viewedPathsKey), [viewedPathsKey])
 
   const toggleViewed = useCallback((path: string) => {
+    window.cancelAnimationFrame(viewedAdvanceFrameRef.current)
+    viewedAdvanceFrameRef.current = 0
+
     const item = itemsByPath.get(path)
     if (item == null) return
     const viewed = viewedPaths.has(path)
+    const viewer = viewerRef.current?.getInstance()
+    const followItemId = viewed || viewer == null
+      ? null
+      : findNextUnreadReviewItemId(
+          findActiveRenderedItemId(viewer),
+          item.id,
+          loadState.items,
+          viewedPaths
+        )
+
     setViewedFiles((current) => viewed
       ? dropChangedViewedFiles(current, [path])
       : markViewedFile(current, item))
     setCollapsedById(itemId(path), !viewed)
-  }, [itemsByPath, setCollapsedById, setViewedFiles, viewedPaths])
+    if (followItemId == null) return
+
+    viewedAdvanceFrameRef.current = window.requestAnimationFrame(() => {
+      viewedAdvanceFrameRef.current = 0
+      viewerRef.current?.scrollTo({
+        type: 'item',
+        id: followItemId,
+        align: 'start',
+        behavior: 'instant'
+      })
+    })
+  }, [itemsByPath, loadState.items, setCollapsedById, setViewedFiles, viewedPaths])
+
+  useEffect(() => () => {
+    window.cancelAnimationFrame(viewedAdvanceFrameRef.current)
+  }, [])
 
   const handledReviewCommandRef = useRef(reviewCommand?.revision ?? 0)
   useEffect(() => {
@@ -654,9 +730,9 @@ const MultiFileReview = memo(function MultiFileReview({
     remoteThreadsByPath={remoteThreadsByPath} pendingRemoteThreadId={pendingRemoteThreadId}
     onReplyToRemoteThread={onReplyToRemoteThread} onResolveRemoteThread={onResolveRemoteThread}
     pendingSelection={pendingSelection} onSelectLines={handleSelectLines}
-    onCommentOnSelection={commentOnSelection} onAskAgentAboutSelection={askAgentAboutSelection}
+    onCommentOnSelection={commentOnSelection} onBeginComment={beginCommentAtSelection}
+    onAskAgentAboutSelection={askAgentAboutSelection}
     onScrollPositionChange={onScrollPositionChange} onVisiblePathChange={onVisiblePathChange} setViewerRef={setViewerRef}
-    setSelectedLines={handleSelectLines} beginComment={beginComment}
     toggleItemCollapsed={toggleItemCollapsed} collapseAllFiles={collapseAllFiles}
     expandAllFiles={expandAllFiles} cancelComment={cancelComment} saveComment={saveComment}
     updateThread={updateThread}
