@@ -16,6 +16,7 @@ import {
   orderReviewItems,
   retainReviewItems
 } from './reviewItems'
+import { reviewScrollAnchorTarget } from './MultiFileReview'
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import type { RemoteReviewThread } from '../../shared/contracts'
 
@@ -66,6 +67,11 @@ describe('createPatchReviewItems', () => {
 })
 
 describe('multi-file review items', () => {
+  test('keeps a background refresh anchor at the same viewport offset', () => {
+    expect(reviewScrollAnchorTarget({ itemId: 'review:file.ts', viewportOffset: -240 }, 1_840)).toBe(2_080)
+    expect(reviewScrollAnchorTarget({ itemId: 'review:file.ts', viewportOffset: 80 }, 40)).toBe(0)
+  })
+
   test('replaces duplicate IDs instead of passing duplicates to CodeView', () => {
     const first = { id: 'review:file.ts', type: 'file', file: { name: 'file.ts', contents: 'old', cacheKey: 'old' } } as CodeViewItem
     const replacement = { id: 'review:file.ts', type: 'file', file: { name: 'file.ts', contents: 'new', cacheKey: 'new' } } as CodeViewItem

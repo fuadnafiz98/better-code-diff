@@ -13,6 +13,7 @@ import type {
 import type { WorkspaceView } from './AppView'
 import type { ConfirmRequest } from './ConfirmDialog'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
+import { automaticWorkspaceView } from './workspaceMode'
 
 interface UseGitWorkflowOptions {
   snapshot: RepositorySnapshot | null
@@ -221,13 +222,14 @@ export function useGitWorkflow({
       setRepositoryReview(null)
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
+      onWorkspaceViewChange(automaticWorkspaceView(nextSnapshot, null))
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, onError])
+  }, [applySnapshot, confirmWorkingTreeChange, onError, onWorkspaceViewChange])
 
   const openPullRequestReview = useCallback(async (selector: number | string) => {
     reviewRequestRef.current += 1
@@ -363,13 +365,14 @@ export function useGitWorkflow({
       setRepositoryReview(null)
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
+      onWorkspaceViewChange(automaticWorkspaceView(nextSnapshot, null))
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, onError])
+  }, [applySnapshot, confirmWorkingTreeChange, onError, onWorkspaceViewChange])
 
   const fetchRemote = useCallback(async () => {
     setActionKey('sync:fetch')
@@ -392,13 +395,14 @@ export function useGitWorkflow({
       const nextSnapshot = await requireRepositoryApi().pullCurrentBranch()
       setRepositoryReview(null)
       applySnapshot(nextSnapshot)
+      onWorkspaceViewChange(automaticWorkspaceView(nextSnapshot, null))
       await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, loadInbox, loadIntegration, onError])
+  }, [applySnapshot, confirmWorkingTreeChange, loadInbox, loadIntegration, onError, onWorkspaceViewChange])
 
   const pushCurrentBranch = useCallback(async () => {
     setActionKey('sync:push')
@@ -464,7 +468,8 @@ export function useGitWorkflow({
     setRepositoryReview(null)
     setSubmissionMessage(null)
     onSelectPath(snapshot?.statuses[0]?.path ?? null)
-  }, [onSelectPath, snapshot?.statuses])
+    if (snapshot != null) onWorkspaceViewChange(automaticWorkspaceView(snapshot, null))
+  }, [onSelectPath, onWorkspaceViewChange, snapshot])
 
   // While the panel is open a commit or a branch switch made in the terminal
   // invalidates the entry, so ahead/behind and the branch list stop being a

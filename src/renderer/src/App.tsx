@@ -65,6 +65,7 @@ import { usePresence, useRetainedPresence } from './usePresence'
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog'
 import { useConfirm } from './useConfirm'
 import { formatAgentReviewContext } from './agentReviewContext'
+import { automaticWorkspaceView } from './workspaceMode'
 
 const RepositoryWorkspace = lazy(() => import('./RepositoryWorkspace'))
 const TerminalDock = lazy(() => import('./TerminalDock'))
@@ -403,6 +404,7 @@ export function App(): React.JSX.Element {
         gitWorkflow.reset()
         setSelectedPath(null)
         applySnapshot(nextSnapshot)
+        setWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
         setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
       }
     } catch (openError) {
@@ -420,6 +422,7 @@ export function App(): React.JSX.Element {
       gitWorkflow.reset()
       setSelectedPath(null)
       applySnapshot(nextSnapshot)
+      setWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
       setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
     } catch (openError) {
       setError(`Cannot open “${folder.name}”. ${getErrorMessage(openError)}`)
@@ -468,6 +471,7 @@ export function App(): React.JSX.Element {
     void repository.getSessionSnapshot().then((sessionSnapshot) => {
       if (cancelled || sessionSnapshot == null) return
       applySnapshot(sessionSnapshot)
+      setWorkspaceView(automaticWorkspaceView(sessionSnapshot, null))
       setRecentFolders((current) => rememberRecentFolder(current, sessionSnapshot))
     }).catch((sessionError: unknown) => {
       if (!cancelled) setError(getErrorMessage(sessionError))

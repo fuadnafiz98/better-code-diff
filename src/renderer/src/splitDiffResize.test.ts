@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { clampSplitPercentage, resistedSplitPercentage, splitPercentageFromPointer } from './splitDiffResize'
+import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
+import {
+  clampSplitPercentage,
+  resistedSplitPercentage,
+  splitPercentageFromPointer,
+  syncSplitDiffResizeLifecycle
+} from './splitDiffResize'
 
 describe('split diff resizing', () => {
   it('keeps both code panes within useful limits', () => {
@@ -22,5 +28,31 @@ describe('split diff resizing', () => {
   it('answers overshoot with resistance during a drag', () => {
     expect(resistedSplitPercentage(15, 1_000)).toBeGreaterThan(15)
     expect(resistedSplitPercentage(85, 1_000)).toBeLessThan(85)
+  })
+
+  it('keeps wrapped unchanged-context labels clear of the divider', () => {
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      'width: var(--horus-split-before-width, 50cqi)'
+    )
+
+    const surface = document.createElement('div')
+    surface.className = 'diff-panel'
+    const viewer = document.createElement('div')
+    surface.append(viewer)
+    const root = viewer.attachShadow({ mode: 'open' })
+    const splitDiff = document.createElement('pre')
+    splitDiff.dataset.diffType = 'split'
+    root.append(splitDiff)
+
+    syncSplitDiffResizeLifecycle(viewer, 'mount')
+    const handle = root.querySelector<HTMLElement>('[data-split-resize-handle]')
+    handle?.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      composed: true,
+      key: 'ArrowLeft'
+    }))
+
+    expect(surface.style.getPropertyValue('--horus-split-before-width')).toBe('48cqi')
+    syncSplitDiffResizeLifecycle(viewer, 'unmount')
   })
 })

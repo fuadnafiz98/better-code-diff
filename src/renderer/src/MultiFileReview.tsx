@@ -8,6 +8,7 @@ import {
   useState,
   type CSSProperties,
   type Dispatch,
+  type RefObject,
   type SetStateAction
 } from 'react'
 import {
@@ -27,6 +28,7 @@ import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { syncDragGuideLifecycle } from './dragSelection'
 import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
 import { isGutterDoubleClick } from './gutterCommentShortcut'
+import { syncReviewCaretLifecycle } from './reviewCaret'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -126,6 +128,26 @@ function scrollToReviewTop(viewer: CodeViewHandle<ReviewAnnotationMetadata> | nu
   viewer?.scrollTo({ type: 'position', position: 0, behavior: 'smooth-auto' })
 }
 
+interface ReviewScrollAnchor {
+  itemId: string
+  viewportOffset: number
+}
+
+export function reviewScrollAnchorTarget(anchor: ReviewScrollAnchor, itemTop: number): number {
+  return Math.max(0, itemTop - anchor.viewportOffset)
+}
+
+function captureReviewScrollAnchor(
+  viewer: CodeViewInstance<ReviewAnnotationMetadata> | undefined
+): ReviewScrollAnchor | null {
+  if (viewer == null) return null
+  const itemId = findActiveRenderedItemId(viewer)
+  if (itemId == null) return null
+  const itemTop = viewer.getTopForItem(itemId)
+  if (itemTop == null) return null
+  return { itemId, viewportOffset: itemTop - viewer.getScrollTop() }
+}
+
 function findActiveRenderedItemId(viewer: CodeViewInstance<ReviewAnnotationMetadata>): string | null {
   const positions = viewer.getRenderedItems().flatMap((item) => {
     const top = viewer.getTopForItem(item.id)
@@ -201,7 +223,7 @@ interface MultiFileViewerProps {
   onCommentOnSelection(): void
   onBeginComment(selection: CodeViewLineSelection): void
   onAskAgentAboutSelection(): void
-  scrollContainerRef: React.Ref<HTMLDivElement>
+  scrollContainerRef: RefObject<HTMLDivElement | null>
   viewerRef: React.RefObject<CodeViewHandle<ReviewAnnotationMetadata> | null>
   onScrollPositionChange(scrollTop: number): void
   onVisiblePathChange(path: string): void
@@ -259,6 +281,53 @@ const MultiFileViewer = memo(function MultiFileViewer({
     selection: CodeViewLineSelection
     timestamp: number
   } | null>(null)
+  const backgroundScrollAnchorRef = useRef<ReviewScrollAnchor | null>(null)
+
+  // GitHub conversation polling and streamed PR pages can update CodeView while
+  // the reader is idle. Keep the same file at the same viewport offset while the
+  // virtualizer reconciles those background changes and finishes measuring them.
+  useLayoutEffect(() => {
+    const anchor = backgroundScrollAnchorRef.current
+    backgroundScrollAnchorRef.current = null
+    let frame = 0
+    let settledFrames = 0
+    let cancelled = false
+    const startedAt = performance.now()
+    const cancel = (): void => {
+      cancelled = true
+    }
+    const stopObservingScrollTakeover = anchor == null
+      ? () => {}
+      : observeScrollTakeover(scrollContainerRef.current, cancel)
+
+    const restore = (): void => {
+      if (cancelled || anchor == null) return
+      const viewer = viewerRef.current
+      const instance = viewer?.getInstance()
+      const itemTop = instance?.getTopForItem(anchor.itemId)
+      const current = instance?.getScrollTop()
+      if (viewer == null || itemTop == null || current == null) return
+      const target = reviewScrollAnchorTarget(anchor, itemTop)
+      if (Math.abs(current - target) <= 1) {
+        settledFrames += 1
+        if (settledFrames >= SCROLL_RESTORE_SETTLED_FRAMES) return
+      } else {
+        settledFrames = 0
+        viewer.scrollTo({ type: 'position', position: target, behavior: 'instant' })
+      }
+      if (performance.now() - startedAt < SCROLL_RESTORE_TIMEOUT_MS) {
+        frame = window.requestAnimationFrame(restore)
+      }
+    }
+    restore()
+
+    return () => {
+      cancelled = true
+      window.cancelAnimationFrame(frame)
+      stopObservingScrollTakeover()
+      backgroundScrollAnchorRef.current = captureReviewScrollAnchor(viewerRef.current?.getInstance())
+    }
+  }, [pullRequestConversation, repositoryReview, scrollContainerRef, viewerRef])
 
   useEffect(() => () => {
     if (visiblePathTimerRef.current != null) clearTimeout(visiblePathTimerRef.current)
@@ -378,6 +447,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
       syncDragGuideLifecycle(node, phase, (range) => onSelectLines({ id: context.item.id, range }))
       syncSplitDiffResizeLifecycle(node, phase)
       syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
+      syncReviewCaretLifecycle(node, phase)
     },
     lineHoverHighlight: 'number', hunkSeparators: 'line-info-basic', expandUnchanged: !preferences.foldUnchanged,
     collapsedContextThreshold: 4, stickyHeaders: true, layout: { paddingTop: 16, paddingBottom: 48, gap: 12 },

@@ -1,135 +1,247 @@
 # Ideas for Horus
 
-GitHub is a website that happens to show diffs. Horus is a desk that already has the repo, the patch, a terminal, a watcher, and an agent in one process. The next product is not “more panels.” It is **holding several versions of the same project at once, and reviewing the change as a change** — not as a file list that forgot why it exists.
+GitHub is a website that happens to show diffs. Horus is a desk that already has the repo, the patch, a terminal, a watcher, and an agent in one process. The product is **a local review workspace**: hold several versions of the same project, review the change against the world you actually have, and prove it.
 
-Tabs and markdown preview are the on-ramp. They are not the point.
+Tabs and markdown preview are on-ramps. They are not the point.
+
+The loop that is worth building:
+
+> Open a PR → show Desk collisions → show changes since checkpoint → walk proof-first → run evidence in Stage → submit anchored comments with a proof receipt.
+
+That is something a browser cannot copy. It is also not an IDE.
 
 ---
 
-## The bet
+## Rules
 
-A reviewer is doing four jobs GitHub pretends are one:
-
-1. **See** the patch (CodeView already does this).
-2. **Understand** the intent (the PR body, the commits, the tests, the docs).
-3. **Check it against the world they actually have** (dirty working tree, other branches, the last time they looked).
-4. **Prove it** (run it, click it, read the rendered doc, not the source of the doc).
-
-Horus can do 3 and 4 because it is local. Everything below is a way to stop throwing that away.
-
-**Rules that keep this a review app, not an IDE**
-
-- One window. Several worlds. One visible diff.
-- A tab is a version of the repo, not a URL.
-- Everyday actions stay instant. No tab-switch animation, no “delight” on `]`.
+- One window. Several worlds. **One mounted CodeView.**
+- A world is a version of the repo, not a URL and not a tab sticker.
+- Everyday actions stay instant. No tab-switch animation, no motion on `]`.
 - Pierre renders code. New ideas wrap it or reorder it. They do not replace it.
+- Deterministic classifications must be explained. Nothing that looks like a green tick unless a human confirmed it.
 - If an idea needs the network for the *sensation* of review (embedded GitHub, remote HTML, CI dashboards), it is the wrong idea.
+- Inactive world state lives **outside** the viewer. Do not multiply the memory-heavy CodeView.
 
 ---
 
-## Leap 1 — Parallel worlds
+## What the code actually is
 
-Today `useGitWorkflow` holds one `repositoryReview`. Opening `#1092` evicts the live working tree. The watcher keeps running; the UI pretends the folder left.
+The thesis above overshot several shortcuts. These are the constraints, not nits.
 
-The first leap is not a tab strip. It is **several checkouts of meaning, side by side in time**.
+The renderer holds one `repositoryReview`, one selected path, and one workspace. Opening a review remounts `RepositoryWorkspace` and replaces the instance (`useGitWorkflow.ts`, `App.tsx`). Main holds one `RepositoryService`, one watcher, one terminal service, and one agent service (`index.ts`). Agent and terminal cwd are that single root.
 
-### Worlds, not chrome
+Linked-worktree watching exists only for Git metadata (`resolveLinkedGitDirectory` in `repositoryWatcher.ts`). It is not a multi-root capability model.
 
-| World | What it is | Alive? |
+The PR patch cache is keyed by URL + `headRefOid` with **no index of previous snapshots** (`PullRequestReviewCache` in `repository.ts`). Viewed state stores file signatures, not a dated checkpoint. The fallback signature is change type plus line counts, so equal-churn content can collide (`reviewFileSignature` in `viewedFileStorage.ts`).
+
+PR contracts have files, a patch, and omitted files. They have **no commit list and no semantic classification** (`contracts.ts`). `orderReviewItems` can permute; it cannot invent Story or Shape from data we do not have.
+
+Local comments store line number, side, and range (`ReviewThread` in `ReviewComments.tsx`). They will not survive a pushed commit.
+
+The markdown parser is headings, paragraphs, flat lists, quotes, and fenced code (`markdown.ts`). No links, images, tables, task lists, nesting, or source ranges. PR patches are hunks, not complete documents.
+
+Selecting review lines already attaches a path and range for the agent (`agentAttachments.ts`). The prompt tells the agent to **read that path from the repository**. The agent runs in Desk cwd. On a remote Patch, that is the wrong tree.
+
+None of this kills the bet. It says: **model worlds first**, then attach terminals, agents, and documents to a world, not to “the app.”
+
+---
+
+## 1. World foundation
+
+A world is immutable in identity and snapshot, mutable in navigation. Only the active world’s CodeView is mounted.
+
+```text
+World
+├── identity: worldId
+├── source: desk | patch | stage | since
+├── snapshot: baseOid + headOid
+├── review: files + patch (request-scoped load)
+├── navigation: selected path + scroll
+├── walk + collapsed state
+├── comments (anchored)
+├── viewed state
+└── checkpoint (if the source is a PR)
+```
+
+| Source | Meaning | Alive? |
 | --- | --- | --- |
-| **Desk** | The folder you opened. `HEAD → working tree`. | Yes. Existing watcher. |
-| **Patch** | A PR, `main...feature`, or a commit, as a frozen CodeView. | No. Pinned to `headRefOid` until refresh. |
-| **Stage** | A git worktree of that PR/commit. Diff *and* a terminal whose cwd is that tree. | Yes, in its own tree. Desk is untouched. |
-| **Since** | The interdiff: this PR’s patch minus the patch you already reviewed. | No. Two cached `headRefOid`s. |
+| **Desk** | The opened folder. `HEAD → working tree`. | Yes. Existing watcher. |
+| **Patch** | A PR, `main...feature`, or a commit, as a frozen CodeView. | No. Pinned to `baseOid`/`headOid` until refresh. |
+| **Stage** | A detached worktree of that snapshot. Diff plus a terminal and agent bound to that tree. | Yes, in its own root. Desk is untouched. |
+| **Since** | Files (later hunks) that changed since the last **checkpoint**, not since the last open. | No. |
 
-The strip under the titlebar names worlds (`Desk`, `#1092`, `#1092 run`, `#1092 since Fri`). `⌘T` / `⌘W` / `⌘⇧[ ]`. Overflow is a menu. You cannot close Desk.
+Desk cannot be closed. The strip names worlds (`Desk`, `#1092`, `#1092 run`, `#1092 since`). `⌘T` / `⌘W` / `⌘⇧[ ]`. Overflow is a menu, not a second scrollbar. Switching worlds restores navigation from stored state and remounts one CodeView.
 
-The git panel already opens PRs, local compares, and commits. Those calls create or focus a world. They stop being a trap door.
+Loading is **request-scoped** to `worldId`. A late PR page must not land in a world the user already left.
 
-`repositoryWatcher.ts` already knows linked worktrees (`resolveLinkedGitDirectory`). A Stage tab is `git worktree add` under an app-managed directory, scoped to the approved root, deleted when the tab closes. The existing terminal binds to that cwd. That is the honest version of “preview the PR”: **boot it**, don’t iframe github.com.
+**Collision radar** is exact path intersection: Desk dirty paths ∩ Patch file list. Paint the overlap in the explorer. No heuristics.
 
-Stay small: one CodeView on screen. No split of two reviews. No tearing tabs into windows. A Stage is optional; a Patch world is enough to ship first.
-
-### Collision radar
-
-Desk is dirty. A Patch world touches `agentService.ts`, which is also modified on Desk. The explorer already has status. Paint the overlap.
-
-This is the sentence GitHub cannot say: **this PR lands on files you are already changing.** It is free once Desk and Patch coexist.
+The git panel already opens PRs, local compares, and commits. Those calls create or focus a world. They stop replacing Desk.
 
 ---
 
-## Leap 2 — Review the change, not the tree
+## 2. Checkpoints and “Since”
 
-`orderReviewItems` already permutes CodeView. The explorer path order is a default, not a law. A 135-file review in path order is how you miss the point.
+“Since last time” is the right idea. Opening a PR is not a review. The cache of patches is not a history.
 
-### Walks
+A **ReviewCheckpoint** is explicit:
 
-A review has a **walk**: the order the viewer actually lays out. Built-in walks:
+```text
+PR URL + baseOid + headOid + timestamp + patch manifest
+```
 
-- **Tree** — today’s path order.
-- **Story** — commit order, so you watch the change arrive.
-- **Risk** — tests and types first, generated and lockfiles last.
-- **Shape** — cluster by mechanical kind (rename, import-only, new API, snapshot).
+Advance it only when the user **submits a review** or chooses **Set checkpoint**. Merely opening, scrolling, or marking viewed must not move the baseline.
 
-The agent’s job is not a summary. It is a **proposed walk**: “start at the type, then the store, then the UI; skip the snapshots.” That walk is just another permutation of `orderReviewItems`, stored on the world, editable, dismissible. The file list becomes a queue with a reason.
+File signatures used for viewed/checkpoint comparison must prefer blob OIDs. The line-count fallback stays a last resort and must not be treated as identity.
 
-### Quiet files
+**Since, in this order:**
 
-Lockfiles, snapshots, import-only churn, formatting-only diffs start **collapsed**, counted: `12 quiet`. Never hidden. A hidden file in a review is a lie. One control restores them.
+1. File-level: paths added, removed, or whose blob OID (or strong signature) changed since the checkpoint.
+2. Hunk matching later, as its own algorithm. A “moved hunk” is not `diff(patchA, patchB)`.
 
-### Claims
-
-A PR body is a list of claims (“adds retry”, “no API change”, “docs follow”). Parse the Brief (we already parse that markdown). Tick each claim against the actual file list and hunk headers. Unticked claims stay loud. Extra files that match no claim stay loud.
-
-This is drift detection for humans. The description and the patch stop being able to ignore each other.
-
-### Since last time
-
-Viewed files are already keyed by **content signature**. PR patches are already cached by `headRefOid`. Two visits to `#1092` at two SHAs are two patches. The `Since` world is the diff of those diffs: only hunks that appeared, disappeared, or moved.
-
-Re-reviewing a pushed PR should feel like inbox zero, not like the first time.
-
-### Seen light
-
-`V` is a checkbox people click to make a number move. The virtualizer already knows which items occupied the viewport (`findActiveReviewItemId` is one sample). **Seen** is “this hunk was on screen long enough to read.” Unseen hunks stay at full contrast; seen ones recede. `V` remains as an override for “I looked, I swear.”
-
-The progress pill becomes honest: `seen 40% of the semantic change` (quiet files discounted), not `12 of 135 reviewed`.
-
-### Comments that follow the code
-
-A GitHub thread is a line number with hope. Horus already drops viewed marks when content changes. Comments should **re-anchor** on the surrounding lines, and prefer a **symbol** when the hunk is a function. The local thread model already exists; the address is what is wrong.
+If there is no checkpoint, Since is empty and says so.
 
 ---
 
-## Leap 3 — Surfaces that are not source
+## 3. Comments that can survive a push
 
-### Documents as documents
+This is foundational and lands **before** hunk-level Since and before agent ghost comments.
 
-`MarkdownContent` already renders PR bodies and agent answers. `README.md` in the tree is still a code view. That is a category error.
+Today a thread is `lineNumber + side + range`. Store an **anchor**:
 
-- **Source / Preview / Split** on a markdown file. Images resolve inside the approved root only.
-- **Brief** as its own world: rendered description, submitted reviews, file list that jumps into the Patch world. Unstick `PullRequestContext` from the diff scroll.
-- **Rendered diff** for a changed `.md`: old document | new document, block-level add/delete, using the existing `parseMarkdown` block list. This is the review GitHub still cannot do.
+```text
+selected text
++ surrounding context hashes
++ side
++ blob OID
++ optional symbol
+```
 
-Comments on a rendered document attach to a **heading or paragraph**, not to `README.md:47`.
+Re-anchor deterministically. **One match:** move the comment. **Zero or many matches:** mark it orphaned. Do not guess. Orphans are visible and must be confirmed or dropped by a human.
 
-### Pair the test
+Rendered-document comments (heading / paragraph) wait until document ASTs have stable anchors. Do not invent a second address space early.
 
-When the walk is on `agentService.ts`, the right edge can offer the test file that names it (`agentService.test.ts` already sits next to it in this repo). Not a second CodeView forever — a **peek** that becomes a jump. Implementation and proof in one motion.
+---
 
-### Images are diffs
+## 4. Walks and quiet files
 
-A skipped `png` in a PR is a hole. Before/after slider, same split metaphor as code. Anything else binary stays skipped.
+`orderReviewItems` is the permutation API. Walks we can ship without new Git data:
 
-### The three instruments share a subject
+- **Tree** — current path order.
+- **Proof** — contracts, types, tests, then implementation. Deterministic path/name rules, each file tagged with why it ranked.
+- **Risk** — auth, persistence, migrations, configuration, public APIs, then the rest. Same: explain every bump.
 
-Diff, terminal, and agent currently share a window and nothing else. The selected hunk is the **subject**:
+Walks that wait for data we do not have:
 
-- CodeView highlights it.
-- The agent receives that hunk (not the 80-file name list, not the entire patch).
-- If the world is a Stage, the terminal is already in that tree; a command can be “run the test that names this symbol.”
+- **Story** — needs a commit list on the PR contract.
+- **Shape** — import-only / formatting-only needs conservative analysis. Guessing here hides real changes.
 
-`formatAgentReviewContext` is a file list on purpose. Keep that as the map. The subject is the pin. **Draft a review of this world** writes ghost comments into the existing local-thread model; the human accepts, edits, or throws them away, then submits. The agent does not become a second inbox.
+**Quiet files** start with high-confidence rules only: lockfiles, known generated paths, snapshots. Always show the reason (`lockfile`, `generated`, `snapshot`). Never hide. A hidden file in a review is a lie. One control restores them.
+
+An agent **proposed walk** is a later permutation the human can accept or dismiss. It is not the default.
+
+---
+
+## 5. Claim checks, not claim ticks
+
+A sentence in a PR body such as “no API change” cannot be validated from filenames and hunk headers. A checkbox would be false confidence.
+
+**Claim checks** extract claims from the Brief and show, for each:
+
+- the claim
+- supporting or contradicting evidence (paths, hunk headers, later Stage receipts)
+- confidence
+- **needs human confirmation**
+
+No green tick without that confirmation. Unticked claims stay loud. Files that match no claim stay loud. The agent may propose evidence; the human still confirms.
+
+---
+
+## 6. Stage worlds
+
+A Stage is a **detached worktree pinned to an exact commit**, not a linked checkout of a moving branch.
+
+Main must grow a **multi-root capability**:
+
+- Grant the Stage path as an approved root (realpath-checked), not the Electron user-data tree.
+- Terminal cwd and agent cwd follow the **active world’s root**. Desk stays Desk.
+- Watcher: content under the Stage root; Git metadata via the existing linked-gitdir resolution.
+
+**Lifecycle.** Closing the UI **detaches** the world. It does not delete the worktree.
+
+- Clean disposable worktree → Horus may delete it.
+- Dirty worktree → retain, or confirm before delete.
+- Never auto-delete while a terminal or editor in that root still exists.
+
+Stage is where proof happens: run the test that names the current symbol, record the receipt.
+
+---
+
+## 7. World-aware subject and the agent
+
+The subject is not “a path in the open folder.” It is:
+
+```text
+worldId + path + revision + side + line range + exact selected text
+```
+
+- **Patch worlds** send the exact hunk text. Do not tell the agent to `read` Desk.
+- **Stage worlds** may also let the agent read from the Stage cwd, at that revision.
+- **Desk** keeps today’s “read the working tree” behaviour.
+
+`formatAgentReviewContext` stays a file-list **map** of the world. The subject is the pin.
+
+Ghost comments, proposed walks, and claim evidence are **proposals**. They write into the local-thread / walk / claim-check models only after human acceptance. The agent is not a second inbox.
+
+---
+
+## 8. Proof ledger
+
+A review is unfinished until there is a receipt. Stage commands append to a per-world ledger:
+
+```text
+command + exit code + timestamp + headOid
+```
+
+The submit bar can then say something true:
+
+> Tested at `abc123`. 2 Desk collisions remain. 1 claim lacks evidence. 3 comments orphaned after the last push.
+
+That sentence is the product. It is not a dashboard.
+
+---
+
+## 9. Documents and images
+
+The current parser is good enough for agent answers and short PR bodies. It is not document-grade.
+
+Use a real CommonMark/GFM parser and sanitized rendering. Repository images go through a file API with realpath checks against the world’s approved root. No network, no HTML, no scripts.
+
+PR patches are partial hunks. A rendered old/new document needs **complete contents for both revisions** — a revision-content API, not `parsePatchFiles`.
+
+Ship in this order:
+
+1. Current-side markdown preview (Desk file, or the new side of a Patch file once full content exists).
+2. Old/new rendered documents, independently scrollable.
+3. Block-level document diff after the AST has stable anchors.
+4. Comments on heading/paragraph, using those anchors.
+
+Images in a review: before/after slider for `png`/`svg`. Other binaries stay skipped.
+
+The Brief is a Patch-world header, not a fake GitHub page: rendered description, submitted reviews, file list that jumps to the file in the same world.
+
+---
+
+## 10. Seen is exposure, not review
+
+The viewer knows the active rendered **file**, not which semantic hunks were understood. Dwell time is a poor proxy for reading, and a worse one for accessibility.
+
+Keep two words:
+
+- **Seen** — appeared in the viewport for a minimum time. Optional, experimental, never the source of truth.
+- **Reviewed** — explicit `V` (or equivalent). This is what the pill counts.
+
+Do not label viewport exposure as “40% of the semantic change.” If Seen ships at all, it is a dimming hint, off by default or behind a preference, and it never replaces Reviewed.
 
 ---
 
@@ -137,24 +249,43 @@ Diff, terminal, and agent currently share a window and nothing else. The selecte
 
 - A browser of github.com.
 - An IDE. Edit stays the exception, on one file, on Desk or Stage.
-- Two CodeViews fighting in one layout.
+- Two CodeViews mounted at once.
 - Animated tab switches, file jumps, or viewed checkboxes.
 - Remote HTML, remote images, or scripts in document preview.
 - A CI dashboard. Checks belong on lines, or they don’t belong.
-- Chat that summarises the PR you can already scroll.
+- Automatic deletion of a dirty Stage.
+- Green ticks on claims, walks, or Seen.
+- Chat that summarises a PR you can already scroll.
+- Telling the agent to read Desk while the user is looking at a Patch.
 
 ---
 
 ## Build order
 
-Ship worlds first. Everything else is a surface with nowhere to sit.
+1. **World foundation + Patch worlds**  
+   Immutable `worldId` and snapshot, per-world navigation stored off the viewer, request-scoped loading, one mounted CodeView, exact-path collision radar. Desk survives opening a PR.
 
-1. **Patch worlds** — wrap today’s `repositoryReview` so a PR no longer destroys Desk. Collision radar comes for free.
-2. **Walks + quiet files** — permute `orderReviewItems`; collapse the boring tail.
-3. **Documents** — file preview, then Brief world, then rendered markdown diff.
-4. **Since** — interdiff from the PR cache and viewed signatures you already persist.
-5. **Seen light** — viewport-backed progress. Keep `V`.
-6. **Stage worlds** — worktree + terminal cwd. This is “run the PR.”
-7. **Claims, re-anchored comments, subject-pinned agent, test peek, image diffs.**
+2. **Review checkpoints + re-anchored comments**  
+   Explicit checkpoint (submit or Set checkpoint). Stronger signatures (prefer blob OIDs). File-level Since. Anchors with selected text, context hashes, blob OID; orphans on ambiguity.
 
-If only one thing ships, ship **Desk and Patch as two worlds**. If only two ship, add **walks**. Stage, Seen, and rendered docs are how it becomes something reviewers cannot get in a browser.
+3. **Proof and Risk walks + quiet files**  
+   Deterministic, explained. No Story/Shape yet. Quiet = lockfile / generated / snapshot, reason visible.
+
+4. **Stage worlds + world-aware subject**  
+   Detached worktree at an exact commit. Per-world approved root, terminal cwd, agent cwd. Close detaches; delete only a clean disposable tree, confirm if dirty. Patch subject sends exact hunk text.
+
+5. **Proof ledger**  
+   Commands, exit codes, timestamps, `headOid`. Receipt on submit.
+
+6. **Document and image surfaces**  
+   Real parser. Current-side preview first. Old/new full contents. Block diff after AST anchors. Image before/after.
+
+7. **Agent proposals**  
+   Proposed walk, claim evidence, ghost comments. Human acceptance required.
+
+8. **Seen experiment**  
+   Optional exposure hint. Never the review’s source of truth.
+
+If only one thing ships: **Desk and Patch as two worlds, one CodeView.**  
+If two: **checkpoints, file-level Since, and re-anchored comments.**  
+Stage, the ledger, and documents are how it becomes a workspace you can prove a change in — not a tab strip with a prettier README.

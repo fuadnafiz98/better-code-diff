@@ -14,3 +14,12 @@ export function automaticWorkspaceView(
     ? 'multi'
     : 'file'
 }
+
+export function workspaceViewForTreePath(
+  currentView: WorkspaceView,
+  pathIsInReview: boolean,
+  hasEditSession: boolean
+): WorkspaceView {
+  if (hasEditSession) return currentView
+  return pathIsInReview ? 'multi' : 'file'
+}

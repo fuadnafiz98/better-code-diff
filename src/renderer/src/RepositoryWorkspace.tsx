@@ -26,7 +26,7 @@ import { useCodeZoomGesture } from './useCodeZoomGesture'
 import { useFileEditing } from './useFileEditing'
 import { EditorStatusBar } from './editor/EditorStatusBar'
 import { useViewerContext } from './editor/ViewerProviders'
-import { automaticWorkspaceView } from './workspaceMode'
+import { workspaceViewForTreePath } from './workspaceMode'
 
 import type { ContentSearchState } from './DiffSurface'
 
@@ -74,16 +74,15 @@ const TREE_STYLES = `
     transition-duration: 0s, 100ms;
   }
 
-  /* A full-width row answers a press with a tint; a ratio scale would squash it
-     by 20px and read as the row being crushed. */
-  [data-type="item"]:active {
+  /* A full-width, unselected row answers a press with a tint; a ratio scale
+     would squash it by 20px and read as the row being crushed. */
+  [data-type="item"]:active:not([data-item-selected="true"]) {
     scale: 1;
     background: var(--accent-soft);
   }
 
   [data-type="item"] {
     border-radius: var(--corner-compact);
-    transition: background-color var(--duration-base) var(--ease-in-out);
   }
 
   /* The tree marks pointer-focused rows with data-item-focused, which makes its
@@ -735,13 +734,9 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onComparisonChange: onComparisonSaved,
     onError
   })
-  const preferredWorkspaceView = automaticWorkspaceView(snapshot, repositoryReview)
-  useLayoutEffect(() => {
-    if (fileEditing.hasSession || workspaceView === preferredWorkspaceView) return
-    onWorkspaceViewChange(preferredWorkspaceView)
-  }, [fileEditing.hasSession, onWorkspaceViewChange, preferredWorkspaceView, workspaceView])
   const { reviewPaths, treePaths, treeStatuses, reviewComments } =
     useReviewTreeData(snapshot, repositoryReview, threadsByPath)
+  const reviewPathSet = useMemo(() => new Set(reviewPaths), [reviewPaths])
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
   const viewerPreferences = useViewerPreferences(preferences, codeZoom)
   // Releasing the viewer would destroy the edit session and every unsaved draft
@@ -820,8 +815,11 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     if (!pathSet.has(path)) return
     markInstantTreeFollowTarget(path)
     onSelectPath(path)
-    if (workspaceView === 'multi') setMultiFileNavigationRevision((revision) => revision + 1)
-  }, [markInstantTreeFollowTarget, onSelectPath, pathSet, workspaceView])
+    const nextView = workspaceViewForTreePath(workspaceView, reviewPathSet.has(path), fileEditing.hasSession)
+    if (nextView !== workspaceView) onWorkspaceViewChange(nextView)
+    if (nextView === 'multi') setMultiFileNavigationRevision((revision) => revision + 1)
+  }, [fileEditing.hasSession, markInstantTreeFollowTarget, onSelectPath, onWorkspaceViewChange,
+    pathSet, reviewPathSet, workspaceView])
 
   // ⌘P search, review shortcuts and the tree all change the selected path; in the
   // multi-file review that has to move the viewer, or picking a result looks like

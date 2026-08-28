@@ -2,6 +2,7 @@ import { CENTERED_COLLAPSED_SEPARATOR_CSS } from './collapsedSeparator'
 import { COPY_FILE_PATH_CSS } from './copyFilePath'
 import { DRAG_SELECTION_CSS } from './dragSelection'
 import { SPLIT_DIFF_RESIZE_CSS } from './splitDiffResize'
+import { REVIEW_CARET_CSS } from './reviewCaret'
 
 /**
  * A document stylesheet cannot match inside a shadow root, so styles.css's
@@ -84,6 +85,7 @@ export const VIEWER_BASE_CSS = `
   ${CENTERED_COLLAPSED_SEPARATOR_CSS}
   ${SPLIT_DIFF_RESIZE_CSS}
   ${COPY_FILE_PATH_CSS}
+  ${REVIEW_CARET_CSS}
   ${REDUCED_MOTION_CSS}
 `
 

@@ -29,6 +29,18 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     grid-template-columns: 32px 32px minmax(0, 1fr) 32px 32px;
   }
 
+  /* In wrapped split view, the only visible separator belongs to the old-code
+     gutter. Keep it inside that pane so neither label variant sits beneath the
+     draggable divider. The percentage follows the divider while it moves. */
+  [data-diff-type="split"][data-overflow="wrap"]
+    [data-deletions] > [data-gutter]
+    [data-separator="line-info-basic"] [data-separator-wrapper],
+  [data-dehydrated][data-diff-type="split"][data-overflow="scroll"]
+    [data-deletions] > [data-gutter]
+    [data-separator="line-info-basic"] [data-separator-wrapper] {
+    width: var(--horus-split-before-width, 50cqi);
+  }
+
   /* A collapsed run of lines reads as a seam in the file: one hairline across the
      strip, broken by the count. */
   [data-separator="line-info-basic"] [data-separator-content] {
@@ -119,10 +131,4 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     }
   }
 
-  /* Centring the label means it overflows its own gutter column, so that column
-     has to paint over the opposite pane and the split divider — otherwise the
-     middle of the label disappears behind the other pane's line numbers. */
-  [data-diff-type="split"] [data-deletions] > [data-gutter] {
-    z-index: 9;
-  }
 `

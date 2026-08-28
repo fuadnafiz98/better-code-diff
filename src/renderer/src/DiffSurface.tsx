@@ -16,6 +16,7 @@ import type { DiffStyle } from './AppView'
 import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { syncDragGuideLifecycle } from './dragSelection'
 import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
+import { syncReviewCaretLifecycle } from './reviewCaret'
 import { SELECTION_ACTION_CSS, VIEWER_BASE_CSS } from './viewerCss'
 import { contentSearchMarkers, markersEqual, type EditorMarker } from './editor/markers'
 import {
@@ -374,6 +375,7 @@ function DiffContents({
       syncDragGuideLifecycle(node, phase, beginComment)
       syncSplitDiffResizeLifecycle(node, phase)
       syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
+      syncReviewCaretLifecycle(node, phase)
     }
   }), [beginComment, comparisonPath, setReviewCursor])
 
