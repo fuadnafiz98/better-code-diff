@@ -23,7 +23,8 @@
     "lint": "oxlint src",
     "test": "bun test",
     "verify": "bun run lint && bun run typecheck && bun test && bun run build",
-    "perf:snapshot": "bash scripts/benchmark-memory.sh"
+    "perf:snapshot": "bash scripts/benchmark-memory.sh",
+    "perf:startup": "bun scripts/benchmark-startup.mjs"
   },
   "comment:dependencies": "electron-builder packs `dependencies` into the app verbatim. Only packages the main process resolves at runtime belong here: the Claude Agent SDK, @vscode/ripgrep, and the native node-pty bridge. Everything the renderer uses is bundled by Vite into out/renderer, so shipping it again would be dead weight.",
   "dependencies": {

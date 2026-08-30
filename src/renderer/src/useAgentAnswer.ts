@@ -6,6 +6,8 @@ import type {
   AgentApprovalDecision,
   AgentApprovalRequest,
   AgentProvider,
+  AgentRequestSelection,
+  AgentRequestSubject,
   AgentStreamEvent,
   AgentUsageUpdate
 } from '../../shared/contracts'
@@ -54,6 +56,9 @@ export interface AgentAnswerApi extends AgentAnswerState {
     prompt: string
     context: string
     question?: string
+    subject: AgentRequestSubject
+    selections: AgentRequestSelection[]
+    sessionScope: string
   }): void
   respondToApproval(requestId: string, decision: AgentApprovalDecision): void
   cancel(): void
@@ -223,11 +228,14 @@ export function useAgentAnswer(): AgentAnswerApi {
     prompt: string
     context: string
     question?: string
+    subject: AgentRequestSubject
+    selections: AgentRequestSelection[]
+    sessionScope: string
   }) => {
     const repository = window.repository
     if (repository == null) return
     const id = crypto.randomUUID()
-    const sessionKey = `${options.provider}:${options.model}:${options.accessMode}`
+    const sessionKey = `${options.provider}:${options.model}:${options.accessMode}:${options.sessionScope}`
     const resumeSessionId = state.sessionKey === sessionKey ? state.sessionId : null
     requestIdRef.current = id
     setState((current) => {
@@ -255,6 +263,8 @@ export function useAgentAnswer(): AgentAnswerApi {
         accessMode: options.accessMode,
         prompt: options.prompt,
         context: options.context,
+        subject: options.subject,
+        selections: options.selections,
         ...(resumeSessionId == null ? {} : { resumeSessionId })
       })
       .catch((error: unknown) => {

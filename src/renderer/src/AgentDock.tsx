@@ -54,6 +54,7 @@ export function AgentDock({ session, contextLabel, confirm }: AgentDockProps): R
         model={session.model}
         effort={session.effort}
         accessMode={session.accessMode}
+        accessModeLocked={session.accessModeLocked}
         models={session.models}
         efforts={session.efforts}
         loadingModels={session.loadingModels}

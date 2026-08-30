@@ -13,6 +13,7 @@ import {
   IconEye,
   IconFolder,
   IconGear,
+  IconGlobe,
   IconPencil,
   IconRefresh,
   IconRepeat,
@@ -57,9 +58,14 @@ interface TitlebarProps {
   opening: boolean
   keybindings: KeybindingMap
   activeSearchResultId?: string
+  newTab: boolean
+  locator: string
+  locatorBusy: boolean
   onSidebarToggle(): void
   onSearchQueryChange(query: string): void
   onSearchKeyDown(event: KeyboardEvent<HTMLInputElement>): void
+  onLocatorChange(locator: string): void
+  onLocatorSubmit(): void
   onOpen(): Promise<void>
   onSettingsOpen(): void
   onGitOpen(): void
@@ -79,9 +85,14 @@ export const Titlebar = memo(function Titlebar({
   opening,
   keybindings,
   activeSearchResultId,
+  newTab,
+  locator,
+  locatorBusy,
   onSidebarToggle,
   onSearchQueryChange,
   onSearchKeyDown,
+  onLocatorChange,
+  onLocatorSubmit,
   onOpen,
   onSettingsOpen,
   onGitOpen,
@@ -95,7 +106,19 @@ export const Titlebar = memo(function Titlebar({
     <header className="titlebar">
       <div className="titlebar-repository">
         {snapshot == null ? (
-          <span className="product-name"><IconBraces />Horus</span>
+          <>
+            <span className="product-name"><IconBraces />Horus</span>
+            <button
+              className="open-button titlebar-open-button"
+              type="button"
+              onClick={() => void onOpen()}
+              disabled={opening}
+              title={`Open Folder (${formatKeybinding(keybindings.openFolder)})`}
+            >
+              {opening ? <IconRefresh className="spin" /> : <IconFolder />}
+              <span>Open</span>
+            </button>
+          </>
         ) : (
           <>
             <button
@@ -143,28 +166,39 @@ export const Titlebar = memo(function Titlebar({
       </div>
 
       <div className="global-search">
-        <IconSearch aria-hidden="true" />
+        {newTab ? <IconGlobe aria-hidden="true" /> : <IconSearch aria-hidden="true" />}
         <input
-          name="repository-search"
-          ref={searchInputRef}
-          value={searchQuery}
-          onChange={(event) => onSearchQueryChange(event.target.value)}
-          onKeyDown={onSearchKeyDown}
-          placeholder="Search files and content"
-          aria-label="Search repository files and content"
-          role="combobox"
-          aria-autocomplete="list"
-          aria-controls="repository-search-results"
-          aria-activedescendant={activeSearchResultId}
-          aria-expanded={searchQuery.trim().length > 0}
-          disabled={snapshot == null}
+          name={newTab ? 'review-locator' : 'repository-search'}
+          ref={newTab ? undefined : searchInputRef}
+          value={newTab ? locator : searchQuery}
+          onChange={(event) => newTab
+            ? onLocatorChange(event.target.value)
+            : onSearchQueryChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (newTab && event.key === 'Enter') {
+              event.preventDefault()
+              onLocatorSubmit()
+              return
+            }
+            if (!newTab) onSearchKeyDown(event)
+          }}
+          placeholder={newTab ? 'Enter a GitHub pull request URL' : 'Search files and content'}
+          aria-label={newTab ? 'Open pull request URL' : 'Search repository files and content'}
+          role={newTab ? undefined : 'combobox'}
+          aria-autocomplete={newTab ? undefined : 'list'}
+          aria-controls={newTab ? undefined : 'repository-search-results'}
+          aria-activedescendant={newTab ? undefined : activeSearchResultId}
+          aria-expanded={newTab ? undefined : searchQuery.trim().length > 0}
+          disabled={newTab ? locatorBusy : snapshot == null}
         />
-        {searchingContent ? <IconRefresh className="spin search-spinner" /> : null}
-        {searchQuery !== '' ? (
-          <button className="clear-search" type="button" onClick={() => onSearchQueryChange('')}>
+        {searchingContent || locatorBusy ? <IconRefresh className="spin search-spinner" /> : null}
+        {(newTab ? locator : searchQuery) !== '' ? (
+          <button className="clear-search" type="button" onClick={() => newTab
+            ? onLocatorChange('')
+            : onSearchQueryChange('')}>
             <IconX /><span className="sr-only">Clear search</span>
           </button>
-        ) : (
+        ) : newTab ? null : (
           <ShortcutHint keys={formatKeybinding(keybindings.goToFile)} label="Search repository shortcut" />
         )}
       </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react'
+import type { CodeViewItem } from '@pierre/diffs'
 
-import type { ReviewThread } from './ReviewComments'
+import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import {
   loadStoredReviewThreads,
   reviewThreadStorageKey,
@@ -12,6 +13,7 @@ import {
   viewedFileStorageKey,
   type ViewedFileSignatures
 } from './viewedFileStorage'
+import { reanchorReviewThreads } from './reviewThreadAnchors'
 
 interface ReviewSession {
   threadsByPath: Record<string, ReviewThread[]>
@@ -20,9 +22,19 @@ interface ReviewSession {
   setViewedFiles: Dispatch<SetStateAction<ViewedFileSignatures>>
 }
 
+interface ReviewReanchorSource {
+  items: readonly CodeViewItem<ReviewAnnotationMetadata>[]
+  loading: boolean
+  enabled: boolean
+}
+
 // Draft comments and viewed marks belong to one review of one repository, and
 // both outlive the window: they are restored on mount and saved on every change.
-export function useReviewSession(root: string, reviewIdentity: string): ReviewSession {
+export function useReviewSession(
+  root: string,
+  reviewIdentity: string,
+  reanchorSource: ReviewReanchorSource
+): ReviewSession {
   const threadStorageKey = reviewThreadStorageKey(root, reviewIdentity)
   const viewedStorageKey = viewedFileStorageKey(root, reviewIdentity)
   const [threadsByPath, setThreadsByPath] = useState<Record<string, ReviewThread[]>>(
@@ -35,6 +47,15 @@ export function useReviewSession(root: string, reviewIdentity: string): ReviewSe
   useEffect(() => {
     saveStoredReviewThreads(threadStorageKey, threadsByPath)
   }, [threadStorageKey, threadsByPath])
+
+  useEffect(() => {
+    if (!reanchorSource.enabled) return
+    setThreadsByPath((current) => reanchorReviewThreads(
+      reanchorSource.items,
+      current,
+      !reanchorSource.loading
+    ))
+  }, [reanchorSource.enabled, reanchorSource.items, reanchorSource.loading])
 
   useEffect(() => {
     saveStoredViewedFiles(viewedStorageKey, viewedFiles)

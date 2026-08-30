@@ -35,6 +35,7 @@ interface AgentPanelProps {
   model: string
   effort: string
   accessMode: AgentAccessMode
+  accessModeLocked: boolean
   models: readonly AgentModelOption[]
   efforts: readonly string[]
   loadingModels: boolean
@@ -73,7 +74,7 @@ const RESET_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 
 export const AgentPanel = memo(function AgentPanel({
   answer, blocks, streaming, error, question, activity, approvals, usage, history,
-  startedAt, completedAt, provider, model, effort, accessMode, models, efforts,
+  startedAt, completedAt, provider, model, effort, accessMode, accessModeLocked, models, efforts,
   loadingModels, statuses, loadingStatuses, authenticatingProvider, statusError,
   attachments, contextLabel, onProviderChange, onModelChange, onEffortChange,
   onAccessModeChange, onConfirm, onRefreshStatuses, onLogin, onApprovalDecision,
@@ -205,11 +206,13 @@ export const AgentPanel = memo(function AgentPanel({
             <div className="agent-attachments" aria-label="Attached selections">
               {attachments.map((attachment) => {
                 const id = agentAttachmentId(attachment)
+                const label = formatAgentAttachment(attachment)
                 return (
-                  <span className="agent-attachment" key={id} title={id}>
-                    <code>{formatAgentAttachment(attachment)}</code>
+                  <span className="agent-attachment" key={id}
+                    title={`${attachment.subject.repositoryName} · ${attachment.path} · ${attachment.side === 'deletions' ? 'old' : 'new'} side`}>
+                    <code>{label}</code>
                     <button type="button" onClick={() => onRemoveAttachment(id)}
-                      aria-label={`Remove ${id}`}><IconX /></button>
+                      aria-label={`Remove ${label}`}><IconX /></button>
                   </span>
                 )
               })}
@@ -242,7 +245,10 @@ export const AgentPanel = memo(function AgentPanel({
               </AgentConfigField>
               <AgentConfigField label="Access" controlId="agent-access">
                 <AgentSelect label="Access" name="agent-access" value={accessMode}
-                  title={ACCESS_MODES[accessMode].description}
+                  disabled={accessModeLocked}
+                  title={accessModeLocked
+                    ? 'Patch and Since tabs are read-only because they do not own a writable checkout.'
+                    : ACCESS_MODES[accessMode].description}
                   onChange={async (value) => {
                     const nextMode = value as AgentAccessMode
                     if (nextMode === 'full-access' && accessMode !== 'full-access' &&
@@ -266,7 +272,9 @@ export const AgentPanel = memo(function AgentPanel({
                 </AgentSelect>
               </AgentConfigField>
               <p className="agent-config-help"><IconShieldKeyhole aria-hidden="true" />
-                {ACCESS_MODES[accessMode].description}</p>
+                {accessModeLocked
+                  ? 'Patch and Since tabs are locked to Review access. The agent receives exact selected code but cannot modify another checkout.'
+                  : ACCESS_MODES[accessMode].description}</p>
             </div>
           ) : null}
           <div className="agent-composer-actions">

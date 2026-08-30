@@ -16,7 +16,7 @@ import {
   orderReviewItems,
   retainReviewItems
 } from './reviewItems'
-import { reviewScrollAnchorTarget } from './MultiFileReview'
+import { agentSelectionForReviewItem, reviewScrollAnchorTarget } from './MultiFileReview'
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import type { RemoteReviewThread } from '../../shared/contracts'
 
@@ -63,6 +63,33 @@ describe('createPatchReviewItems', () => {
     const items = createPatchReviewItems(patch, 'pr-files-api')
     expect(items).toHaveLength(1)
     expect(items[0]?.id).toBe('review:src/page.tsx')
+  })
+
+  test('captures exact old-side text and revision identity for the agent', () => {
+    const patch = [
+      'diff --git a/src/value.ts b/src/value.ts',
+      `index ${'1'.repeat(40)}..${'2'.repeat(40)} 100644`,
+      '--- a/src/value.ts',
+      '+++ b/src/value.ts',
+      '@@ -1,2 +1,2 @@',
+      ' export const stable = true',
+      '-export const value = 1',
+      '+export const value = 2'
+    ].join('\n') + '\n'
+    const item = createPatchReviewItems(patch, 'pr-agent')[0]!
+
+    expect(agentSelectionForReviewItem(item, 'src/value.ts', {
+      start: 2,
+      end: 2,
+      side: 'deletions'
+    })).toEqual({
+      path: 'src/value.ts',
+      startLine: 2,
+      endLine: 2,
+      side: 'deletions',
+      selectedText: 'export const value = 1',
+      blobOid: '1'.repeat(40)
+    })
   })
 })
 

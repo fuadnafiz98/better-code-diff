@@ -1,4 +1,7 @@
+import { createHash } from 'node:crypto'
+
 import type { OmittedDiffFile, PullRequestFile } from '../shared/contracts.js'
+import { parseDiffGitHeaderPaths } from '../shared/patchHeaders.js'
 
 import { comparePaths, splitNullDelimited } from './gitCommands.js'
 
@@ -15,7 +18,6 @@ export const MAX_PULL_REQUEST_FILES = 3_000
 // request. Fetched one after another a 3000-file review took nearly two minutes.
 const PULL_REQUEST_FILES_PAGE_CONCURRENCY = 8
 const GIT_DIFF_SECTION_PREFIX = 'diff --git '
-const DIFF_HEADER_PATHS = /^diff --git (?:"a\/(.+?)"|a\/(.+?)) (?:"b\/(.+?)"|b\/(.+?))$/
 
 function patchPathNeedsQuotes(path: string): boolean {
   if (/["\\]/.test(path)) return true
@@ -92,7 +94,12 @@ export function parseNumstat(buffer: Buffer): DiffChurnEntry[] {
 
 export function diffFilesFromChurn(entries: readonly DiffChurnEntry[]): PullRequestFile[] {
   return entries
-    .map((entry) => ({ path: entry.path, additions: entry.additions, deletions: entry.deletions }))
+    .map((entry) => ({
+      path: entry.path,
+      ...(entry.previousPath == null ? {} : { previousPath: entry.previousPath }),
+      additions: entry.additions,
+      deletions: entry.deletions
+    }))
     .sort((left, right) => comparePaths(left.path, right.path))
 }
 
@@ -160,6 +167,7 @@ export function pullRequestFilePageWave(startPage: number): number[] {
 export interface RawPullRequestFile {
   filename: string
   previous_filename?: string
+  sha?: string
   status?: string
   additions?: number
   deletions?: number
@@ -197,27 +205,54 @@ export function buildPullRequestPatchFromFiles(rawFiles: readonly RawPullRequest
     if (path === '') continue
     const additions = Number.isFinite(rawFile.additions) ? Number(rawFile.additions) : 0
     const deletions = Number.isFinite(rawFile.deletions) ? Number(rawFile.deletions) : 0
-    files.push({ path, additions, deletions })
+    const previousPath = typeof rawFile.previous_filename === 'string' && rawFile.previous_filename !== ''
+      ? rawFile.previous_filename
+      : path
+    const blobOid = typeof rawFile.sha === 'string' && /^[0-9a-f]{40,64}$/i.test(rawFile.sha)
+      ? rawFile.sha.toLowerCase()
+      : undefined
+    const blobIdentity = rawFile.status === 'removed'
+      ? (blobOid == null ? {} : { baseBlobOid: blobOid })
+      : (blobOid == null ? {} : { headBlobOid: blobOid })
     if (typeof rawFile.patch !== 'string' || rawFile.patch === '') {
+      files.push({
+        path,
+        ...(previousPath === path ? {} : { previousPath }),
+        additions,
+        deletions,
+        ...blobIdentity
+      })
       omittedFiles.push({ path, reason: 'too-large', additions, deletions })
       continue
     }
 
-    const previousPath = typeof rawFile.previous_filename === 'string' && rawFile.previous_filename !== ''
-      ? rawFile.previous_filename
-      : path
     const header = [`${GIT_DIFF_SECTION_PREFIX}${formatPatchPath('a', previousPath)} ${formatPatchPath('b', path)}`]
     if (rawFile.status === 'added') header.push('new file mode 100644')
     if (rawFile.status === 'removed') header.push('deleted file mode 100644')
     if (rawFile.status === 'renamed' && previousPath !== path) {
       header.push(`rename from ${previousPath}`, `rename to ${path}`)
     }
+    if (blobOid != null) {
+      const zeroOid = '0'.repeat(blobOid.length)
+      const baseOid = rawFile.status === 'removed' ? blobOid : zeroOid
+      const headOid = rawFile.status === 'removed' ? zeroOid : blobOid
+      header.push(`index ${baseOid}..${headOid} 100644`)
+    }
     header.push(
       rawFile.status === 'added' ? '--- /dev/null' : `--- ${formatPatchPath('a', previousPath)}`,
       rawFile.status === 'removed' ? '+++ /dev/null' : `+++ ${formatPatchPath('b', path)}`
     )
     const body = rawFile.patch.endsWith('\n') ? rawFile.patch : `${rawFile.patch}\n`
-    sections.push(`${header.join('\n')}\n${body}`)
+    const section = `${header.join('\n')}\n${body}`
+    sections.push(section)
+    files.push({
+      path,
+      ...(previousPath === path ? {} : { previousPath }),
+      additions,
+      deletions,
+      ...blobIdentity,
+      patchHash: createHash('sha256').update(section).digest('hex')
+    })
   }
   return { patch: sections.join(''), files, omittedFiles }
 }
@@ -233,16 +268,35 @@ function findPatchSectionStarts(patch: string): number[] {
   return starts
 }
 
-function patchSectionPath(patch: string, start: number, end: number): string {
+function patchSectionPaths(patch: string, start: number, end: number): {
+  path: string
+  previousPath?: string
+} {
   const newlineIndex = patch.indexOf('\n', start)
   const headerEnd = newlineIndex === -1 || newlineIndex > end ? end : newlineIndex
   const header = patch.slice(start, headerEnd)
-  const match = DIFF_HEADER_PATHS.exec(header)
-  const plainPath = match?.[4]
-  if (plainPath != null) return plainPath
-  const quotedPath = match?.[3]
-  if (quotedPath != null) return quotedPath.replace(/\\(.)/g, '$1')
-  return header.slice(GIT_DIFF_SECTION_PREFIX.length)
+  const paths = parseDiffGitHeaderPaths(header)
+  if (paths == null) return { path: header.slice(GIT_DIFF_SECTION_PREFIX.length) }
+  return {
+    path: paths.path,
+    ...(paths.previousPath === paths.path ? {} : { previousPath: paths.previousPath })
+  }
+}
+
+function patchSectionBlobOids(section: string): {
+  baseBlobOid?: string
+  headBlobOid?: string
+} {
+  const match = /^index ([0-9a-f]+)\.\.([0-9a-f]+)(?: \d+)?$/im.exec(section)
+  if (match == null) return {}
+  const normalize = (oid: string | undefined): string | undefined =>
+    oid == null || /^0+$/.test(oid) ? undefined : oid.toLowerCase()
+  const baseBlobOid = normalize(match[1])
+  const headBlobOid = normalize(match[2])
+  return {
+    ...(baseBlobOid == null ? {} : { baseBlobOid }),
+    ...(headBlobOid == null ? {} : { headBlobOid })
+  }
 }
 
 function countPatchSectionChurn(
@@ -279,9 +333,13 @@ export function filesFromPatch(patch: string): PullRequestFile[] {
   for (let index = 0; index < sectionStarts.length; index += 1) {
     const start = sectionStarts[index]!
     const end = sectionStarts[index + 1] ?? patch.length
+    const section = patch.slice(start, end)
+    const paths = patchSectionPaths(patch, start, end)
     files.push({
-      path: patchSectionPath(patch, start, end),
-      ...countPatchSectionChurn(patch, start, end)
+      ...paths,
+      ...countPatchSectionChurn(patch, start, end),
+      ...patchSectionBlobOids(section),
+      patchHash: createHash('sha256').update(section).digest('hex')
     })
   }
   return files
@@ -312,7 +370,7 @@ export function limitPatchFileSize(
       continue
     }
     omittedFiles.push({
-      path: patchSectionPath(patch, start, end),
+      path: patchSectionPaths(patch, start, end).path,
       reason: 'too-large',
       ...countPatchSectionChurn(patch, start, end)
     })

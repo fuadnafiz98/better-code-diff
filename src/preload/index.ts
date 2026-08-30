@@ -14,12 +14,19 @@ import type {
 import { IPC_CHANNELS } from '../shared/contracts.js'
 
 // The detail main can supply; the renderer-local half is measured here.
-type MainPerformanceDetail = Pick<PerformanceMetricsDetail, 'memoryByProcessType' | 'mainPrivateMegabytes'>
+type MainPerformanceDetail = Pick<
+  PerformanceMetricsDetail,
+  'mainStartup' | 'memoryByProcessType' | 'mainPrivateMegabytes'
+>
 
 const repositoryApi: RepositoryApi = {
   getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
   openPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPath, path),
+  activateRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.activateRepository, root),
+  releaseRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.releaseRepository, root),
+  resolvePullRequestRepository: (pullRequestUrl) =>
+    ipcRenderer.invoke(IPC_CHANNELS.resolvePullRequestRepository, pullRequestUrl),
   readClipboardText: (type) => ipcRenderer.invoke(IPC_CHANNELS.readClipboardText, type),
   revealPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.revealPath, path),
   refresh: () => ipcRenderer.invoke(IPC_CHANNELS.refresh),
@@ -45,8 +52,10 @@ const repositoryApi: RepositoryApi = {
   fetchRemote: () => ipcRenderer.invoke(IPC_CHANNELS.fetchRemote),
   pullCurrentBranch: () => ipcRenderer.invoke(IPC_CHANNELS.pullCurrentBranch),
   pushCurrentBranch: () => ipcRenderer.invoke(IPC_CHANNELS.pushCurrentBranch),
-  getPullRequestReview: (selector) => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestReview, selector),
-  cancelPullRequestReview: () => ipcRenderer.send(IPC_CHANNELS.cancelPullRequestReview),
+  getPullRequestReview: (root, selector, requestId) =>
+    ipcRenderer.invoke(IPC_CHANNELS.getPullRequestReview, root, selector, requestId),
+  cancelPullRequestReview: (root, requestId) =>
+    ipcRenderer.send(IPC_CHANNELS.cancelPullRequestReview, root, requestId),
   checkoutPullRequest: (number) => ipcRenderer.invoke(IPC_CHANNELS.checkoutPullRequest, number),
   submitPullRequestReview: (selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, commitId, event, body, comments),
   getAgentModels: () => ipcRenderer.invoke(IPC_CHANNELS.getAgentModels),

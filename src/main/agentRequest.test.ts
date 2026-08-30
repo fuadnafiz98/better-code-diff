@@ -73,9 +73,25 @@ describe('parseAgentAskRequest', () => {
     provider: 'claude' as const,
     model: 'sonnet',
     effort: 'high',
-    accessMode: 'auto' as const,
+    accessMode: 'review' as const,
     prompt: 'Explain',
-    context: 'diff'
+    context: 'diff',
+    subject: {
+      tabId: 'patch:repo-a:42',
+      repositoryRoot: '/repo-a',
+      repositoryName: 'repo-a',
+      source: 'patch' as const,
+      baseOid: 'base-42',
+      headOid: 'head-42'
+    },
+    selections: [{
+      path: 'src/value.ts',
+      startLine: 4,
+      endLine: 5,
+      side: 'additions' as const,
+      selectedText: 'export const value = 42',
+      blobOid: 'blob-42'
+    }]
   }
 
   it('accepts a well-formed request', async () => {
@@ -108,7 +124,7 @@ describe('parseAgentAskRequest', () => {
   })
 
   it('rejects a missing or mistyped field on every required key', async () => {
-    for (const key of ['id', 'model', 'effort', 'prompt', 'context'] as const) {
+    for (const key of ['id', 'model', 'effort', 'prompt', 'context', 'subject', 'selections'] as const) {
       await expect(parseAgentAskRequest({ ...valid, [key]: 7 })).rejects.toThrow('not understood')
       const missing: Record<string, unknown> = { ...valid }
       delete missing[key]
@@ -119,6 +135,51 @@ describe('parseAgentAskRequest', () => {
   it('rejects an unknown access mode and a non-string session id', async () => {
     await expect(parseAgentAskRequest({ ...valid, accessMode: 'root' })).rejects.toThrow('not understood')
     await expect(parseAgentAskRequest({ ...valid, resumeSessionId: 7 })).rejects.toThrow('not understood')
+  })
+
+  it('requires a registered-tab-shaped subject with an absolute repository root', async () => {
+    await expect(parseAgentAskRequest({
+      ...valid,
+      subject: { ...valid.subject, repositoryRoot: '../other-repo' }
+    })).rejects.toThrow('repository root')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      subject: { ...valid.subject, source: 'stage' }
+    })).rejects.toThrow('not understood')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      subject: { ...valid.subject, tabId: '' }
+    })).rejects.toThrow('review tab')
+  })
+
+  it('requires exact revisions and read-only access for immutable review tabs', async () => {
+    await expect(parseAgentAskRequest({
+      ...valid,
+      accessMode: 'auto'
+    })).rejects.toThrow('read-only agent access')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      subject: { ...valid.subject, headOid: null }
+    })).rejects.toThrow('exact revision')
+  })
+
+  it('validates exact selection paths, ranges, sides, and text', async () => {
+    await expect(parseAgentAskRequest({
+      ...valid,
+      selections: [{ ...valid.selections[0], path: '../other-repo/secret.ts' }]
+    })).rejects.toThrow('code path')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      selections: [{ ...valid.selections[0], startLine: 9, endLine: 2 }]
+    })).rejects.toThrow('line range')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      selections: [{ ...valid.selections[0], side: 'both' }]
+    })).rejects.toThrow('not understood')
+    await expect(parseAgentAskRequest({
+      ...valid,
+      selections: [{ ...valid.selections[0], selectedText: '' }]
+    })).rejects.toThrow('code selection')
   })
 
   it('rejects an id that is blank or long enough to be a payload', async () => {

@@ -118,9 +118,11 @@ export function useRepositorySearch(
       previousScheduledQueryRef.current = query
       setContentResults([])
       setSearchingContent(false)
-      window.repository?.cancelContentSearch()
+      if (snapshot != null) window.repository?.cancelContentSearch()
       return
     }
+
+    if (snapshot == null) return
 
     setContentResults([])
     setSearchingContent(true)
@@ -141,7 +143,7 @@ export function useRepositorySearch(
         })
     }, delay)
     return () => window.clearTimeout(timeout)
-  }, [onError, query])
+  }, [onError, query, snapshot])
 
   // A bare object literal here defeated `memo(AppLayout)` and `memo(AgentSessionLayout)`
   // on every App render, so both boundaries cost a 40-key compare and saved nothing.

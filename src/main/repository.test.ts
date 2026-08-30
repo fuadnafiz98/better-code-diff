@@ -488,7 +488,9 @@ describe('buildPullRequestPatchFromFiles', () => {
       + '+++ b/src/app.ts\n'
       + '@@ -1 +1 @@\n-old\n+new\n'
     )
-    expect(built.files).toEqual([{ path: 'src/app.ts', additions: 1, deletions: 1 }])
+    expect(built.files).toHaveLength(1)
+    expect(built.files[0]).toMatchObject({ path: 'src/app.ts', additions: 1, deletions: 1 })
+    expect(built.files[0]?.patchHash).toMatch(/^[0-9a-f]{64}$/)
     expect(built.omittedFiles).toEqual([])
   })
 
@@ -544,16 +546,20 @@ describe('filesFromPatch', () => {
       'diff --git a/old/name.ts b/new/name.ts\nrename from old/name.ts\nrename to new/name.ts\n--- a/old/name.ts\n+++ b/new/name.ts\n@@ -1 +1 @@\n-a\n+b\n',
       'diff --git a/gone.ts b/gone.ts\ndeleted file mode 100644\n--- a/gone.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-only\n'
     ].join('')
-    expect(filesFromPatch(patch)).toEqual([
-      { path: 'src/a.ts', additions: 1, deletions: 1 },
-      { path: 'new/name.ts', additions: 1, deletions: 1 },
-      { path: 'gone.ts', additions: 0, deletions: 1 }
+    const files = filesFromPatch(patch)
+    expect(files.map(({ path, previousPath, additions, deletions }) => ({
+      path, previousPath, additions, deletions
+    }))).toEqual([
+      { path: 'src/a.ts', previousPath: undefined, additions: 1, deletions: 1 },
+      { path: 'new/name.ts', previousPath: 'old/name.ts', additions: 1, deletions: 1 },
+      { path: 'gone.ts', previousPath: undefined, additions: 0, deletions: 1 }
     ])
+    expect(files.every((file) => /^[0-9a-f]{64}$/.test(file.patchHash ?? ''))).toBe(true)
   })
 
   it('unescapes a quoted path and reports a binary section as no churn', () => {
-    const patch = 'diff --git "a/dir/a b.ts" "b/dir/a b.ts"\nBinary files a/dir/a b.ts and b/dir/a b.ts differ\n'
-    expect(filesFromPatch(patch)).toEqual([{ path: 'dir/a b.ts', additions: 0, deletions: 0 }])
+    const patch = 'diff --git "a/dir/a\\"b-\\303\\251.ts" "b/dir/a\\"b-\\303\\251.ts"\nBinary files differ\n'
+    expect(filesFromPatch(patch)[0]).toMatchObject({ path: 'dir/a"b-é.ts', additions: 0, deletions: 0 })
   })
 
   it('returns nothing for an empty patch', () => {
@@ -880,6 +886,8 @@ describe('PullRequestReviewCache', () => {
   const review = (overrides: Record<string, unknown> = {}): PullRequestReview => ({
     kind: 'github',
     selector: '7',
+    baseOid: 'base-oid-1',
+    headOid: 'oid-1',
     commitId: 'oid-1',
     viewerCanSubmitDecision: true,
     pullRequest: {
@@ -1310,13 +1318,24 @@ describe('RepositoryService', () => {
       expect(integration.defaultBranch).toBe('main')
       expect(integration.commits.map((commit) => commit.subject)).toEqual(['Feature', 'Base'])
       expect(review.kind).toBe('local')
-      expect(review.files).toEqual([{ path: 'value.txt', additions: 1, deletions: 0 }])
+      expect(review.baseOid).toBe(integration.commits[1]!.oid)
+      expect(review.headOid).toBe(integration.commits[0]!.oid)
+      expect(review.files).toHaveLength(1)
+      expect(review.files[0]).toMatchObject({ path: 'value.txt', additions: 1, deletions: 0 })
+      expect(review.files[0]?.baseBlobOid).toMatch(/^[0-9a-f]{40}$/)
+      expect(review.files[0]?.headBlobOid).toMatch(/^[0-9a-f]{40}$/)
       expect(review.omittedFiles).toEqual([])
       expect(review.patch).toContain('+feature')
       expect(commitReview.title).toContain('Feature')
+      expect(commitReview.baseOid).toBe(integration.commits[1]!.oid)
+      expect(commitReview.headOid).toBe(integration.commits[0]!.oid)
       expect(commitReview.patch).toContain('+feature')
       expect(rootCommitReview.baseRefName).toBe('Empty tree')
-      expect(rootCommitReview.files).toEqual([{ path: 'value.txt', additions: 1, deletions: 0 }])
+      expect(rootCommitReview.baseOid).toBe('4b825dc642cb6eb9a060e54bf8d69288fbee4904')
+      expect(rootCommitReview.headOid).toBe(integration.commits[1]!.oid)
+      expect(rootCommitReview.files).toHaveLength(1)
+      expect(rootCommitReview.files[0]).toMatchObject({ path: 'value.txt', additions: 1, deletions: 0 })
+      expect(rootCommitReview.files[0]?.headBlobOid).toMatch(/^[0-9a-f]{40}$/)
       expect(rootCommitReview.patch).toContain('+base')
     } finally {
       await rm(repositoryPath, { recursive: true, force: true })

@@ -21,4 +21,17 @@ describe('formatReviewCommentsForAgent', () => {
     expect(prompt).toContain('Handle the error explicitly.')
     expect(prompt).toContain('Reply: Preserve the original cause.')
   })
+
+  it('warns the agent when a comment needs a human-selected location', () => {
+    const prompt = formatReviewCommentsForAgent([{
+      path: 'src/app.ts',
+      thread: {
+        id: 'thread-1', body: 'Keep this check.', lineNumber: 8,
+        range: { start: 8, end: 8, side: 'additions' }, replies: [],
+        resolved: false, orphaned: true
+      }
+    }])
+
+    expect(prompt).toContain('[Orphaned — verify location]')
+  })
 })

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { IconCheck, IconCodeComments, IconCopy } from '@pierre/icons'
+import { IconCheck, IconCodeComments, IconCopy, IconRefresh, IconTrash, IconX } from '@pierre/icons'
 
 import { formatSelectedRange, type ReviewThread } from './ReviewComments'
 
@@ -11,14 +11,29 @@ export interface ReviewSummaryEntry {
 export function formatReviewCommentsForAgent(entries: readonly ReviewSummaryEntry[]): string {
   const comments = entries.map(({ path, thread }, index) => {
     const replies = thread.replies.map((reply) => `   Reply: ${reply.body}`).join('\n')
-    return `${index + 1}. ${path} — ${formatSelectedRange(thread.range)}\n   ${thread.body}${replies === '' ? '' : `\n${replies}`}`
+    const status = thread.orphaned ? ' [Orphaned — verify location]' : ''
+    return `${index + 1}. ${path} — ${formatSelectedRange(thread.range)}${status}\n   ${thread.body}${replies === '' ? '' : `\n${replies}`}`
   })
   return `Please address these code review comments:\n\n${comments.join('\n\n')}`
 }
 
 const COPY_STATE_MS = { copied: 1_600, failed: 2_400 } as const
 
-export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntry[] }): React.JSX.Element | null {
+interface ReviewSummaryProps {
+  entries: readonly ReviewSummaryEntry[]
+  reattachingThreadId: string | null
+  onBeginReattach(entry: ReviewSummaryEntry): void
+  onCancelReattach(): void
+  onDrop(entry: ReviewSummaryEntry): void
+}
+
+export function ReviewSummary({
+  entries,
+  reattachingThreadId,
+  onBeginReattach,
+  onCancelReattach,
+  onDrop
+}: ReviewSummaryProps): React.JSX.Element | null {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const resetTimerRef = useRef(0)
 
@@ -57,13 +72,30 @@ export function ReviewSummary({ entries }: { entries: readonly ReviewSummaryEntr
         </button>
       </header>
       <ol>
-        {entries.map(({ path, thread }) => (
-          <li key={thread.id}>
-            <div><code>{path}</code><span>{formatSelectedRange(thread.range)}</span>{thread.resolved ? <em>Resolved</em> : null}</div>
-            <p>{thread.body}</p>
-            {thread.replies.map((reply) => <blockquote key={reply.id}>{reply.body}</blockquote>)}
-          </li>
-        ))}
+        {entries.map((entry) => {
+          const { path, thread } = entry
+          const reattaching = reattachingThreadId === thread.id
+          return (
+            <li key={thread.id}>
+              <div className="review-summary-line"><code>{path}</code><span>{formatSelectedRange(thread.range)}</span>
+                {thread.orphaned ? <em data-state="orphaned">Orphaned</em> : thread.resolved ? <em>Resolved</em> : null}
+              </div>
+              <p>{thread.body}</p>
+              {thread.replies.map((reply) => <blockquote key={reply.id}>{reply.body}</blockquote>)}
+              {thread.orphaned ? (
+                <div className="review-orphan-actions">
+                  <span>{reattaching ? 'Select replacement lines in any file.' : 'The original lines no longer have one safe match.'}</span>
+                  {reattaching ? (
+                    <button type="button" onClick={onCancelReattach}><IconX />Cancel</button>
+                  ) : (
+                    <button type="button" onClick={() => onBeginReattach(entry)}><IconRefresh />Reattach</button>
+                  )}
+                  <button type="button" onClick={() => onDrop(entry)}><IconTrash />Drop</button>
+                </div>
+              ) : null}
+            </li>
+          )
+        })}
       </ol>
     </section>
   )

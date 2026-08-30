@@ -67,13 +67,32 @@ export function dropChangedViewedFiles(
   return changed ? next : signatures
 }
 
-// Patch cache keys carry the load timestamp, so they cannot identify content.
-// Git object IDs identify it exactly; patch line counts approximate it otherwise.
+function hashPatchLines(lines: readonly string[], seed: number): number {
+  let hash = seed
+  for (const line of lines) {
+    for (let index = 0; index < line.length; index += 1) {
+      hash = Math.imul(hash ^ line.charCodeAt(index), 16_777_619)
+    }
+    hash = Math.imul(hash ^ 0, 16_777_619)
+  }
+  return hash >>> 0
+}
+
+function patchContentSignature(type: string, additions: readonly string[], deletions: readonly string[]): string {
+  const first = hashPatchLines([type, ...additions, '\u0001', ...deletions], 2_166_136_261)
+  const second = hashPatchLines([type, ...deletions, '\u0002', ...additions], 2_654_435_761)
+  return `patch:${first.toString(16).padStart(8, '0')}${second.toString(16).padStart(8, '0')}`
+}
+
+// Git object IDs identify content exactly. Patches without object IDs use a
+// content hash; equal line counts alone are never accepted as file identity.
 export function reviewFileSignature<Metadata>(item: CodeViewItem<Metadata>): string {
-  if (item.type === 'file') return item.file.cacheKey ?? `contents:${item.file.contents.length}`
+  if (item.type === 'file') {
+    return item.file.cacheKey ?? patchContentSignature('file', [item.file.contents], [])
+  }
   const { fileDiff } = item
   if (fileDiff.newObjectId != null) return `${fileDiff.prevObjectId ?? 'none'}..${fileDiff.newObjectId}`
-  return `${fileDiff.type}:${fileDiff.additionLines.length}:${fileDiff.deletionLines.length}`
+  return patchContentSignature(fileDiff.type, fileDiff.additionLines, fileDiff.deletionLines)
 }
 
 export function markViewedFile<Metadata>(

@@ -30,10 +30,25 @@ export interface RepositoryChangeEvent {
   revision: number
 }
 
+export interface MainStartupMetrics {
+  appReady: number | null
+  windowCreated: number | null
+  restoreSettled: number | null
+}
+
+export interface RendererStartupMetrics {
+  rendererLoaded: number | null
+  reactCommitted: number | null
+  snapshotReady: number | null
+  explorerCommitted: number | null
+  viewerCommitted: number | null
+}
+
 // Split from PerformanceMetrics because collecting it costs a full document
 // traversal in the preload and a per-process map/sort in main. Only gathered
 // while the diagnostics disclosure that renders it is open.
 export interface PerformanceMetricsDetail {
+  mainStartup: MainStartupMetrics
   memoryByProcessType: Array<{ type: string; megabytes: number }>
   mainPrivateMegabytes: number
   rendererHeapUsedMegabytes: number
@@ -150,8 +165,14 @@ export interface PullRequestInboxSnapshot {
 
 export interface PullRequestFile {
   path: string
+  previousPath?: string
   additions: number
   deletions: number
+  /** Full blob IDs are preferred for checkpoint and viewed-state identity. */
+  baseBlobOid?: string
+  headBlobOid?: string
+  /** Hash of the complete patch section when a full blob ID is unavailable. */
+  patchHash?: string
 }
 
 export interface RemoteReviewComment {
@@ -203,6 +224,10 @@ export interface WorkingTreePatch {
 export interface PullRequestReview {
   kind: 'github'
   selector: string
+  /** Immutable comparison snapshot. `baseOid` is the PR base commit. */
+  baseOid: string
+  /** Immutable comparison snapshot. Also used when submitting a review. */
+  headOid: string
   commitId: string
   viewerCanSubmitDecision: boolean
   pullRequest: PullRequestSummary
@@ -220,13 +245,21 @@ export interface PullRequestReview {
  * files, each carrying only its own slice of the patch.
  */
 export type PullRequestReviewProgress =
-  | { kind: 'metadata'; selector: string; review: PullRequestReview }
+  | {
+      kind: 'metadata'
+      selector: string
+      review: PullRequestReview
+      root?: string
+      requestId?: string
+    }
   | {
       kind: 'files'
       selector: string
       patch: string
       files: PullRequestFile[]
       omittedFiles: OmittedDiffFile[]
+      root?: string
+      requestId?: string
     }
 
 export interface LocalBranchReview {
@@ -235,6 +268,10 @@ export interface LocalBranchReview {
   title: string
   baseRefName: string
   headRefName: string
+  /** Resolved comparison base. For `A...B`, this is the merge base. */
+  baseOid: string
+  /** Resolved comparison head. */
+  headOid: string
   files: PullRequestFile[]
   patch: string
   omittedFiles: OmittedDiffFile[]
@@ -379,6 +416,26 @@ export interface AgentApprovalRequest {
 
 export type AgentApprovalDecision = 'accept' | 'acceptForSession' | 'decline'
 
+export type AgentSubjectSource = 'workingTree' | 'patch' | 'since'
+
+export interface AgentRequestSubject {
+  tabId: string
+  repositoryRoot: string
+  repositoryName: string
+  source: AgentSubjectSource
+  baseOid: string | null
+  headOid: string | null
+}
+
+export interface AgentRequestSelection {
+  path: string
+  startLine: number
+  endLine: number
+  side: 'additions' | 'deletions'
+  selectedText: string
+  blobOid: string | null
+}
+
 export interface AgentAskInput {
   id: string
   provider: AgentProvider
@@ -387,6 +444,8 @@ export interface AgentAskInput {
   accessMode: AgentAccessMode
   prompt: string
   context: string
+  subject: AgentRequestSubject
+  selections: AgentRequestSelection[]
   resumeSessionId?: string
 }
 
@@ -422,6 +481,9 @@ export interface RepositoryApi {
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
   openPath(path: string): Promise<RepositorySnapshot>
+  activateRepository(root: string): Promise<RepositorySnapshot>
+  releaseRepository(root: string): Promise<void>
+  resolvePullRequestRepository(pullRequestUrl: string): Promise<RepositorySnapshot | null>
   readClipboardText(type?: string): Promise<string>
   revealPath(path: string): Promise<void>
   refresh(): Promise<RepositorySnapshot>
@@ -439,8 +501,8 @@ export interface RepositoryApi {
   fetchRemote(): Promise<GitIntegrationSnapshot>
   pullCurrentBranch(): Promise<RepositorySnapshot>
   pushCurrentBranch(): Promise<GitIntegrationSnapshot>
-  getPullRequestReview(selector: number | string): Promise<PullRequestReview>
-  cancelPullRequestReview(): void
+  getPullRequestReview(root: string, selector: number | string, requestId: string): Promise<PullRequestReview>
+  cancelPullRequestReview(root: string, requestId: string): void
   getPullRequestConversation(selector: number | string): Promise<PullRequestConversation>
   replyToPullRequestThread(threadId: string, body: string): Promise<void>
   setPullRequestThreadResolved(threadId: string, resolved: boolean): Promise<void>
@@ -486,6 +548,9 @@ export const IPC_CHANNELS = {
   getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
   openPath: 'repository:open-path',
+  activateRepository: 'repository:activate',
+  releaseRepository: 'repository:release',
+  resolvePullRequestRepository: 'repository:resolve-pull-request',
   readClipboardText: 'app:clipboard-read-text',
   revealPath: 'app:reveal-path',
   refresh: 'repository:refresh',

@@ -13,6 +13,7 @@ import {
 } from './performanceHistory'
 import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
 import { isHighMemory } from './performanceHealth'
+import { getRendererStartupMetrics } from './startupMetrics'
 
 // The lightweight sample uses Electron's in-process app metrics. Keep it fast
 // enough to catch a short memory spike; expensive process detail remains gated
@@ -30,6 +31,10 @@ type SamplingStatus = 'sampling' | 'live' | 'unavailable'
 
 type ProcessStyle = CSSProperties & {
   '--performance-process-share': number
+}
+
+function formatStartupTiming(milliseconds: number | null | undefined): string {
+  return milliseconds == null ? '—' : `${Math.round(milliseconds)} ms`
 }
 
 export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element {
@@ -105,6 +110,7 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
     ? 'Collecting application performance metrics.'
     : `${metrics.production ? 'Production' : 'Development'} build. ${metrics.processCount} processes. CPU ${formatPerformancePercent(metrics.cpuPercent)}. Total application working set ${formatPerformanceMemory(metrics.workingSetMegabytes)}.${highMemory ? ' High memory warning.' : ''}`
   const detail = metrics?.detail ?? null
+  const rendererStartup = getRendererStartupMetrics()
   const processPeak = Math.max(1, ...(detail?.memoryByProcessType.map((entry) => entry.megabytes) ?? []))
   const statusLabel = samplingStatus === 'live'
     ? 'Live'
@@ -174,6 +180,26 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
                       <div><dt>Files hydrated</dt><dd>{reviewMetrics.hydratedFiles.toLocaleString()}</dd></div>
                       <div><dt>Workspace renders</dt><dd>{reviewMetrics.workspaceRenders.toLocaleString()}</dd></div>
                       <div><dt>Agent events</dt><dd>{reviewMetrics.agentStreamEvents.toLocaleString()}</dd></div>
+                    </dl>
+                  </section>
+
+                  <section className="performance-group">
+                    <h3>Main startup</h3>
+                    <dl>
+                      <div><dt>App ready</dt><dd>{formatStartupTiming(detail?.mainStartup.appReady)}</dd></div>
+                      <div><dt>Window created</dt><dd>{formatStartupTiming(detail?.mainStartup.windowCreated)}</dd></div>
+                      <div><dt>Restore settled</dt><dd>{formatStartupTiming(detail?.mainStartup.restoreSettled)}</dd></div>
+                    </dl>
+                  </section>
+
+                  <section className="performance-group">
+                    <h3>Renderer startup</h3>
+                    <dl>
+                      <div><dt>Renderer loaded</dt><dd>{formatStartupTiming(rendererStartup.rendererLoaded)}</dd></div>
+                      <div><dt>React committed</dt><dd>{formatStartupTiming(rendererStartup.reactCommitted)}</dd></div>
+                      <div><dt>Snapshot ready</dt><dd>{formatStartupTiming(rendererStartup.snapshotReady)}</dd></div>
+                      <div><dt>Explorer committed</dt><dd>{formatStartupTiming(rendererStartup.explorerCommitted)}</dd></div>
+                      <div><dt>Viewer committed</dt><dd>{formatStartupTiming(rendererStartup.viewerCommitted)}</dd></div>
                     </dl>
                   </section>
                 </div>

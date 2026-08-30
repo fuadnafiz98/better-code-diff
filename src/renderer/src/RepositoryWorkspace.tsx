@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type Ref, type SetStateAction } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type Dispatch, type Ref, type SetStateAction } from 'react'
 import type { FileContents } from '@pierre/diffs'
 import type { Editor } from '@pierre/diffs/edit'
 import type { FileTree as FileTreeModel } from '@pierre/trees'
@@ -10,11 +10,14 @@ import { Explorer } from './Explorer'
 import { getEditorThemeType, type AppPreferences } from './preferences'
 import { SidebarResizer } from './SidebarResizer'
 import { PullRequestReviewBar } from './PullRequestReviewBar'
+import { ReviewCheckpointBar } from './ReviewCheckpointBar'
+import type { ReviewCheckpoint } from './reviewCheckpoints'
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import { createPullRequestReviewComments } from './pullRequestReviewComments'
-import type { AgentAttachment } from './agentAttachments'
+import type { AgentSelection } from './agentAttachments'
 import { usePullRequestConversation } from './usePullRequestConversation'
 import { useReviewSession } from './useReviewSession'
+import { useReviewLoadState, type ReviewLoadState } from './useReviewLoadState'
 import { useViewerSuspension } from './useViewerSuspension'
 import type { ReviewCommand } from './keybindings'
 import { useReviewShortcuts } from './useReviewShortcuts'
@@ -27,11 +30,17 @@ import { useFileEditing } from './useFileEditing'
 import { EditorStatusBar } from './editor/EditorStatusBar'
 import { useViewerContext } from './editor/ViewerProviders'
 import { workspaceViewForTreePath } from './workspaceMode'
+import { getErrorMessage } from './repositoryApi'
+import {
+  getLoadedDiffSurface,
+  getLoadedMultiFileReview,
+  preloadWorkspaceViewer,
+  subscribeDiffSurface,
+  subscribeMultiFileReview
+} from './workspaceBoot'
+import { markRendererStartup } from './startupMetrics'
 
 import type { ContentSearchState } from './DiffSurface'
-
-const DiffSurface = lazy(() => import('./DiffSurface'))
-const MultiFileReview = lazy(() => import('./MultiFileReview'))
 
 type TreeFileStatus = Exclude<RepositoryFileStatus, 'conflicted'>
 
@@ -83,6 +92,21 @@ const TREE_STYLES = `
 
   [data-type="item"] {
     border-radius: var(--corner-compact);
+  }
+
+  /* A stationary pointer must not paint every virtualized row that passes under
+     it during wheel or trackpad scrolling. The selected row stays visible. */
+  [data-file-tree-virtualized-root="true"][data-is-scrolling] [data-type="item"] {
+    pointer-events: none;
+    transition: none;
+  }
+
+  [data-file-tree-virtualized-root="true"][data-is-scrolling]
+  [data-type="item"]:hover:not([data-item-selected="true"]),
+  [data-file-tree-virtualized-root="true"][data-is-scrolling]
+  [data-type="item"][data-item-context-hover="true"]:not([data-item-selected="true"]) {
+    background-color: var(--trees-bg);
+    --truncate-marker-background-overlay-color: transparent;
   }
 
   /* The tree marks pointer-focused rows with data-item-focused, which makes its
@@ -152,7 +176,7 @@ const TREE_STYLES = `
 
 const TREE_INSTANT_FOLLOW_RESET_MS = 800
 
-interface RepositoryWorkspaceProps {
+export interface RepositoryWorkspaceProps {
   snapshot: RepositorySnapshot
   selectedPath: string | null
   comparison: FileComparison | null
@@ -160,16 +184,28 @@ interface RepositoryWorkspaceProps {
   diffStyle: DiffStyle
   workspaceView: WorkspaceView
   preferences: AppPreferences
-  onAttachToAgent(attachment: AgentAttachment): void
+  onAttachToAgent(selection: AgentSelection): void
   onPreferencesChange(preferences: AppPreferences): void
   repositoryReview: RepositoryReview | null
+  sinceRemovedPaths: readonly string[]
+  sinceUncertainPaths: readonly string[]
+  reviewWorldSource: 'desk' | 'patch' | 'since'
+  reviewCheckpoint: ReviewCheckpoint | null
+  checkpointChangedFileCount: number
+  checkpointRemovedFileCount: number
+  reviewReady: boolean
   repositoryChange: RepositoryChangeEvent | null
+  collisionPaths: ReadonlySet<string>
+  initialReviewScrollTop: number
+  onReviewScrollPositionChange(scrollTop: number): void
   /** Repository search state, surfaced as inline hint markers while editing. */
   contentSearch?: ContentSearchState
   onSelectPath(path: string): void
   onDiffStyleChange(style: DiffStyle): void
   onWorkspaceViewChange(view: WorkspaceView): void
   onClosePullRequestReview(): void
+  onSetReviewCheckpoint(): void
+  onOpenSinceReview(): void
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
   onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string, comments: PullRequestReviewComment[]): Promise<boolean>
@@ -186,13 +222,21 @@ interface RepositoryReviewHeaderProps {
   workspaceView: WorkspaceView
   reviewFileCount: number
   repositoryReview: RepositoryReview | null
+  reviewWorldSource: 'desk' | 'patch' | 'since'
+  reviewCheckpoint: ReviewCheckpoint | null
+  checkpointChangedFileCount: number
+  checkpointRemovedFileCount: number
+  reviewReady: boolean
   wordWrap: boolean
   foldUnchanged: boolean
   fileEdit: FileEditControls
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
   inlineCommentCount: number
+  orphanedCommentCount: number
   onClosePullRequestReview(): void
+  onSetReviewCheckpoint(): void
+  onOpenSinceReview(): void
   onDiffStyleChange(style: DiffStyle): void
   onWordWrapToggle(): void
   onFoldUnchangedToggle(): void
@@ -209,13 +253,21 @@ function RepositoryReviewHeader({
   workspaceView,
   reviewFileCount,
   repositoryReview,
+  reviewWorldSource,
+  reviewCheckpoint,
+  checkpointChangedFileCount,
+  checkpointRemovedFileCount,
+  reviewReady,
   wordWrap,
   foldUnchanged,
   fileEdit,
   submittingPullRequestReview,
   pullRequestReviewMessage,
   inlineCommentCount,
+  orphanedCommentCount,
   onClosePullRequestReview,
+  onSetReviewCheckpoint,
+  onOpenSinceReview,
   onDiffStyleChange,
   onWordWrapToggle,
   onFoldUnchangedToggle,
@@ -244,15 +296,30 @@ function RepositoryReviewHeader({
         onWordWrapToggle={onWordWrapToggle}
         onFoldUnchangedToggle={onFoldUnchangedToggle}
       />
-      {repositoryReview?.kind === 'github' && repositoryReview.pullRequest.state === 'OPEN' ? (
+      {repositoryReview?.kind === 'github' && reviewWorldSource === 'patch' ? (
+        <ReviewCheckpointBar
+          checkpoint={reviewCheckpoint}
+          changedFileCount={checkpointChangedFileCount}
+          removedFileCount={checkpointRemovedFileCount}
+          reviewReady={reviewReady}
+          onSetCheckpoint={onSetReviewCheckpoint}
+          onOpenSince={onOpenSinceReview}
+        />
+      ) : null}
+      {repositoryReview?.kind === 'github' && repositoryReview.pullRequest.state === 'OPEN' && reviewWorldSource === 'patch' ? (
         <PullRequestReviewBar
           submitting={submittingPullRequestReview}
           message={pullRequestReviewMessage}
           inlineCommentCount={inlineCommentCount}
+          orphanedCommentCount={orphanedCommentCount}
           viewerCanSubmitDecision={repositoryReview.viewerCanSubmitDecision}
           onOpen={onOpenReviewSummary}
           onSubmit={onSubmitPullRequestReview}
         />
+      ) : repositoryReview?.kind === 'github' && reviewWorldSource === 'since' ? (
+        <div className="pr-review-readonly" role="status">
+          File-level changes since the checkpoint. Return to the Patch world to submit a review.
+        </div>
       ) : repositoryReview?.kind === 'github' ? (
         <div className="pr-review-readonly" role="status">
           This pull request is {repositoryReview.pullRequest.state.toLowerCase()}. Review submission is disabled.
@@ -274,17 +341,24 @@ function RepositoryReviewHeader({
   )
 }
 
-function useReviewTreeData(
+function useReviewPaths(
   snapshot: RepositorySnapshot,
-  repositoryReview: RepositoryReview | null,
-  threadsByPath: Record<string, ReviewThread[]>
-) {
+  repositoryReview: RepositoryReview | null
+): string[] {
   const unorderedReviewPaths = useMemo(
     () => repositoryReview?.files.map((file) => file.path)
       ?? (snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : snapshot.paths),
     [repositoryReview, snapshot.kind, snapshot.paths, snapshot.statuses]
   )
-  const reviewPaths = useMemo(() => orderPathsForTree(unorderedReviewPaths), [unorderedReviewPaths])
+  return useMemo(() => orderPathsForTree(unorderedReviewPaths), [unorderedReviewPaths])
+}
+
+function useReviewTreeData(
+  snapshot: RepositorySnapshot,
+  repositoryReview: RepositoryReview | null,
+  reviewPaths: readonly string[],
+  threadsByPath: Record<string, ReviewThread[]>
+) {
   // Both source arrays are already memoized, so identity is the whole test the
   // tree needs. Joining them into multi-megabyte keys on every render was the
   // most expensive thing this component did on a large repository.
@@ -299,8 +373,18 @@ function useReviewTreeData(
     () => createPullRequestReviewComments(threadsByPath),
     [threadsByPath]
   )
+  const orphanedCommentCount = useMemo(
+    () => Object.values(threadsByPath).reduce(
+      (count, threads) => threads.reduce(
+        (pathCount, thread) => pathCount + (thread.orphaned ? 1 : 0),
+        count
+      ),
+      0
+    ),
+    [threadsByPath]
+  )
 
-  return { reviewPaths, treePaths, treeStatuses, reviewComments }
+  return { treePaths, treeStatuses, reviewComments, orphanedCommentCount }
 }
 
 function useViewerPreferences(
@@ -458,8 +542,13 @@ interface RepositoryDiffPanelProps {
   diffStyle: DiffStyle
   viewerPreferences: AppPreferences
   repositoryReview: RepositoryReview | null
+  reviewLoadState: ReviewLoadState
+  reviewLoading: boolean
+  reviewTargetPathCount: number
+  onLoadMoreReviewFiles(): void
+  sinceRemovedPaths: readonly string[]
+  sinceUncertainPaths: readonly string[]
   pullRequestConversation: ReturnType<typeof usePullRequestConversation>['conversation']
-  repositoryChange: RepositoryChangeEvent | null
   reviewScrollRevision: number
   selectedPath: string | null
   multiFileNavigationRevision: number
@@ -474,7 +563,7 @@ interface RepositoryDiffPanelProps {
   pendingRemoteThreadId: string | null
   onReplyToRemoteThread(threadId: string, body: string): void
   onResolveRemoteThread(threadId: string, resolved: boolean): void
-  onAttachToAgent(attachment: AgentAttachment): void
+  onAttachToAgent(selection: AgentSelection): void
   reviewCommand: { command: ReviewCommand; path: string; revision: number } | null
   surfaceComparison: FileComparison | null
   surfaceLoading: boolean
@@ -487,6 +576,7 @@ interface RepositoryDiffPanelProps {
   fileExtension: string | undefined
   dirty: boolean
   getEditor(): Editor<ReviewAnnotationMetadata> | null
+  onError(message: string | null): void
 }
 
 function useRepositoryReviewHeader({
@@ -498,12 +588,20 @@ function useRepositoryReviewHeader({
   workspaceView,
   reviewFileCount,
   repositoryReview,
+  reviewWorldSource,
+  reviewCheckpoint,
+  checkpointChangedFileCount,
+  checkpointRemovedFileCount,
+  reviewReady,
   preferences,
   fileEdit,
   submittingPullRequestReview,
   pullRequestReviewMessage,
   inlineCommentCount,
+  orphanedCommentCount,
   onClosePullRequestReview,
+  onSetReviewCheckpoint,
+  onOpenSinceReview,
   onDiffStyleChange,
   onPreferencesChange,
   onOpenReviewSummary,
@@ -517,12 +615,20 @@ function useRepositoryReviewHeader({
   workspaceView: WorkspaceView
   reviewFileCount: number
   repositoryReview: RepositoryReview | null
+  reviewWorldSource: 'desk' | 'patch' | 'since'
+  reviewCheckpoint: ReviewCheckpoint | null
+  checkpointChangedFileCount: number
+  checkpointRemovedFileCount: number
+  reviewReady: boolean
   preferences: AppPreferences
   fileEdit: FileEditControls
   submittingPullRequestReview: boolean
   pullRequestReviewMessage: string | null
   inlineCommentCount: number
+  orphanedCommentCount: number
   onClosePullRequestReview(): void
+  onSetReviewCheckpoint(): void
+  onOpenSinceReview(): void
   onDiffStyleChange(style: DiffStyle): void
   onPreferencesChange(preferences: AppPreferences): void
   onOpenReviewSummary(): void
@@ -543,13 +649,21 @@ function useRepositoryReviewHeader({
     workspaceView,
     reviewFileCount,
     repositoryReview,
+    reviewWorldSource,
+    reviewCheckpoint,
+    checkpointChangedFileCount,
+    checkpointRemovedFileCount,
+    reviewReady,
     wordWrap: preferences.wordWrap,
     foldUnchanged: preferences.foldUnchanged,
     fileEdit,
     submittingPullRequestReview,
     pullRequestReviewMessage,
     inlineCommentCount,
+    orphanedCommentCount,
     onClosePullRequestReview,
+    onSetReviewCheckpoint,
+    onOpenSinceReview,
     onDiffStyleChange,
     onWordWrapToggle: toggleWordWrap,
     onFoldUnchangedToggle: toggleFoldUnchanged,
@@ -560,9 +674,12 @@ function useRepositoryReviewHeader({
     diffStyle,
     fileEdit,
     inlineCommentCount,
+    orphanedCommentCount,
     isFilePreview,
     isGitRepository,
     onClosePullRequestReview,
+    onSetReviewCheckpoint,
+    onOpenSinceReview,
     onDiffStyleChange,
     onOpenReviewSummary,
     onSubmitPullRequestReview,
@@ -570,6 +687,11 @@ function useRepositoryReviewHeader({
     preferences.wordWrap,
     pullRequestReviewMessage,
     repositoryReview,
+    reviewWorldSource,
+    reviewCheckpoint,
+    checkpointChangedFileCount,
+    checkpointRemovedFileCount,
+    reviewReady,
     reviewFileCount,
     selectedPath,
     submittingPullRequestReview,
@@ -596,8 +718,13 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
   diffStyle,
   viewerPreferences,
   repositoryReview,
+  reviewLoadState,
+  reviewLoading,
+  reviewTargetPathCount,
+  onLoadMoreReviewFiles,
+  sinceRemovedPaths,
+  sinceUncertainPaths,
   pullRequestConversation,
-  repositoryChange,
   reviewScrollRevision,
   selectedPath,
   multiFileNavigationRevision,
@@ -624,8 +751,28 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
   showStatusBar,
   fileExtension,
   dirty,
-  getEditor
+  getEditor,
+  onError
 }: RepositoryDiffPanelProps): React.JSX.Element {
+  const DiffSurface = useSyncExternalStore(
+    subscribeDiffSurface,
+    getLoadedDiffSurface,
+    getLoadedDiffSurface
+  )
+  const MultiFileReview = useSyncExternalStore(
+    subscribeMultiFileReview,
+    getLoadedMultiFileReview,
+    getLoadedMultiFileReview
+  )
+
+  useEffect(() => {
+    let active = true
+    void preloadWorkspaceViewer(workspaceView).catch((error: unknown) => {
+      if (active) onError(getErrorMessage(error))
+    })
+    return () => { active = false }
+  }, [onError, workspaceView])
+
   return (
     <section ref={surfaceRef} className={`diff-panel ${isFilePreview ? 'file-preview-mode' : 'diff-mode'}`} id="repository-diff">
       <RepositoryReviewHeader {...header} />
@@ -645,17 +792,21 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
       ) : null}
       {viewerSuspended ? (
         <div className="diff-state"><span>Viewer paused while the app is hidden.</span></div>
-      ) : (
-        <Suspense fallback={<WorkspaceCodeSkeleton />}>
-          {workspaceView === 'multi' ? (
+      ) : workspaceView === 'multi' ? (
+        MultiFileReview == null ? <WorkspaceCodeSkeleton /> : (
             <MultiFileReview
               key={`${reviewIdentity}:${reviewSessionRevision}`}
               paths={reviewPaths}
               diffStyle={diffStyle}
               preferences={viewerPreferences}
               repositoryReview={repositoryReview}
+              loadState={reviewLoadState}
+              loading={reviewLoading}
+              targetPathCount={reviewTargetPathCount}
+              onLoadMore={onLoadMoreReviewFiles}
+              sinceRemovedPaths={sinceRemovedPaths}
+              sinceUncertainPaths={sinceUncertainPaths}
               pullRequestConversation={pullRequestConversation}
-              repositoryChange={repositoryChange}
               scrollToReviewRevision={reviewScrollRevision}
               navigationPath={selectedPath}
               navigationRevision={multiFileNavigationRevision}
@@ -673,7 +824,9 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
               onAttachToAgent={onAttachToAgent}
               reviewCommand={reviewCommand}
             />
-          ) : (
+        )
+      ) : (
+        DiffSurface == null ? <WorkspaceCodeSkeleton /> : (
             <DiffSurface comparison={surfaceComparison} loading={surfaceLoading} diffStyle={diffStyle}
               preferences={viewerPreferences} editMode={editMode}
               contentSearch={contentSearch} getEditor={getEditor}
@@ -681,8 +834,7 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
               onEditorBlur={onEditorBlur}
               onAttachToAgent={onAttachToAgent}
               threadsByPath={threadsByPath} setThreadsByPath={setThreadsByPath} />
-          )}
-        </Suspense>
+        )
       )}
       {showStatusBar ? (
         <EditorStatusBar
@@ -696,32 +848,198 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
   )
 })
 
-const RepositoryWorkspace = memo(function RepositoryWorkspace({
-  snapshot, selectedPath, comparison, loadingDiff, diffStyle, workspaceView,
-  preferences, onAttachToAgent, onPreferencesChange, repositoryReview, repositoryChange, contentSearch, onSelectPath,
-  onDiffStyleChange, onWorkspaceViewChange, onClosePullRequestReview, submittingPullRequestReview,
-  pullRequestReviewMessage, onSubmitPullRequestReview, onComparisonSaved, onError
-}: RepositoryWorkspaceProps): React.JSX.Element {
-  useEffect(markRepositoryWorkspaceRender)
-  const isFilePreview = workspaceView === 'file' && comparison?.mode === 'file'
-  const reviewIdentity = repositoryReviewIdentity(repositoryReview)
-  const { threadsByPath, setThreadsByPath, viewedFiles, setViewedFiles } =
-    useReviewSession(snapshot.root, reviewIdentity)
-  const conversation = usePullRequestConversation(repositoryReview, onError)
+function useRetainedComparison(
+  comparison: FileComparison | null,
+  selectedPath: string | null,
+  loading: boolean
+): { comparison: FileComparison | null; loading: boolean } {
+  // Multi-file review unmounts DiffSurface. Retain only the last comparison for
+  // the same path so returning to a file does not flash an empty viewer.
+  const retainedRef = useRef<FileComparison | null>(null)
+  useEffect(() => {
+    if (comparison != null) retainedRef.current = comparison
+  }, [comparison])
+  const retained = comparison ?? (retainedRef.current?.path === selectedPath ? retainedRef.current : null)
+  return {
+    comparison: retained,
+    loading: loading || (comparison == null && retained != null)
+  }
+}
+
+function usePullRequestReviewSubmission(
+  orphanedCommentCount: number,
+  reviewComments: PullRequestReviewComment[],
+  setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>,
+  submit: RepositoryWorkspaceProps['onSubmitPullRequestReview']
+): {
+  reviewSessionRevision: number
+  submitReview(event: PullRequestReviewEvent, body: string): Promise<boolean>
+} {
+  const [reviewSessionRevision, setReviewSessionRevision] = useState(0)
+  const submitReview = useCallback(async (event: PullRequestReviewEvent, body: string) => {
+    if (orphanedCommentCount > 0) return false
+    const submitted = await submit(event, body, reviewComments)
+    if (submitted) {
+      setThreadsByPath({})
+      setReviewSessionRevision((revision) => revision + 1)
+    }
+    return submitted
+  }, [orphanedCommentCount, reviewComments, setThreadsByPath, submit])
+  return { reviewSessionRevision, submitReview }
+}
+
+function useRepositoryReviewSession({
+  root,
+  reviewIdentity,
+  reviewPaths,
+  workspaceView,
+  repositoryReview,
+  repositoryChange,
+  reviewWorldSource
+}: {
+  root: string
+  reviewIdentity: string
+  reviewPaths: readonly string[]
+  workspaceView: WorkspaceView
+  repositoryReview: RepositoryReview | null
+  repositoryChange: RepositoryChangeEvent | null
+  reviewWorldSource: RepositoryWorkspaceProps['reviewWorldSource']
+}) {
+  const active = workspaceView === 'multi'
+  const activePaths = useMemo(() => active ? [...reviewPaths] : [], [active, reviewPaths])
+  const pathsKey = useMemo(() => activePaths.join('\0'), [activePaths])
+  const load = useReviewLoadState({
+    pathsKey,
+    stablePaths: activePaths,
+    repositoryReview: active ? repositoryReview : null,
+    repositoryChange: active ? repositoryChange : null
+  })
+  const session = useReviewSession(root, reviewIdentity, {
+    items: load.loadState.items,
+    loading: load.loading,
+    enabled: active && reviewWorldSource === 'patch' && repositoryReview?.kind === 'github'
+  })
+  return { ...session, load }
+}
+
+function useReviewNavigation({
+  paths,
+  workspaceView,
+  initialScrollTop,
+  markInstantTreeFollowTarget,
+  onSelectPath,
+  onWorkspaceViewChange,
+  onScrollPositionChange
+}: {
+  paths: readonly string[]
+  workspaceView: WorkspaceView
+  initialScrollTop: number
+  markInstantTreeFollowTarget(path: string): void
+  onSelectPath(path: string): void
+  onWorkspaceViewChange(view: WorkspaceView): void
+  onScrollPositionChange(scrollTop: number): void
+}) {
   const [reviewCommand, setReviewCommand] = useState<{
     command: ReviewCommand
     path: string
     revision: number
   } | null>(null)
-  const [reviewSessionRevision, setReviewSessionRevision] = useState(0)
-  const [reviewScrollRevision, setReviewScrollRevision] = useState(0)
+  const [scrollRevision, setScrollRevision] = useState(0)
+  const [navigationRevision, setNavigationRevision] = useState(0)
+  const visiblePathRef = useRef<string | null>(null)
+  const scrollTopRef = useRef(initialScrollTop)
+  const advance = useCallback(() => setNavigationRevision((revision) => revision + 1), [])
+  const openSummary = useCallback(() => {
+    scrollTopRef.current = 0
+    onWorkspaceViewChange('multi')
+    setScrollRevision((revision) => revision + 1)
+  }, [onWorkspaceViewChange])
+  const rememberScroll = useCallback((scrollTop: number) => {
+    scrollTopRef.current = scrollTop
+    onScrollPositionChange(scrollTop)
+  }, [onScrollPositionChange])
+  const navigate = useCallback((path: string) => {
+    markInstantTreeFollowTarget(path)
+    onSelectPath(path)
+    advance()
+  }, [advance, markInstantTreeFollowTarget, onSelectPath])
+  const runItemCommand = useCallback((command: ReviewCommand, path: string) => {
+    setReviewCommand((current) => ({ command, path, revision: (current?.revision ?? 0) + 1 }))
+  }, [])
+
+  useReviewShortcuts({
+    active: workspaceView === 'multi',
+    paths,
+    currentPathRef: visiblePathRef,
+    onNavigate: navigate,
+    onItemCommand: runItemCommand
+  })
+
+  return {
+    advance,
+    navigationRevision,
+    openSummary,
+    rememberScroll,
+    reviewCommand,
+    scrollRevision,
+    scrollTopRef,
+    visiblePathRef
+  }
+}
+
+const RepositoryWorkspace = memo(function RepositoryWorkspace({
+  snapshot, selectedPath, comparison, loadingDiff, diffStyle, workspaceView,
+  preferences, onAttachToAgent, onPreferencesChange, repositoryReview, reviewWorldSource,
+  reviewCheckpoint, checkpointChangedFileCount, checkpointRemovedFileCount, reviewReady,
+  sinceRemovedPaths, sinceUncertainPaths,
+  repositoryChange, contentSearch, onSelectPath,
+  collisionPaths, initialReviewScrollTop, onReviewScrollPositionChange,
+  onDiffStyleChange, onWorkspaceViewChange, onClosePullRequestReview, onSetReviewCheckpoint,
+  onOpenSinceReview, submittingPullRequestReview,
+  pullRequestReviewMessage, onSubmitPullRequestReview, onComparisonSaved, onError
+}: RepositoryWorkspaceProps): React.JSX.Element {
+  useLayoutEffect(() => markRendererStartup('explorerCommitted'), [])
+  useEffect(markRepositoryWorkspaceRender)
+  const isFilePreview = workspaceView === 'file' && comparison?.mode === 'file'
+  const reviewIdentity = repositoryReviewIdentity(repositoryReview)
+  const reviewPaths = useReviewPaths(snapshot, repositoryReview)
+  const { threadsByPath, setThreadsByPath, viewedFiles, setViewedFiles, load: reviewLoad } =
+    useRepositoryReviewSession({
+      root: snapshot.root,
+      reviewIdentity,
+      reviewPaths,
+      workspaceView,
+      repositoryReview,
+      repositoryChange,
+      reviewWorldSource
+    })
+  const conversation = usePullRequestConversation(repositoryReview, onError)
   const viewer = useViewerContext()
   const codeZoom = useCodeZoomGesture(preferences.codeFontSize, preferences.codeLineHeight)
   const hiddenLongEnoughToRelease = useViewerSuspension()
-  const visibleMultiFilePathRef = useRef<string | null>(null)
   const { markInstantTreeFollowTarget, consumeInstantTreeFollowTarget } = useInstantTreeFollow()
-  const multiFileScrollTopRef = useRef(0)
-  const [multiFileNavigationRevision, setMultiFileNavigationRevision] = useState(0)
+  const {
+    advance: advanceMultiFileNavigation,
+    navigationRevision: multiFileNavigationRevision,
+    openSummary: openReviewSummary,
+    rememberScroll: handleMultiFileScrollPositionChange,
+    reviewCommand,
+    scrollRevision: reviewScrollRevision,
+    scrollTopRef: multiFileScrollTopRef,
+    visiblePathRef: visibleMultiFilePathRef
+  } = useReviewNavigation({
+    paths: reviewPaths,
+    workspaceView,
+    initialScrollTop: initialReviewScrollTop,
+    markInstantTreeFollowTarget,
+    onSelectPath,
+    onWorkspaceViewChange,
+    onScrollPositionChange: onReviewScrollPositionChange
+  })
+  const collisionPathsRef = useRef(collisionPaths)
+  useLayoutEffect(() => {
+    collisionPathsRef.current = collisionPaths
+  }, [collisionPaths])
   const fileEditing = useFileEditing({
     root: snapshot.root,
     comparison,
@@ -734,8 +1052,8 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onComparisonChange: onComparisonSaved,
     onError
   })
-  const { reviewPaths, treePaths, treeStatuses, reviewComments } =
-    useReviewTreeData(snapshot, repositoryReview, threadsByPath)
+  const { treePaths, treeStatuses, reviewComments, orphanedCommentCount } =
+    useReviewTreeData(snapshot, repositoryReview, reviewPaths, threadsByPath)
   const reviewPathSet = useMemo(() => new Set(reviewPaths), [reviewPaths])
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
   const viewerPreferences = useViewerPreferences(preferences, codeZoom)
@@ -752,53 +1070,19 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     setViewerSuspended?.(viewerSuspended)
   }, [setViewerSuspended, viewerSuspended])
 
-  // Switching to the multi-file review unmounts DiffSurface, so the previous
-  // file has to be remembered here to survive the trip back.
-  const lastComparisonRef = useRef<FileComparison | null>(null)
-  useEffect(() => {
-    if (fileEditing.renderedComparison != null) lastComparisonRef.current = fileEditing.renderedComparison
-  }, [fileEditing.renderedComparison])
-  const previousComparison = lastComparisonRef.current
-  const surfaceComparison = fileEditing.renderedComparison
-    ?? (previousComparison?.path === selectedPath ? previousComparison : null)
-  const surfaceLoading = loadingDiff || (fileEditing.renderedComparison == null && surfaceComparison != null)
+  const { comparison: surfaceComparison, loading: surfaceLoading } = useRetainedComparison(
+    fileEditing.renderedComparison,
+    selectedPath,
+    loadingDiff
+  )
 
-  const submitPullRequestReview = useCallback(async (event: PullRequestReviewEvent, body: string) => {
-    const submitted = await onSubmitPullRequestReview(event, body, reviewComments)
-    if (submitted) {
-      setThreadsByPath({})
-      setReviewSessionRevision((revision) => revision + 1)
-    }
-    return submitted
-  }, [onSubmitPullRequestReview, reviewComments, setThreadsByPath])
-
-  const openReviewSummary = useCallback(() => {
-    multiFileScrollTopRef.current = 0
-    onWorkspaceViewChange('multi')
-    setReviewScrollRevision((revision) => revision + 1)
-  }, [onWorkspaceViewChange])
-
-  const handleMultiFileScrollPositionChange = useCallback((scrollTop: number) => {
-    multiFileScrollTopRef.current = scrollTop
-  }, [])
-
-  const navigateToReviewFile = useCallback((path: string) => {
-    markInstantTreeFollowTarget(path)
-    onSelectPath(path)
-    setMultiFileNavigationRevision((revision) => revision + 1)
-  }, [markInstantTreeFollowTarget, onSelectPath])
-
-  const runReviewItemCommand = useCallback((command: ReviewCommand, path: string) => {
-    setReviewCommand((current) => ({ command, path, revision: (current?.revision ?? 0) + 1 }))
-  }, [])
-
-  useReviewShortcuts({
-    active: workspaceView === 'multi',
-    paths: reviewPaths,
-    currentPathRef: visibleMultiFilePathRef,
-    onNavigate: navigateToReviewFile,
-    onItemCommand: runReviewItemCommand
-  })
+  const { reviewSessionRevision, submitReview: submitPullRequestReview } =
+    usePullRequestReviewSubmission(
+      orphanedCommentCount,
+      reviewComments,
+      setThreadsByPath,
+      onSubmitPullRequestReview
+    )
 
   const pathSet = useMemo(() => new Set(treePaths), [treePaths])
   const directoryPaths = useMemo(() => getDirectoryPaths(treePaths), [treePaths])
@@ -817,9 +1101,9 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onSelectPath(path)
     const nextView = workspaceViewForTreePath(workspaceView, reviewPathSet.has(path), fileEditing.hasSession)
     if (nextView !== workspaceView) onWorkspaceViewChange(nextView)
-    if (nextView === 'multi') setMultiFileNavigationRevision((revision) => revision + 1)
+    if (nextView === 'multi') advanceMultiFileNavigation()
   }, [fileEditing.hasSession, markInstantTreeFollowTarget, onSelectPath, onWorkspaceViewChange,
-    pathSet, reviewPathSet, workspaceView])
+    advanceMultiFileNavigation, pathSet, reviewPathSet, workspaceView])
 
   // ⌘P search, review shortcuts and the tree all change the selected path; in the
   // multi-file review that has to move the viewer, or picking a result looks like
@@ -832,8 +1116,9 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     if (workspaceView !== 'multi' || selectedPath === visibleMultiFilePathRef.current) return
     if (!pathSet.has(selectedPath)) return
     markInstantTreeFollowTarget(selectedPath)
-    setMultiFileNavigationRevision((revision) => revision + 1)
-  }, [markInstantTreeFollowTarget, pathSet, selectedPath, workspaceView])
+    advanceMultiFileNavigation()
+  }, [advanceMultiFileNavigation, markInstantTreeFollowTarget, pathSet, selectedPath,
+    visibleMultiFilePathRef, workspaceView])
 
   const handleTreeSelection = useCallback((paths: readonly string[]) => {
     const path = paths.at(-1)
@@ -841,7 +1126,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     // scroll it came from.
     if (path == null || path === visibleMultiFilePathRef.current) return
     activateTreeRow(path)
-  }, [activateTreeRow])
+  }, [activateTreeRow, visibleMultiFilePathRef])
 
   // useFileTree captures its options once at model creation, so the selection
   // callback must be delegated through a ref to see current view state.
@@ -860,6 +1145,13 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     stickyFolders: true,
     search: true,
     icons: { set: 'complete', colored: true },
+    renderRowDecoration: ({ item }) => collisionPathsRef.current.has(item.path)
+      ? {
+          text: 'Desk',
+          title: 'This path also has changes on Desk',
+          parts: [{ text: 'Desk', color: 'var(--status-warning-text)' }]
+        }
+      : null,
     unsafeCSS: TREE_STYLES,
     composition: {
       contextMenu: {
@@ -895,7 +1187,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     const instantTarget = consumeInstantTreeFollowTarget(path)
     const followBehavior = getTreeFollowBehavior(instantTarget == null ? 'review-scroll' : 'direct-navigation')
     scrollTreeToPath(path, followBehavior.offset)
-  }, [consumeInstantTreeFollowTarget, model, pathSet, scrollTreeToPath])
+  }, [consumeInstantTreeFollowTarget, model, pathSet, scrollTreeToPath, visibleMultiFilePathRef])
 
   const reviewHeader = useRepositoryReviewHeader({
     comparison: fileEditing.renderedComparison,
@@ -906,12 +1198,20 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     workspaceView,
     reviewFileCount: reviewPaths.length,
     repositoryReview,
+    reviewWorldSource,
+    reviewCheckpoint,
+    checkpointChangedFileCount,
+    checkpointRemovedFileCount,
+    reviewReady,
     preferences,
     fileEdit: fileEditing.controls,
     submittingPullRequestReview,
     pullRequestReviewMessage,
     inlineCommentCount: reviewComments.length,
+    orphanedCommentCount,
     onClosePullRequestReview,
+    onSetReviewCheckpoint,
+    onOpenSinceReview,
     onDiffStyleChange,
     onPreferencesChange,
     onOpenReviewSummary: openReviewSummary,
@@ -940,8 +1240,13 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         diffStyle={diffStyle}
         viewerPreferences={viewerPreferences}
         repositoryReview={repositoryReview}
+        reviewLoadState={reviewLoad.loadState}
+        reviewLoading={reviewLoad.loading}
+        reviewTargetPathCount={reviewLoad.targetPathCount}
+        onLoadMoreReviewFiles={reviewLoad.loadMoreFiles}
+        sinceRemovedPaths={sinceRemovedPaths}
+        sinceUncertainPaths={sinceUncertainPaths}
         pullRequestConversation={conversation.conversation}
-        repositoryChange={repositoryChange}
         reviewScrollRevision={reviewScrollRevision}
         selectedPath={selectedPath}
         multiFileNavigationRevision={multiFileNavigationRevision}
@@ -969,6 +1274,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         fileExtension={fileExtension}
         dirty={fileEditing.controls.dirty}
         getEditor={fileEditing.getEditor}
+        onError={onError}
       />
     </>
   )

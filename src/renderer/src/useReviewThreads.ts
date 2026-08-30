@@ -3,6 +3,10 @@ import type { CodeViewItem, CodeViewLineSelection, SelectedLineRange } from '@pi
 
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import { pathFromReviewItemId as pathFromItemId } from './reviewItems'
+import {
+  attachReviewThreadToRange,
+  createReviewCommentAnchor
+} from './reviewThreadAnchors'
 
 export interface DraftReviewComment {
   path: string
@@ -29,7 +33,13 @@ function incrementItemVersions(
 
 interface ReviewThreadsOptions {
   items: readonly CodeViewItem<ReviewAnnotationMetadata>[]
+  threadsByPath: Readonly<Record<string, ReviewThread[]>>
   setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>
+}
+
+export interface ReattachingReviewThread {
+  path: string
+  threadId: string
 }
 
 interface ReviewThreadsApi {
@@ -47,14 +57,23 @@ interface ReviewThreadsApi {
   handleSelectedLinesChange(selection: CodeViewLineSelection | null): void
   saveComment(body: string): void
   cancelComment(): void
+  reattachingThread: ReattachingReviewThread | null
+  beginReattach(path: string, threadId: string): void
+  cancelReattach(): void
+  reattachToSelection(selection: CodeViewLineSelection): boolean
   updateThread: UpdateReviewThread
 }
 
-export function useReviewThreads({ items, setThreadsByPath }: ReviewThreadsOptions): ReviewThreadsApi {
+export function useReviewThreads({
+  items,
+  threadsByPath,
+  setThreadsByPath
+}: ReviewThreadsOptions): ReviewThreadsApi {
   const [selectedLines, setSelectedLines] = useState<CodeViewLineSelection | null>(null)
   const [draftComment, setDraftComment] = useState<DraftReviewComment | null>(null)
   const [annotationVersions, setAnnotationVersions] = useState<Record<string, number>>({})
   const [collapsedItemIds, setCollapsedItemIds] = useState<Set<string>>(() => new Set())
+  const [reattachingThread, setReattachingThread] = useState<ReattachingReviewThread | null>(null)
 
   const bumpAnnotationVersion = useCallback((path: string) => {
     setAnnotationVersions((current) => ({
@@ -117,12 +136,15 @@ export function useReviewThreads({ items, setThreadsByPath }: ReviewThreadsOptio
 
   const saveComment = useCallback((body: string) => {
     if (draftComment == null) return
+    const item = items.find((candidate) => pathFromItemId(candidate.id) === draftComment.path)
+    const anchor = item == null ? null : createReviewCommentAnchor(item, draftComment.range)
     const thread: ReviewThread = {
       id: crypto.randomUUID(),
       body,
       lineNumber: draftComment.range.start,
       side: draftComment.range.side,
       range: draftComment.range,
+      ...(anchor == null ? {} : { anchor }),
       replies: [],
       resolved: false
     }
@@ -132,12 +154,54 @@ export function useReviewThreads({ items, setThreadsByPath }: ReviewThreadsOptio
     }))
     bumpAnnotationVersion(draftComment.path)
     setDraftComment(null)
-  }, [bumpAnnotationVersion, draftComment, setThreadsByPath])
+  }, [bumpAnnotationVersion, draftComment, items, setThreadsByPath])
 
   const cancelComment = useCallback(() => {
     setDraftComment(null)
     setSelectedLines(null)
   }, [])
+
+  const beginReattach = useCallback((path: string, threadId: string) => {
+    setReattachingThread({ path, threadId })
+    setDraftComment(null)
+    setSelectedLines(null)
+  }, [])
+
+  const cancelReattach = useCallback(() => {
+    setReattachingThread(null)
+    setSelectedLines(null)
+  }, [])
+
+  const reattachToSelection = useCallback((selection: CodeViewLineSelection): boolean => {
+    if (reattachingThread == null) return false
+    const destinationPath = pathFromItemId(selection.id)
+    const item = items.find((candidate) => candidate.id === selection.id)
+    const thread = threadsByPath[reattachingThread.path]?.find(
+      (candidate) => candidate.id === reattachingThread.threadId
+    )
+    if (item == null || thread == null) return false
+    const attached = attachReviewThreadToRange(thread, item, selection.range)
+    if (attached == null) return false
+    setThreadsByPath((current) => {
+      const sourceThreads = (current[reattachingThread.path] ?? []).filter(
+        (candidate) => candidate.id !== reattachingThread.threadId
+      )
+      if (destinationPath === reattachingThread.path) {
+        return { ...current, [destinationPath]: [...sourceThreads, attached] }
+      }
+      return {
+        ...current,
+        [reattachingThread.path]: sourceThreads,
+        [destinationPath]: [...(current[destinationPath] ?? []), attached]
+      }
+    })
+    bumpPathVersions(reattachingThread.path === destinationPath
+      ? [destinationPath]
+      : [reattachingThread.path, destinationPath])
+    setReattachingThread(null)
+    setSelectedLines(null)
+    return true
+  }, [bumpPathVersions, items, reattachingThread, setThreadsByPath, threadsByPath])
 
   const updateThread = useCallback<UpdateReviewThread>((path, threadId, update) => {
     setThreadsByPath((current) => ({
@@ -166,6 +230,10 @@ export function useReviewThreads({ items, setThreadsByPath }: ReviewThreadsOptio
     handleSelectedLinesChange,
     saveComment,
     cancelComment,
+    reattachingThread,
+    beginReattach,
+    cancelReattach,
+    reattachToSelection,
     updateThread
   }
 }

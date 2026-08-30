@@ -27,11 +27,12 @@ describe('createPullRequestReviewComments', () => {
     }])
   })
 
-  it('uses the old side for deletions and omits resolved drafts', () => {
+  it('uses the old side for deletions and omits unsafe drafts', () => {
     expect(createPullRequestReviewComments({
       'src/value.ts': [
         thread({ range: { start: 9, end: 9, side: 'deletions' } }),
-        thread({ id: 'resolved', resolved: true })
+        thread({ id: 'resolved', resolved: true }),
+        thread({ id: 'orphaned', orphaned: true })
       ]
     })).toEqual([{
       path: 'src/value.ts',

@@ -1,6 +1,10 @@
+import { isAbsolute } from 'node:path'
+
 import type {
   AgentAccessMode,
   AgentActivityUpdate,
+  AgentRequestSelection,
+  AgentRequestSubject,
   AgentRateLimitWindow,
   AgentUsageUpdate
 } from '../shared/contracts.js'
@@ -21,11 +25,48 @@ export interface AgentAskRequest {
   accessMode: AgentAccessMode
   prompt: string
   context: string
+  subject: AgentRequestSubject
+  selections: AgentRequestSelection[]
   resumeSessionId?: string
 }
 
 const AGENT_PROVIDERS = new Set<AgentAskRequest['provider']>(['claude', 'codex'])
 const AGENT_ACCESS_MODES = new Set<AgentAccessMode>(['review', 'auto', 'full-access'])
+const AGENT_SUBJECT_SOURCES = new Set<AgentRequestSubject['source']>(['workingTree', 'patch', 'since'])
+
+function decodeAgentSubject(value: unknown): AgentRequestSubject | null {
+  if (typeof value !== 'object' || value == null || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value) as unknown
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const candidate = value as Record<string, unknown>
+  const { tabId, repositoryRoot, repositoryName, source, baseOid, headOid } = candidate
+  if (typeof tabId !== 'string' || typeof repositoryRoot !== 'string'
+    || typeof repositoryName !== 'string' || typeof source !== 'string') return null
+  if (baseOid !== null && typeof baseOid !== 'string') return null
+  if (headOid !== null && typeof headOid !== 'string') return null
+  if (!AGENT_SUBJECT_SOURCES.has(source as AgentRequestSubject['source'])) return null
+  return {
+    tabId,
+    repositoryRoot,
+    repositoryName,
+    source: source as AgentRequestSubject['source'],
+    baseOid,
+    headOid
+  }
+}
+
+function decodeAgentSelection(value: unknown): AgentRequestSelection | null {
+  if (typeof value !== 'object' || value == null || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value) as unknown
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const candidate = value as Record<string, unknown>
+  const { path, startLine, endLine, side, selectedText, blobOid } = candidate
+  if (typeof path !== 'string' || typeof startLine !== 'number' || typeof endLine !== 'number'
+    || typeof selectedText !== 'string') return null
+  if (side !== 'additions' && side !== 'deletions') return null
+  if (blobOid !== null && typeof blobOid !== 'string') return null
+  return { path, startLine, endLine, side, selectedText, blobOid }
+}
 
 // This is the renderer -> subprocess trust boundary, so the request is rebuilt
 // field by field instead of forwarded: a class instance, a prototype-polluted
@@ -37,12 +78,17 @@ function decodeAgentAskRequest(value: unknown): AgentAskRequest | null {
   const prototype = Object.getPrototypeOf(value) as unknown
   if (prototype !== Object.prototype && prototype !== null) return null
   const candidate = value as Record<string, unknown>
-  const { id, provider, model, effort, accessMode, prompt, context, resumeSessionId } = candidate
+  const { id, provider, model, effort, accessMode, prompt, context, subject, selections, resumeSessionId } = candidate
   if (typeof id !== 'string' || typeof model !== 'string' || typeof effort !== 'string' ||
       typeof prompt !== 'string' || typeof context !== 'string') return null
   if (typeof provider !== 'string' || !AGENT_PROVIDERS.has(provider as AgentAskRequest['provider'])) return null
   if (typeof accessMode !== 'string' || !AGENT_ACCESS_MODES.has(accessMode as AgentAccessMode)) return null
   if (resumeSessionId !== undefined && typeof resumeSessionId !== 'string') return null
+  const decodedSubject = decodeAgentSubject(subject)
+  if (decodedSubject == null) return null
+  if (!Array.isArray(selections)) return null
+  const decodedSelections = selections.map(decodeAgentSelection)
+  if (decodedSelections.some((selection) => selection == null)) return null
   return {
     id,
     provider: provider as AgentAskRequest['provider'],
@@ -51,6 +97,8 @@ function decodeAgentAskRequest(value: unknown): AgentAskRequest | null {
     accessMode: accessMode as AgentAccessMode,
     prompt,
     context,
+    subject: decodedSubject,
+    selections: decodedSelections as AgentRequestSelection[],
     ...(resumeSessionId === undefined ? {} : { resumeSessionId })
   }
 }
@@ -77,6 +125,47 @@ export async function parseAgentAskRequest(value: unknown): Promise<AgentAskRequ
   if (request.resumeSessionId != null && !/^[A-Za-z0-9-]{1,128}$/.test(request.resumeSessionId)) {
     throw new Error('The agent session could not be identified.')
   }
+  if (request.subject.tabId.trim() === '' || request.subject.tabId.length > 512) {
+    throw new Error('The review tab could not be identified.')
+  }
+  if (!isAbsolute(request.subject.repositoryRoot) || request.subject.repositoryRoot.length > 4_096) {
+    throw new Error('The agent repository root is not valid.')
+  }
+  if (request.subject.repositoryName.trim() === '' || request.subject.repositoryName.length > 256) {
+    throw new Error('The agent repository name is not valid.')
+  }
+  if (request.subject.source !== 'workingTree' && request.accessMode !== 'review') {
+    throw new Error('Patch and Since tabs allow read-only agent access.')
+  }
+  if (request.subject.source !== 'workingTree'
+    && (request.subject.baseOid == null || request.subject.headOid == null)) {
+    throw new Error('The review tab does not identify an exact revision.')
+  }
+  for (const oid of [request.subject.baseOid, request.subject.headOid]) {
+    if (oid != null && (oid.trim() === '' || oid.length > 128)) {
+      throw new Error('The agent revision is not valid.')
+    }
+  }
+  if (request.selections.length > 8) throw new Error('Too many code selections were attached.')
+  for (const selection of request.selections) {
+    const unsafeSegment = selection.path.split(/[\\/]/).some((segment) => segment === '..')
+    if (selection.path === '' || selection.path.length > 4_096 || selection.path.includes('\0')
+      || isAbsolute(selection.path) || unsafeSegment) {
+      throw new Error('An attached code path is not valid.')
+    }
+    if (!Number.isInteger(selection.startLine) || !Number.isInteger(selection.endLine)
+      || selection.startLine < 1 || selection.endLine < selection.startLine
+      || selection.endLine > 10_000_000) {
+      throw new Error('An attached line range is not valid.')
+    }
+    if (selection.selectedText === '' || selection.selectedText.length > 40_000) {
+      throw new Error('An attached code selection is not valid.')
+    }
+    if (selection.blobOid != null
+      && (selection.blobOid.trim() === '' || selection.blobOid.length > 128)) {
+      throw new Error('An attached blob identity is not valid.')
+    }
+  }
   return {
     id: request.id,
     provider: request.provider,
@@ -85,6 +174,8 @@ export async function parseAgentAskRequest(value: unknown): Promise<AgentAskRequ
     accessMode: request.accessMode,
     prompt,
     context: request.context.slice(0, MAX_AGENT_CONTEXT_LENGTH),
+    subject: request.subject,
+    selections: request.selections,
     ...(request.resumeSessionId == null ? {} : { resumeSessionId: request.resumeSessionId })
   }
 }

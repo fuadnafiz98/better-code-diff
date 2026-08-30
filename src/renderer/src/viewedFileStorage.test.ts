@@ -58,9 +58,21 @@ describe('reviewFileSignature', () => {
     expect(reviewFileSignature(diffItem('src/a.ts', 'new-oid'))).toBe('old-oid..new-oid')
   })
 
-  it('falls back to patch line counts when object ids are absent', () => {
-    expect(reviewFileSignature(diffItem('src/a.ts', undefined, ['+a', '+b'])))
-      .toBe('modified:2:0')
+  it('hashes patch content instead of treating equal line counts as identity', () => {
+    const first = reviewFileSignature(diffItem('src/a.ts', undefined, ['+a', '+b']))
+    const sameCounts = reviewFileSignature(diffItem('src/a.ts', undefined, ['+c', '+d']))
+    expect(first).toMatch(/^patch:[0-9a-f]{16}$/)
+    expect(first).not.toBe(sameCounts)
+  })
+
+  it('hashes full-file content when no cache key is available', () => {
+    const file = (contents: string): CodeViewItem<unknown> => ({
+      id: 'review:note.md',
+      type: 'file',
+      file: { name: 'note.md', contents }
+    })
+
+    expect(reviewFileSignature(file('same'))).not.toBe(reviewFileSignature(file('size')))
   })
 })
 

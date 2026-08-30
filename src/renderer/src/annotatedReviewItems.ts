@@ -186,7 +186,7 @@ export function deriveAnnotatedReviewItems({
   let changed = previousItems == null || previousItems.length !== items.length
   const nextItems = items.map((baseItem, index) => {
     const path = pathFromItemId(baseItem.id)
-    const threads = threadsByPath[path] ?? []
+    const threads = (threadsByPath[path] ?? []).filter((thread) => !thread.orphaned)
     const remoteThreads = remoteThreadsByPath.get(path) ?? []
     const draftRange = draftComment?.path === path ? draftComment.range : null
     const selectionRange = draftComment == null && pendingSelection?.id === baseItem.id

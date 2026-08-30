@@ -124,7 +124,6 @@ interface ReviewLoadStateOptions {
   stablePaths: string[]
   repositoryReview: RepositoryReview | null
   repositoryChange: RepositoryChangeEvent | null
-  onPathsReloaded(paths: readonly string[]): void
 }
 
 interface ReviewLoadStateApi {
@@ -153,8 +152,7 @@ export function useReviewLoadState({
   pathsKey,
   stablePaths,
   repositoryReview,
-  repositoryChange,
-  onPathsReloaded
+  repositoryChange
 }: ReviewLoadStateOptions): ReviewLoadStateApi {
   const loadedPathsKeyRef = useRef<string | null>(null)
   const loadedPageCountRef = useRef(0)
@@ -367,7 +365,6 @@ export function useReviewLoadState({
     })().then((results) => {
       if (cancelled) return
       startTransition(() => {
-        onPathsReloaded(results.map((result) => result.path))
         setFolderLoadState((current) => {
           const replacements = new Map(results.map((result) => [itemId(result.path), result.item]))
           const nextItems = current.items.flatMap((item) => {
@@ -385,7 +382,7 @@ export function useReviewLoadState({
     })
 
     return () => { cancelled = true }
-  }, [externalReviewItems, onPathsReloaded, repositoryChange, stablePaths])
+  }, [externalReviewItems, repositoryChange, stablePaths])
 
   useEffect(() => {
     resetReviewFileMetrics()

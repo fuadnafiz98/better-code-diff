@@ -5,13 +5,17 @@ import type {
   AgentModelCatalog,
   AgentModelOption,
   AgentProvider,
-  AgentProviderStatuses
+  AgentProviderStatuses,
+  AgentRequestSubject
 } from '../../shared/contracts'
 import {
   agentAttachmentId,
+  agentSubjectKey,
+  attachAgentSelection,
   describeAgentAttachments,
   mergeAgentAttachments,
-  type AgentAttachment
+  type AgentAttachment,
+  type AgentSelection
 } from './agentAttachments'
 import { useAgentAnswer, type AgentAnswerApi } from './useAgentAnswer'
 import { getErrorMessage } from './repositoryApi'
@@ -19,6 +23,7 @@ import { getErrorMessage } from './repositoryApi'
 interface AgentSessionOptions {
   /** Sent alongside the question so the agent sees the change under review. */
   context: string
+  subject: AgentRequestSubject | null
 }
 
 // Everything the agent panel needs: whether it is docked open, which provider
@@ -30,6 +35,7 @@ export interface AgentSessionApi {
   model: string
   effort: string
   accessMode: AgentAccessMode
+  accessModeLocked: boolean
   models: readonly AgentModelOption[]
   efforts: readonly string[]
   loadingModels: boolean
@@ -44,7 +50,7 @@ export interface AgentSessionApi {
   setAccessMode(accessMode: AgentAccessMode): void
   refreshStatuses(): void
   login(provider: AgentProvider): void
-  attach(attachment: AgentAttachment): void
+  attach(selection: AgentSelection): void
   removeAttachment(id: string): void
   ask(prompt: string): void
   toggle(): void
@@ -76,6 +82,10 @@ const DEFAULT_CATALOG: AgentModelCatalog = {
 }
 
 const AGENT_SETTINGS_KEY = 'horus:agent-settings:v2'
+const MAX_ATTACHMENT_TEXT_LENGTH = 40_000
+const MAX_ATTACHMENTS_PER_TAB = 8
+const MAX_ATTACHMENT_TABS = 12
+const NO_ATTACHMENTS: readonly AgentAttachment[] = []
 // Sign-in happens in a browser the app cannot see, so it is polled — but an
 // abandoned sign-in used to poll two CLI probes a second forever.
 const AUTH_POLL_START_MS = 2_000
@@ -126,12 +136,12 @@ function loadAgentSettings(): {
   }
 }
 
-export function useAgentSession({ context }: AgentSessionOptions): AgentSessionApi {
+export function useAgentSession({ context, subject }: AgentSessionOptions): AgentSessionApi {
   const answer = useAgentAnswer()
   const initialSettings = useMemo(loadAgentSettings, [])
   const [open, setOpen] = useState(false)
   const [provider, setProvider] = useState<AgentProvider>(initialSettings.provider)
-  const [accessMode, setAccessMode] = useState<AgentAccessMode>(initialSettings.accessMode)
+  const [configuredAccessMode, setConfiguredAccessMode] = useState<AgentAccessMode>(initialSettings.accessMode)
   const [selections, setSelections] = useState(initialSettings.selections)
   const [catalog, setCatalog] = useState<AgentModelCatalog>(DEFAULT_CATALOG)
   const [loadingModels, setLoadingModels] = useState(false)
@@ -139,7 +149,13 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
   const [loadingStatuses, setLoadingStatuses] = useState(false)
   const [authenticatingProvider, setAuthenticatingProvider] = useState<AgentProvider | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
-  const [attachments, setAttachments] = useState<readonly AgentAttachment[]>([])
+  const [attachmentsBySubject, setAttachmentsBySubject] = useState<
+    Readonly<Record<string, readonly AgentAttachment[]>>
+  >({})
+  const subjectKey = subject == null ? null : agentSubjectKey(subject)
+  const attachments = subjectKey == null ? NO_ATTACHMENTS : attachmentsBySubject[subjectKey] ?? NO_ATTACHMENTS
+  const accessModeLocked = subject != null && subject.source !== 'workingTree'
+  const accessMode = accessModeLocked ? 'review' : configuredAccessMode
 
   const models = catalog[provider]
   const selected = selections[provider]
@@ -151,7 +167,7 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
 
   useEffect(() => {
     try {
-      const persistedAccessMode = accessMode === 'full-access' ? 'auto' : accessMode
+      const persistedAccessMode = configuredAccessMode === 'full-access' ? 'auto' : configuredAccessMode
       localStorage.setItem(AGENT_SETTINGS_KEY, JSON.stringify({
         provider,
         accessMode: persistedAccessMode,
@@ -160,7 +176,7 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     } catch {
       // The settings are optional when storage is blocked or full.
     }
-  }, [accessMode, provider, selections])
+  }, [configuredAccessMode, provider, selections])
 
   useEffect(() => {
     if (!open || window.repository == null) return
@@ -248,26 +264,50 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     }))
   }, [provider])
 
-  const attach = useCallback((attachment: AgentAttachment) => {
+  const attach = useCallback((selection: AgentSelection) => {
     setOpen(true)
-    setAttachments((current) => mergeAgentAttachments(current, attachment))
-  }, [])
+    if (subject == null || subjectKey == null) {
+      setStatusError('Select code in a repository tab before adding it to the agent.')
+      return
+    }
+    if (selection.selectedText.length > MAX_ATTACHMENT_TEXT_LENGTH) {
+      setStatusError('That selection is too large. Select a smaller region of code.')
+      return
+    }
+    const attachment = attachAgentSelection(subject, selection)
+    setStatusError(null)
+    setAttachmentsBySubject((current) => {
+      const nextForSubject = mergeAgentAttachments(current[subjectKey] ?? [], attachment)
+        .slice(-MAX_ATTACHMENTS_PER_TAB)
+      const next = { ...current, [subjectKey]: nextForSubject }
+      const keys = Object.keys(next)
+      if (keys.length > MAX_ATTACHMENT_TABS) delete next[keys[0]!]
+      return next
+    })
+  }, [subject, subjectKey])
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((current) => current.filter((attachment) => agentAttachmentId(attachment) !== id))
-  }, [])
+    if (subjectKey == null) return
+    setAttachmentsBySubject((current) => ({
+      ...current,
+      [subjectKey]: (current[subjectKey] ?? []).filter(
+        (attachment) => agentAttachmentId(attachment) !== id
+      )
+    }))
+  }, [subjectKey])
 
-  // The review context is a re-joined copy of the whole patch; reading it from a
-  // ref keeps `ask` stable while an answer streams, instead of rebuilding this
-  // callback on every token.
+  // Reading the tab/review summary from a ref keeps `ask` stable while an answer
+  // streams instead of rebuilding this callback on every token.
   const contextRef = useRef(context)
   useEffect(() => {
     contextRef.current = context
   }, [context])
 
   const ask = useCallback((prompt: string) => {
-    // The agent reads the repository itself, so the attachment is passed as a
-    // file and line reference rather than as a second copy of those lines.
+    if (subject == null || subjectKey == null) {
+      setStatusError('Open a repository tab before asking the agent.')
+      return
+    }
     answer.ask({
       provider,
       model,
@@ -275,10 +315,13 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
       accessMode,
       prompt: describeAgentAttachments(attachments, prompt),
       context: contextRef.current,
-      question: prompt
+      question: prompt,
+      subject,
+      selections: attachments.map(({ subject: _subject, ...selection }) => selection),
+      sessionScope: subjectKey
     })
-    setAttachments([])
-  }, [accessMode, answer, attachments, effort, model, provider])
+    setAttachmentsBySubject((current) => ({ ...current, [subjectKey]: NO_ATTACHMENTS }))
+  }, [accessMode, answer, attachments, effort, model, provider, subject, subjectKey])
 
   const toggle = useCallback(() => setOpen((current) => !current), [])
   const close = useCallback(() => setOpen(false), [])
@@ -290,6 +333,7 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     model,
     effort,
     accessMode,
+    accessModeLocked,
     models,
     efforts,
     loadingModels,
@@ -301,7 +345,7 @@ export function useAgentSession({ context }: AgentSessionOptions): AgentSessionA
     setProvider,
     setModel,
     setEffort,
-    setAccessMode,
+    setAccessMode: setConfiguredAccessMode,
     refreshStatuses,
     login,
     attach,

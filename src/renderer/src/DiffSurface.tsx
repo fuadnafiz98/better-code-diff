@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
 import type { DiffLineAnnotation, FileContents, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
 import { File, MultiFileDiff, useVirtualizer, Virtualizer } from '@pierre/diffs/react'
 import type { Editor } from '@pierre/diffs/edit'
@@ -11,7 +11,7 @@ import {
 } from '@pierre/icons'
 
 import type { ContentSearchResult, FileComparison } from '../../shared/contracts'
-import type { AgentAttachment } from './agentAttachments'
+import type { AgentSelection } from './agentAttachments'
 import type { DiffStyle } from './AppView'
 import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { syncDragGuideLifecycle } from './dragSelection'
@@ -33,7 +33,9 @@ import {
   type ReviewAnnotationMetadata,
   type ReviewThread
 } from './ReviewComments'
+import { markRendererStartup } from './startupMetrics'
 import { BackToTopButton, BACK_TO_TOP_THRESHOLD, preferredScrollBehavior } from './BackToTopButton'
+import { showToast } from './toast'
 
 const DIFF_OPTIONS = {
   diffIndicators: 'bars' as const,
@@ -72,7 +74,7 @@ export interface ContentSearchState {
   results: readonly ContentSearchResult[]
 }
 
-interface DiffSurfaceProps {
+export interface DiffSurfaceProps {
   comparison: FileComparison | null
   loading: boolean
   diffStyle: DiffStyle
@@ -83,7 +85,7 @@ interface DiffSurfaceProps {
   onDraftFileChange(file: FileContents): void
   onEditorAttach(editor: Editor<ReviewAnnotationMetadata>): void
   onEditorBlur(): void
-  onAttachToAgent(attachment: AgentAttachment): void
+  onAttachToAgent(selection: AgentSelection): void
   threadsByPath: Record<string, ReviewThread[]>
   setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>
 }
@@ -306,10 +308,24 @@ function DiffContents({
   }, [onDraftFileChange, publishRemappedAnnotations])
 
   const askAgentAboutSelection = useCallback((context: SelectionActionContext) => {
-    if (comparisonPath == null) return
+    if (comparisonPath == null || comparison == null) return
     const { startLine, endLine } = selectionLineRange(context.selection)
-    onAttachToAgent({ path: comparisonPath, startLine, endLine })
-  }, [comparisonPath, onAttachToAgent])
+    const selectedText = context.getSelectionText()
+    if (selectedText === '') {
+      showToast('Select code before adding it to the agent')
+      return
+    }
+    const side = comparison.newFile == null ? 'deletions' : 'additions'
+    const file = side === 'deletions' ? comparison.oldFile : comparison.newFile
+    onAttachToAgent({
+      path: comparisonPath,
+      startLine,
+      endLine,
+      side,
+      selectedText,
+      blobOid: file?.cacheKey ?? null
+    })
+  }, [comparison, comparisonPath, onAttachToAgent])
 
   const commentOnSelection = useCallback((context: SelectionActionContext) => {
     const { startLine, endLine } = selectionLineRange(context.selection)
@@ -483,6 +499,7 @@ const DiffSurface = memo(function DiffSurface({
   threadsByPath,
   ...props
 }: DiffSurfaceProps): React.JSX.Element {
+  useLayoutEffect(() => markRendererStartup('viewerCommitted'), [])
   const [staleComparison, setStaleComparison] = useState<FileComparison | null>(null)
   // Only a comparison that is actually on screen is worth remembering, and
   // gating on `loading` keeps a same-path update (a save, an external write)

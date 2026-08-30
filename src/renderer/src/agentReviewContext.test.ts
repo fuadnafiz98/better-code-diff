@@ -1,11 +1,24 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { RepositoryReview } from '../../shared/contracts'
-import { formatAgentReviewContext } from './agentReviewContext'
+import type { RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
+import { agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
+import { createPatchWorld } from './useReviewWorlds'
+
+const snapshot: RepositorySnapshot = {
+  root: '/repo-a',
+  name: 'repo-a',
+  kind: 'git',
+  branch: 'main',
+  head: 'desk-head',
+  paths: ['src/file-0.ts'],
+  statuses: []
+}
 
 const githubReview = (fileCount: number, patch = 'diff --git a/huge b/huge\n'.repeat(4000)): RepositoryReview => ({
   kind: 'github',
   selector: '1092',
+  baseOid: 'base-1092',
+  headOid: 'head-1092',
   commitId: 'abc',
   viewerCanSubmitDecision: true,
   pullRequest: {
@@ -47,5 +60,23 @@ describe('formatAgentReviewContext', () => {
     expect(context).toContain('…and 40 more files')
     expect(context).not.toContain('src/file-80.ts')
     expect(context.length).toBeLessThan(8_000)
+  })
+
+  test('binds a Patch tab to its repository and immutable revisions', () => {
+    const review = githubReview(1)
+    const subject = agentSubjectForWorld(createPatchWorld(snapshot, review, 1, 'ready'))
+    const context = formatAgentReviewContext(review, subject)
+
+    expect(subject).toEqual({
+      tabId: 'patch:https://github.com/example/repo/pull/1092:base-1092:head-1092',
+      repositoryRoot: '/repo-a',
+      repositoryName: 'repo-a',
+      source: 'patch',
+      baseOid: 'base-1092',
+      headOid: 'head-1092'
+    })
+    expect(context).toContain('Repository root: /repo-a')
+    expect(context).toContain('Base revision: base-1092')
+    expect(context).toContain('Head revision: head-1092')
   })
 })

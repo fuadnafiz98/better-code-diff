@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { SelectedLineRange } from '@pierre/diffs'
 
 import type { RemoteReviewThread } from '../../shared/contracts'
+import type { ReviewCommentAnchor } from './reviewThreadAnchors'
 import {
   IconApproved,
   IconCheck,
@@ -25,6 +26,8 @@ export interface ReviewThread {
   lineNumber: number
   side?: 'additions' | 'deletions'
   range: SelectedLineRange
+  anchor?: ReviewCommentAnchor
+  orphaned?: boolean
   replies: ReviewReply[]
   resolved: boolean
 }
@@ -37,6 +40,7 @@ export type ReviewAnnotationMetadata =
 
 interface SelectionActionsProps {
   range: SelectedLineRange
+  commentLabel?: string
   onComment(): void
   onAskAgent(): void
   onDismiss(): void
@@ -46,6 +50,7 @@ interface SelectionActionsProps {
 // same selection can go to a teammate or to the agent.
 export function SelectionActions({
   range,
+  commentLabel = 'Comment',
   onComment,
   onAskAgent,
   onDismiss
@@ -55,8 +60,8 @@ export function SelectionActions({
       <span className="selection-actions-range" title={formatSelectedRange(range)}>
         {formatCompactSelectedRange(range)}
       </span>
-      <button type="button" onClick={onComment} aria-label="Add comment" title="Add comment">
-        <IconCommentAdd />Comment
+      <button type="button" onClick={onComment} aria-label={commentLabel} title={commentLabel}>
+        <IconCommentAdd />{commentLabel}
       </button>
       <button type="button" onClick={onAskAgent} aria-label="Add selection to Chat" title="Add selection to Chat (⌘I)">
         <IconSparkles />Chat<kbd aria-hidden="true">⌘I</kbd>

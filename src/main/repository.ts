@@ -103,7 +103,7 @@ const PULL_REQUEST_LIST_LIMIT = 30
 // restart — can serve it from disk instead of repeating a download the code's own
 // comment measures at nearly two minutes for a 3000-file review. A force-push
 // produces a new oid and therefore a new key, so staleness is impossible.
-const PULL_REQUEST_CACHE_VERSION = 1
+const PULL_REQUEST_CACHE_VERSION = 2
 const MAX_PULL_REQUEST_CACHE_ENTRIES = 20
 const MAX_PULL_REQUEST_CACHE_BYTES = 200 * 1024 * 1024
 
@@ -117,7 +117,8 @@ export interface CachedPullRequestReview {
 const MAX_REVIEW_BODY_LENGTH = 65_536
 // `gh search prs --json` only exposes these pull request fields; richer fields need `gh pr view`.
 const PULL_REQUEST_LIST_FIELDS = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles'
-const PULL_REQUEST_REVIEW_FIELDS = `${PULL_REQUEST_LIST_FIELDS},headRefOid,files`
+const PULL_REQUEST_REVIEW_FIELDS = `${PULL_REQUEST_LIST_FIELDS},baseRefOid,headRefOid,files`
+const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 // Requested separately because older `gh` builds reject the whole command when a field name is unknown.
 const PULL_REQUEST_CHECK_FIELDS = 'statusCheckRollup,mergeable'
 const PASSING_CHECK_RESULTS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED'])
@@ -590,7 +591,7 @@ function parseRemoteBranches(result: CommandResult): RemoteBranch[] {
   })
 }
 
-function parseRemotes(result: CommandResult): GitRemote[] {
+export function parseRemotes(result: CommandResult): GitRemote[] {
   const remotes = new Map<string, GitRemote>()
   for (const line of result.stdout.toString('utf8').split('\n')) {
     const match = /^(\S+)\s+(.+)\s+\((fetch|push)\)$/.exec(line)
@@ -1019,7 +1020,7 @@ export class RepositoryService {
   #pendingComparisons = new Map<string, Promise<FileComparison>>()
   #selfWriteObserver: ((path: string) => void) | null = null
   #checkFieldsSupported = true
-  #reviewAbort: AbortController | null = null
+  #reviewAborts = new Map<string, AbortController>()
   #pullRequestCache: PullRequestReviewCache | null = null
   #activeSearch: { child: ReturnType<typeof spawn>; cancelled: boolean; startedAt: number } | null = null
   #contentSearchMetrics: ContentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
@@ -1749,23 +1750,31 @@ export class RepositoryService {
     if (!branches.has(baseRef) || !branches.has(headRef)) throw new Error('Both comparison refs must be local branches.')
     if (baseRef === headRef) throw new Error('Select two different branches to compare.')
     const comparison = `${baseRef}...${headRef}`
-    const [churnResult, headResult] = await Promise.all([
+    const [churnResult, baseResult, headResult] = await Promise.all([
       this.#git(['diff', '--numstat', '-z', '--find-renames', comparison, '--']),
+      this.#git(['merge-base', baseRef, headRef]),
       this.#git(['rev-parse', headRef])
     ])
+    const baseOid = baseResult.stdout.toString('utf8').trim()
+    const headOid = headResult.stdout.toString('utf8').trim()
     const entries = parseNumstat(churnResult.stdout)
     const oversized = selectOversizedDiffFiles(entries)
     const patchResult = await this.#git([
-      'diff', '--no-color', '--find-renames', comparison, '--', ...oversized.excludePathspecs
+      'diff', '--no-color', '--full-index', '--find-renames', comparison, '--', ...oversized.excludePathspecs
     ])
-    const limited = limitPatchFileSize(patchResult.stdout.toString('utf8'), MAX_DIFF_FILE_BYTES)
+    const patch = patchResult.stdout.toString('utf8')
+    const patchFiles = new Map(filesFromPatch(patch).map((file) => [file.path, file]))
+    const files = diffFilesFromChurn(entries).map((file) => ({ ...file, ...patchFiles.get(file.path) }))
+    const limited = limitPatchFileSize(patch, MAX_DIFF_FILE_BYTES)
     return {
       kind: 'local',
-      id: `${comparison}:${headResult.stdout.toString('utf8').trim()}`,
+      id: `${comparison}:${baseOid}:${headOid}`,
       title: `${headRef} compared with ${baseRef}`,
       baseRefName: baseRef,
       headRefName: headRef,
-      files: diffFilesFromChurn(entries),
+      baseOid,
+      headOid,
+      files,
       patch: limited.patch,
       omittedFiles: [...oversized.omittedFiles, ...limited.omittedFiles]
     }
@@ -1782,8 +1791,8 @@ export class RepositoryService {
       ? ['diff-tree', '--root', '--no-commit-id', '--numstat', '-r', '-z', '--find-renames', commitOid, '--']
       : ['diff', '--numstat', '-z', '--find-renames', firstParent, commitOid, '--']
     const patchArgs = firstParent == null
-      ? ['show', '--format=', '--no-color', '--find-renames', commitOid, '--']
-      : ['diff', '--no-color', '--find-renames', firstParent, commitOid, '--']
+      ? ['show', '--format=', '--no-color', '--full-index', '--find-renames', commitOid, '--']
+      : ['diff', '--no-color', '--full-index', '--find-renames', firstParent, commitOid, '--']
     const [churnResult, metadataResult] = await Promise.all([
       this.#git(churnArgs),
       this.#git(['show', '-s', '--format=%h%x1f%s', commitOid])
@@ -1792,14 +1801,19 @@ export class RepositoryService {
     const entries = parseNumstat(churnResult.stdout)
     const oversized = selectOversizedDiffFiles(entries)
     const patchResult = await this.#git([...patchArgs, ...oversized.excludePathspecs])
-    const limited = limitPatchFileSize(patchResult.stdout.toString('utf8'), MAX_DIFF_FILE_BYTES)
+    const patch = patchResult.stdout.toString('utf8')
+    const patchFiles = new Map(filesFromPatch(patch).map((file) => [file.path, file]))
+    const files = diffFilesFromChurn(entries).map((file) => ({ ...file, ...patchFiles.get(file.path) }))
+    const limited = limitPatchFileSize(patch, MAX_DIFF_FILE_BYTES)
     return {
       kind: 'local',
       id: `commit:${commitOid}`,
       title: `${shortOid} ${subject}`,
       baseRefName: firstParent?.slice(0, 8) ?? 'Empty tree',
       headRefName: shortOid,
-      files: diffFilesFromChurn(entries),
+      baseOid: firstParent ?? EMPTY_TREE_OID,
+      headOid: commitOid,
+      files,
       patch: limited.patch,
       omittedFiles: [...oversized.omittedFiles, ...limited.omittedFiles]
     }
@@ -1838,24 +1852,29 @@ export class RepositoryService {
   // Closing a big review left up to eight `gh api` children per wave running to
   // completion for a patch that was already discarded, and on a rate-limited token
   // that budget is spent invisibly.
-  cancelPullRequestReview(): void {
-    this.#reviewAbort?.abort()
-    this.#reviewAbort = null
+  cancelPullRequestReview(requestId?: string): void {
+    if (requestId != null) {
+      this.#reviewAborts.get(requestId)?.abort()
+      this.#reviewAborts.delete(requestId)
+      return
+    }
+    for (const abort of this.#reviewAborts.values()) abort.abort()
+    this.#reviewAborts.clear()
   }
 
   async getPullRequestReview(
     selector: number | string,
-    onProgress?: (progress: PullRequestReviewProgress) => void
+    onProgress?: (progress: PullRequestReviewProgress) => void,
+    requestId: string = randomUUID()
   ): Promise<PullRequestReview> {
     this.#requireGitRepository()
-    // A second review supersedes the first rather than racing it.
-    this.cancelPullRequestReview()
+    this.cancelPullRequestReview(requestId)
     const abort = new AbortController()
-    this.#reviewAbort = abort
+    this.#reviewAborts.set(requestId, abort)
     try {
       return await this.#loadPullRequestReview(normalizePullRequestSelector(selector), abort.signal, onProgress)
     } finally {
-      if (this.#reviewAbort === abort) this.#reviewAbort = null
+      if (this.#reviewAborts.get(requestId) === abort) this.#reviewAborts.delete(requestId)
     }
   }
 
@@ -1877,8 +1896,12 @@ export class RepositoryService {
       ),
       this.#getGitHubViewerLogin(ghExecutable)
     ])
-    const details = parseJson<RawPullRequestSummary & { files: PullRequestReview['files']; headRefOid: string }>(detailsResult, 'GitHub CLI')
-    const { files, headRefOid, ...rest } = details
+    const details = parseJson<RawPullRequestSummary & {
+      files: PullRequestReview['files']
+      baseRefOid: string
+      headRefOid: string
+    }>(detailsResult, 'GitHub CLI')
+    const { files, baseRefOid, headRefOid, ...rest } = details
     const pullRequest = toPullRequestSummary(rest)
     // The files API stops answering at 3000 files however many GitHub reports, so a
     // review of a bigger pull request is climbing towards the ceiling, not the count.
@@ -1892,6 +1915,8 @@ export class RepositoryService {
     const base: PullRequestReview = {
       kind: 'github',
       selector: normalizedSelector,
+      baseOid: baseRefOid,
+      headOid: headRefOid,
       commitId: headRefOid,
       viewerCanSubmitDecision: !isSameGitHubLogin(viewerLogin, pullRequest.author.login),
       pullRequest,
@@ -1936,8 +1961,6 @@ export class RepositoryService {
     await this.#collectPullRequestPatch(
       ghExecutable,
       normalizedSelector,
-      files ?? [],
-      expectedFileCount,
       signal,
       emit
     )
@@ -1951,7 +1974,6 @@ export class RepositoryService {
     return review
   }
 
-
   /**
    * One diff document is the fast path; a pull request too big for GitHub to render
    * as a single diff is rebuilt from the paged files API instead of failing to open.
@@ -1959,8 +1981,6 @@ export class RepositoryService {
   async #collectPullRequestPatch(
     ghExecutable: string,
     selector: string,
-    detailFiles: readonly PullRequestFile[],
-    expectedFileCount: number,
     signal: AbortSignal,
     emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
   ): Promise<void> {
@@ -1974,7 +1994,7 @@ export class RepositoryService {
       const patch = diffResult.stdout.toString('utf8')
       emit({
         patch,
-        files: detailFiles.length >= expectedFileCount ? [...detailFiles] : filesFromPatch(patch),
+        files: filesFromPatch(patch),
         omittedFiles: []
       })
       return

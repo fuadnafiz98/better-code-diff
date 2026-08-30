@@ -8,8 +8,11 @@ import {
   useEffectEvent,
   useMemo,
   useRef,
+  useLayoutEffect,
   useState,
-  type CSSProperties
+  useSyncExternalStore,
+  type CSSProperties,
+  type RefObject
 } from 'react'
 
 import type {
@@ -38,7 +41,6 @@ import {
   savePreferences,
   type AppPreferences
 } from './preferences'
-import { SettingsPage } from './SettingsPage'
 import { PullRequestLoadingIndicator } from './PullRequestLoadingIndicator'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import {
@@ -60,17 +62,27 @@ import { useTerminalVisibility } from './useTerminalVisibility'
 import { includesPath, samePathList } from './snapshotPaths'
 import { useComparisonLoader } from './useComparisonLoader'
 import { WorkspaceSkeleton } from './WorkspaceSkeleton'
-import { ViewerProviders } from './editor/ViewerProviders'
 import { usePresence, useRetainedPresence } from './usePresence'
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog'
 import { useConfirm } from './useConfirm'
-import { formatAgentReviewContext } from './agentReviewContext'
+import { agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
 import { automaticWorkspaceView } from './workspaceMode'
+import { WorldStrip } from './WorldStrip'
+import { findCollisionPaths } from './useReviewWorlds'
+import {
+  getLoadedWorkspaceRoot,
+  preloadWorkspaceRoot,
+  preloadWorkspaceViewer,
+  subscribeWorkspaceRoot
+} from './workspaceBoot'
+import { markRendererStartup } from './startupMetrics'
 
-const RepositoryWorkspace = lazy(() => import('./RepositoryWorkspace'))
 const TerminalDock = lazy(() => import('./TerminalDock'))
 const RepositoryPanel = lazy(async () => ({
   default: (await import('./GitHubPanel')).RepositoryPanel
+}))
+const SettingsPage = lazy(async () => ({
+  default: (await import('./SettingsPage')).SettingsPage
 }))
 // The titlebar reserves 92px for the traffic lights; in fullscreen there are
 // none, so the CSS collapses the reserve off this attribute.
@@ -109,7 +121,83 @@ function useWindowVisibilitySync(): void {
   }, [])
 }
 
+interface AppShortcutOptions {
+  commandPaletteRef: RefObject<CommandPaletteHandle | null>
+  gitWorkflow: ReturnType<typeof useGitWorkflow>
+  keybindings: AppPreferences['keybindings']
+  runCommand(command: AppCommand): void
+  search: RepositorySearchController
+  settingsOpen: boolean
+}
+
+function useAppShortcuts({
+  commandPaletteRef,
+  gitWorkflow,
+  keybindings,
+  runCommand,
+  search,
+  settingsOpen
+}: AppShortcutOptions): void {
+  const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
+      event.preventDefault()
+      return
+    }
+    // Settings is a modal <dialog>: Escape reaches it as `cancel`, which runs its
+    // own 140ms exit. Closing it from here would skip that.
+    if (event.key === 'Escape' && settingsOpen) return
+    if (event.key === 'Escape' && gitWorkflow.panelOpen) {
+      event.preventDefault()
+      gitWorkflow.setPanelOpen(false)
+      return
+    }
+    if (event.key === 'Escape' && search.isOpen) {
+      event.preventDefault()
+      search.dismiss()
+      return
+    }
+    if (event.defaultPrevented || event.repeat) return
+    if (!settingsOpen && event.metaKey && !event.ctrlKey && !event.altKey) {
+      if (!event.shiftKey && event.key.toLowerCase() === 't') {
+        event.preventDefault()
+        gitWorkflow.openNewWorld()
+        return
+      }
+      if (!event.shiftKey && event.key.toLowerCase() === 'w') {
+        event.preventDefault()
+        gitWorkflow.closeReview()
+        return
+      }
+      if (event.shiftKey && (event.key === '[' || event.key === ']')) {
+        event.preventDefault()
+        gitWorkflow.cycleWorld(event.key === '[' ? -1 : 1)
+        return
+      }
+    }
+    const command = commandFromEvent(event, keybindings)
+    if (command == null) return
+    event.preventDefault()
+    runCommand(command)
+  })
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  const dismissSearchOnOutsidePointer = useEffectEvent((event: PointerEvent): void => {
+    if (!search.isOpen || isInsideSearchSurface(event.target)) return
+    search.dismiss()
+  })
+
+  useEffect(() => {
+    window.addEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
+    return () => window.removeEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
+  }, [])
+}
+
 interface AppLayoutProps {
+  WorkspaceRoot: ReturnType<typeof getLoadedWorkspaceRoot>
   snapshot: RepositorySnapshot | null
   selectedPath: string | null
   comparison: FileComparison | null
@@ -139,7 +227,7 @@ interface AppLayoutProps {
   setSelectedPath: React.Dispatch<React.SetStateAction<string | null>>
   onComparisonSaved(comparison: FileComparison): void
   setDiffStyle: React.Dispatch<React.SetStateAction<DiffStyle>>
-  setWorkspaceView: React.Dispatch<React.SetStateAction<WorkspaceView>>
+  setWorkspaceView(view: WorkspaceView): void
   setTerminalHeight: React.Dispatch<React.SetStateAction<number>>
   setTerminalResizing: React.Dispatch<React.SetStateAction<boolean>>
   toggleSidebar(): void
@@ -160,6 +248,7 @@ interface AppLayoutProps {
 const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps): React.JSX.Element {
   const { gitWorkflow } = view
   const { search } = view
+  const { WorkspaceRoot } = view
   // The palette lists branches the integration snapshot already holds; it never
   // fetches on its own, so this stays empty until the panel has been opened once.
   const branches = gitWorkflow.integration?.branches
@@ -180,21 +269,47 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
     () => ({ query: search.query, results: search.contentResults }),
     [search.contentResults, search.query]
   )
-  // Rebuilt per render this string re-joined the whole review patch on every
-  // streamed token, and re-created `ask` with it.
-  const agentContext = useMemo(
-    () => formatAgentReviewContext(gitWorkflow.repositoryReview),
-    [gitWorkflow.repositoryReview]
+  // Keep the tab/review summary stable while answer tokens stream.
+  const agentSubject = useMemo(
+    () => agentSubjectForWorld(gitWorkflow.activeWorld),
+    [gitWorkflow.activeWorld]
   )
-  const agent = useAgentSession({ context: agentContext })
+  const agentContext = useMemo(
+    () => formatAgentReviewContext(gitWorkflow.repositoryReview, agentSubject),
+    [agentSubject, gitWorkflow.repositoryReview]
+  )
+  const agent = useAgentSession({ context: agentContext, subject: agentSubject })
+  const collisionPaths = useMemo(
+    () => findCollisionPaths(view.snapshot?.statuses ?? [], gitWorkflow.repositoryReview),
+    [gitWorkflow.repositoryReview, view.snapshot?.statuses]
+  )
+  const activeNewWorld = gitWorkflow.activeWorld?.source === 'new' ? gitWorkflow.activeWorld : null
   return <>
-    <Titlebar snapshot={view.snapshot} sidebarVisible={view.sidebarVisible}
+    <WorldStrip
+      worlds={gitWorkflow.worlds}
+      activeWorldId={gitWorkflow.activeWorld?.worldId ?? null}
+      collisionCount={collisionPaths.size}
+      onFocus={gitWorkflow.focusWorld}
+      onClose={gitWorkflow.closeReview}
+      onNew={gitWorkflow.openNewWorld}
+    />
+
+    <Titlebar snapshot={activeNewWorld == null ? view.snapshot : null} sidebarVisible={view.sidebarVisible}
       searchQuery={search.query} searchInputRef={search.inputRef} searchingContent={search.searchingContent}
       activeSearchResultId={search.activeResultIndex >= 0
         ? `repository-search-result-${search.activeResultIndex}` : undefined}
+      newTab={activeNewWorld != null}
+      locator={activeNewWorld?.locator ?? ''}
+      locatorBusy={gitWorkflow.actionKey === 'resolve:pull-request'}
       opening={view.opening} keybindings={view.preferences.keybindings}
       onSidebarToggle={view.toggleSidebar}
       onSearchQueryChange={search.changeQuery} onSearchKeyDown={search.handleKeyDown} onOpen={view.openFolder}
+      onLocatorChange={gitWorkflow.updateNewWorldLocator}
+      onLocatorSubmit={() => {
+        const locator = activeNewWorld?.locator.trim() ?? ''
+        if (locator === '') return
+        void gitWorkflow.openPullRequestFromLocator(locator)
+      }}
       onSettingsOpen={view.openSettings} onGitOpen={gitWorkflow.openPanel}
       onBranchesOpen={gitWorkflow.openBranches}
       agentOpen={agent.open} onAgentToggle={agent.toggle}
@@ -226,8 +341,10 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
       onRunCommand={view.runCommand}
       recentFiles={view.recentFiles} onOpenFile={view.setSelectedPath}
       branches={paletteBranches} onSwitchBranch={(branch) => void gitWorkflow.switchBranch(branch)} />
-    {view.settingsOpen ? <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
-      onClose={() => view.setSettingsOpen(false)} /> : null}
+    {view.settingsOpen ? <Suspense fallback={null}>
+      <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
+        onClose={() => view.setSettingsOpen(false)} />
+    </Suspense> : null}
     {!view.settingsOpen && search.isOpen ? <SearchResults query={search.query}
       fileResults={search.fileResults} contentResults={search.contentResults} searchingContent={search.searchingContent}
       activeIndex={search.activeResultIndex} onActiveIndexChange={search.setActiveResultIndex}
@@ -237,29 +354,43 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
           onDismiss={() => view.setError(null)} />
       : null}
 
-    {view.snapshot == null ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} opening={view.opening}
+    {activeNewWorld != null || view.snapshot == null ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} opening={view.opening}
       recentFolders={view.recentFolders} openingRecentPath={view.openingRecentPath} onRecentOpen={view.openRecentFolder}
       onRecentRemove={(path) => view.setRecentFolders((current) => current.filter((folder) => folder.path !== path))}
       keybindings={view.preferences.keybindings} />) : (
       <div className="workspace-host" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
         <div className={`workspace ${view.sidebarVisible ? '' : 'sidebar-hidden'} ${agent.open ? 'agent-open' : ''}`}>
-          <Suspense fallback={<WorkspaceSkeleton />}>
-            <ViewerProviders theme={view.preferences.editorTheme}>
-              <RepositoryWorkspace key={`${view.snapshot.root}:${gitWorkflow.repositoryReview == null ? 'working-tree'
-                : gitWorkflow.repositoryReview.kind === 'github' ? gitWorkflow.repositoryReview.pullRequest.url : gitWorkflow.repositoryReview.id}`}
+          {WorkspaceRoot == null ? <WorkspaceSkeleton /> : (
+              <WorkspaceRoot workspaceKey={`${view.snapshot.root}:${gitWorkflow.activeWorld?.worldId ?? 'desk'}`}
+                theme={view.preferences.editorTheme}
                 snapshot={view.snapshot} selectedPath={view.selectedPath} comparison={view.comparison}
                 loadingDiff={view.loadingDiff} diffStyle={view.diffStyle} workspaceView={view.workspaceView}
                 preferences={view.preferences} onPreferencesChange={view.setPreferences}
                 onAttachToAgent={agent.attach}
                 repositoryReview={gitWorkflow.repositoryReview} repositoryChange={view.repositoryChange}
+                reviewWorldSource={gitWorkflow.activeWorld?.source === 'new'
+                  ? 'desk'
+                  : gitWorkflow.activeWorld?.source ?? 'desk'}
+                reviewCheckpoint={gitWorkflow.reviewCheckpoint}
+                checkpointChangedFileCount={gitWorkflow.checkpointChangedFileCount}
+                checkpointRemovedFileCount={gitWorkflow.checkpointRemovedFileCount}
+                reviewReady={gitWorkflow.reviewReady}
+                sinceRemovedPaths={gitWorkflow.activeWorld?.source === 'since'
+                  ? gitWorkflow.activeWorld.removedPaths : []}
+                sinceUncertainPaths={gitWorkflow.activeWorld?.source === 'since'
+                  ? gitWorkflow.activeWorld.uncertainPaths : []}
+                collisionPaths={collisionPaths}
+                initialReviewScrollTop={gitWorkflow.initialReviewScrollTop}
+                onReviewScrollPositionChange={gitWorkflow.rememberReviewScroll}
                 contentSearch={contentSearch}
                 onSelectPath={view.setSelectedPath} onDiffStyleChange={view.setDiffStyle}
                 onWorkspaceViewChange={view.setWorkspaceView} onClosePullRequestReview={gitWorkflow.closeReview}
+                onSetReviewCheckpoint={gitWorkflow.setReviewCheckpoint}
+                onOpenSinceReview={gitWorkflow.openSinceReview}
                 submittingPullRequestReview={gitWorkflow.submittingReview} pullRequestReviewMessage={gitWorkflow.submissionMessage}
                 onSubmitPullRequestReview={gitWorkflow.submitReview} onComparisonSaved={view.onComparisonSaved}
                 onError={view.setError} />
-            </ViewerProviders>
-          </Suspense>
+          )}
           <AgentDock session={agent}
             confirm={view.confirm}
             contextLabel={gitWorkflow.repositoryReview == null ? 'your working tree' : 'this review'} />
@@ -270,10 +401,6 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
 })
 
 const RECENT_FILE_LIMIT = 10
-
-// A chunk that fails to prefetch is retried for real by the lazy boundary, so
-// the failure has nowhere useful to go here.
-function ignorePrefetchFailure(): void {}
 
 const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Element {
   // Keyed on the repository only. Opening a pull request review keys the
@@ -317,7 +444,16 @@ const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Eleme
   </main>
 })
 
-export function App(): React.JSX.Element {
+export interface AppProps {
+  initialPreferences?: AppPreferences
+  sessionSnapshot?: Promise<RepositorySnapshot | null>
+}
+
+export function App({
+  initialPreferences = loadPreferences(),
+  sessionSnapshot
+}: AppProps = {}): React.JSX.Element {
+  useLayoutEffect(() => markRendererStartup('reactCommitted'), [])
   useWindowVisibilitySync()
   useFullscreenSync()
   const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(null)
@@ -328,10 +464,18 @@ export function App(): React.JSX.Element {
   const [sidebarVisible, setSidebarVisible] = useState(true)
   const [diffStyle, setDiffStyle] = useState<DiffStyle>('split')
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('multi')
-  const [preferences, setPreferences] = useState<AppPreferences>(loadPreferences)
+  const [preferences, setPreferences] = useState<AppPreferences>(initialPreferences)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [recentFolders, setRecentFolders] = useState<RecentFolder[]>(loadRecentFolders)
   const [repositoryChange, setRepositoryChange] = useState<RepositoryChangeEvent | null>(null)
+  const [startupSessionSnapshot] = useState(() => sessionSnapshot
+    ?? window.repository?.getSessionSnapshot()
+    ?? Promise.resolve(null))
+  const WorkspaceRoot = useSyncExternalStore(
+    subscribeWorkspaceRoot,
+    getLoadedWorkspaceRoot,
+    getLoadedWorkspaceRoot
+  )
   const commandPaletteRef = useRef<CommandPaletteHandle>(null)
   const [recentFiles, setRecentFiles] = useState<readonly string[]>([])
   const confirmation = useConfirm()
@@ -348,13 +492,23 @@ export function App(): React.JSX.Element {
 
   const appliedSnapshotRef = useRef<RepositorySnapshot | null>(null)
 
+  const ensureWorkspaceRoot = useCallback(() => {
+    void preloadWorkspaceRoot().catch((loadError: unknown) => setError(getErrorMessage(loadError)))
+  }, [])
+
+  const changeWorkspaceView = useCallback((nextView: WorkspaceView) => {
+    void preloadWorkspaceViewer(nextView).catch((loadError: unknown) => setError(getErrorMessage(loadError)))
+    setWorkspaceView(nextView)
+  }, [])
+
   const applySnapshot = useCallback(
     (nextSnapshot: RepositorySnapshot) => {
       const previous = appliedSnapshotRef.current
-      const snapshotToApply = previous != null && samePathList(previous.paths, nextSnapshot.paths)
+      const snapshotToApply = previous?.root === nextSnapshot.root && samePathList(previous.paths, nextSnapshot.paths)
         ? { ...nextSnapshot, paths: previous.paths }
         : nextSnapshot
       appliedSnapshotRef.current = snapshotToApply
+      markRendererStartup('snapshotReady')
       setSnapshot(snapshotToApply)
       // A watcher tick must never move the reader: the selection only falls back
       // once the selected file has actually left the repository.
@@ -368,12 +522,26 @@ export function App(): React.JSX.Element {
     []
   )
 
+  const activateSnapshot = useCallback((nextSnapshot: RepositorySnapshot | null) => {
+    if (nextSnapshot != null) {
+      applySnapshot(nextSnapshot)
+      return
+    }
+    appliedSnapshotRef.current = null
+    setSnapshot(null)
+    setSelectedPath(null)
+    setRepositoryChange(null)
+  }, [applySnapshot])
+
   const gitWorkflow = useGitWorkflow({
     snapshot,
+    selectedPath,
+    workspaceView,
     applySnapshot,
+    activateSnapshot,
     onError: setError,
     onSelectPath: setSelectedPath,
-    onWorkspaceViewChange: setWorkspaceView,
+    onWorkspaceViewChange: changeWorkspaceView,
     confirm: confirmation.confirm
   })
 
@@ -396,15 +564,15 @@ export function App(): React.JSX.Element {
   }, [])
 
   const openFolder = useCallback(async () => {
+    ensureWorkspaceRoot()
     setOpening(true)
     setError(null)
     try {
       const nextSnapshot = await requireRepositoryApi().openFolder()
       if (nextSnapshot != null) {
-        gitWorkflow.reset()
         setSelectedPath(null)
-        applySnapshot(nextSnapshot)
-        setWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
+        gitWorkflow.openWorkingTree(nextSnapshot)
+        changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
         setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
       }
     } catch (openError) {
@@ -412,34 +580,39 @@ export function App(): React.JSX.Element {
     } finally {
       setOpening(false)
     }
-  }, [applySnapshot, gitWorkflow.reset])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree])
 
   const openRecentFolder = useCallback(async (folder: RecentFolder) => {
+    ensureWorkspaceRoot()
     setOpeningRecentPath(folder.path)
     setError(null)
     try {
       const nextSnapshot = await requireRepositoryApi().openPath(folder.path)
-      gitWorkflow.reset()
       setSelectedPath(null)
-      applySnapshot(nextSnapshot)
-      setWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
+      gitWorkflow.openWorkingTree(nextSnapshot)
+      changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
       setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
     } catch (openError) {
       setError(`Cannot open “${folder.name}”. ${getErrorMessage(openError)}`)
     } finally {
       setOpeningRecentPath(null)
     }
-  }, [applySnapshot, gitWorkflow.reset])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree])
 
   const handleRepositoryChange = useEffectEvent((change: RepositoryChangeEvent): void => {
+    const previousWorld = gitWorkflow.worlds.find((world) => world.source !== 'new'
+      && world.root === change.snapshot.root)
+    const previousSnapshot = previousWorld == null || previousWorld.source === 'new'
+      ? null
+      : previousWorld.snapshot
+    const nextSnapshot: RepositorySnapshot = {
+      ...change.snapshot,
+      paths: change.snapshot.paths ?? previousSnapshot?.paths ?? []
+    }
+    gitWorkflow.syncRepositorySnapshot(nextSnapshot)
+    if (appliedSnapshotRef.current?.root !== change.snapshot.root) return
     comparisonLoader.invalidate(change.changedPaths)
     startTransition(() => {
-      const previous = appliedSnapshotRef.current
-      const nextSnapshot: RepositorySnapshot = {
-        ...change.snapshot,
-        paths: change.snapshot.paths
-          ?? (previous?.root === change.snapshot.root ? previous.paths : [])
-      }
       applySnapshot(nextSnapshot)
       setRepositoryChange(change)
       if (selectedPath != null && change.changedPaths.includes(selectedPath)) {
@@ -450,34 +623,21 @@ export function App(): React.JSX.Element {
 
   useEffect(() => requireRepositoryApi().onDidChange(handleRepositoryChange), [])
 
-  // The workspace chunk is what a folder needs first and the two viewer chunks
-  // are what it needs second. Pulling them in while the main thread is idle is
-  // what keeps the Suspense skeletons off screen in the common case.
   const hasSnapshot = snapshot != null
-  useEffect(() => {
-    const handle = window.requestIdleCallback(() => {
-      void import('./RepositoryWorkspace').catch(ignorePrefetchFailure)
-      if (!hasSnapshot) return
-      void import('./DiffSurface').catch(ignorePrefetchFailure)
-      void import('./MultiFileReview').catch(ignorePrefetchFailure)
-    })
-    return () => window.cancelIdleCallback(handle)
-  }, [hasSnapshot])
 
   useEffect(() => {
-    const repository = window.repository
-    if (repository == null) return
     let cancelled = false
-    void repository.getSessionSnapshot().then((sessionSnapshot) => {
-      if (cancelled || sessionSnapshot == null) return
-      applySnapshot(sessionSnapshot)
-      setWorkspaceView(automaticWorkspaceView(sessionSnapshot, null))
-      setRecentFolders((current) => rememberRecentFolder(current, sessionSnapshot))
+    void startupSessionSnapshot.then((restoredSnapshot) => {
+      if (cancelled || restoredSnapshot == null) return
+      ensureWorkspaceRoot()
+      gitWorkflow.openWorkingTree(restoredSnapshot)
+      changeWorkspaceView(automaticWorkspaceView(restoredSnapshot, null))
+      setRecentFolders((current) => rememberRecentFolder(current, restoredSnapshot))
     }).catch((sessionError: unknown) => {
       if (!cancelled) setError(getErrorMessage(sessionError))
     })
     return () => { cancelled = true }
-  }, [applySnapshot])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree, startupSessionSnapshot])
 
   useEffect(() => {
     const root = document.documentElement
@@ -536,48 +696,17 @@ export function App(): React.JSX.Element {
     }
   }, [hasSnapshot, openFolder, search.inputRef, settingsOpen, terminal.toggle, toggleSidebar])
 
-  const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
-    if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
-      event.preventDefault()
-      return
-    }
-    // Settings is a modal <dialog>: Escape reaches it as `cancel`, which runs its
-    // own 140ms exit. Closing it from here would skip that.
-    if (event.key === 'Escape' && settingsOpen) return
-    if (event.key === 'Escape' && gitWorkflow.panelOpen) {
-      event.preventDefault()
-      gitWorkflow.setPanelOpen(false)
-      return
-    }
-    if (event.key === 'Escape' && search.isOpen) {
-      event.preventDefault()
-      search.dismiss()
-      return
-    }
-    if (event.defaultPrevented || event.repeat) return
-    const command = commandFromEvent(event, preferences.keybindings)
-    if (command == null) return
-    event.preventDefault()
-    runCommand(command)
+  useAppShortcuts({
+    commandPaletteRef,
+    gitWorkflow,
+    keybindings: preferences.keybindings,
+    runCommand,
+    search,
+    settingsOpen
   })
-
-  useEffect(() => {
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-
-  const dismissSearchOnOutsidePointer = useEffectEvent((event: PointerEvent): void => {
-    if (!search.isOpen || isInsideSearchSurface(event.target)) return
-    search.dismiss()
-  })
-
-  useEffect(() => {
-    window.addEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
-    return () => window.removeEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
-  }, [])
 
   const view: AppLayoutProps = {
-    snapshot, selectedPath, repositoryChange, opening, openingRecentPath,
+    WorkspaceRoot, snapshot, selectedPath, repositoryChange, opening, openingRecentPath,
     comparison: comparisonLoader.comparison, loadingDiff: comparisonLoader.loading,
     error, sidebarVisible, diffStyle, workspaceView,
     terminalOpen: terminal.open, terminalMounted: terminal.mounted,
@@ -585,7 +714,8 @@ export function App(): React.JSX.Element {
     preferences, settingsOpen,
     recentFolders, search, commandPaletteRef, terminalDockRef: terminal.dockRef, gitWorkflow,
     setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath, onComparisonSaved: comparisonLoader.save,
-    setDiffStyle, setWorkspaceView, setTerminalHeight: terminal.setHeight, setTerminalResizing: terminal.setResizing,
+    setDiffStyle, setWorkspaceView: changeWorkspaceView,
+    setTerminalHeight: terminal.setHeight, setTerminalResizing: terminal.setResizing,
     toggleSidebar, toggleTerminal: terminal.toggle, closeTerminal: terminal.close,
     commitTerminalHeight: terminal.commitHeight, openFolder,
     openRecentFolder, openPullRequestFromPalette, openSettings, runCommand, recentFiles,

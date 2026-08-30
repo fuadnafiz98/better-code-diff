@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
+import type { ReviewThread } from './ReviewComments'
 import { parseStoredReviewThreads, reviewThreadStorageKey } from './reviewThreadStorage'
 
 const validThread = {
@@ -26,6 +27,19 @@ describe('parseStoredReviewThreads', () => {
     expect(parseStoredReviewThreads(stored)).toEqual({ 'src/a.ts': [validThread] })
   })
 
+  it('round-trips anchor and orphan state', () => {
+    const anchored: ReviewThread = {
+      ...validThread,
+      orphaned: true,
+      anchor: {
+        version: 1, selectedText: 'value', beforeContextHash: 'before',
+        afterContextHash: 'after', side: 'additions', blobOid: 'a'.repeat(40)
+      }
+    }
+    expect(parseStoredReviewThreads(JSON.stringify({ 'src/a.ts': [anchored] })))
+      .toEqual({ 'src/a.ts': [anchored] })
+  })
+
   it('returns an empty map for missing or corrupt payloads', () => {
     expect(parseStoredReviewThreads(null)).toEqual({})
     expect(parseStoredReviewThreads('not json')).toEqual({})
@@ -35,7 +49,12 @@ describe('parseStoredReviewThreads', () => {
 
   it('drops malformed threads while keeping valid ones', () => {
     const stored = JSON.stringify({
-      'src/a.ts': [validThread, { id: 42, body: 'missing fields' }],
+      'src/a.ts': [
+        validThread,
+        { ...validThread, id: 'bad-range', range: { start: '4', end: 6 } },
+        { ...validThread, id: 'bad-reply', replies: [{ id: 1, body: 'invalid' }] },
+        { id: 42, body: 'missing fields' }
+      ],
       'src/b.ts': [{ body: 'no id' }],
       'src/c.ts': 'not an array'
     })

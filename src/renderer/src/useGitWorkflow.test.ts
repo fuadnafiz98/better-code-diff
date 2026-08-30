@@ -5,6 +5,7 @@ import { GIT_PANEL_TTL_MS, isPanelDataStale, type PanelCacheEntry } from './useG
 const entry = (overrides: Partial<PanelCacheEntry<string>> = {}): PanelCacheEntry<string> => ({
   data: 'value',
   fetchedAt: 1_000,
+  root: null,
   head: 'abc',
   branch: 'main',
   ...overrides
@@ -29,6 +30,14 @@ describe('isPanelDataStale', () => {
   it('expires immediately when HEAD or the branch moved', () => {
     expect(isPanelDataStale(entry(), at('def', 'main'), 1_001)).toBe(true)
     expect(isPanelDataStale(entry(), at('abc', 'feature'), 1_001)).toBe(true)
+  })
+
+  it('never serves panel data from another repository with the same branch and HEAD', () => {
+    expect(isPanelDataStale(
+      entry({ root: '/repo-a' }),
+      { root: '/repo-b', head: 'abc', branch: 'main' },
+      1_001
+    )).toBe(true)
   })
 
   it('ignores the snapshot before one is loaded', () => {

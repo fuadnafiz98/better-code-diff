@@ -4,10 +4,19 @@ import { readFile, writeFile } from 'node:fs/promises'
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme, screen, shell, type RenderProcessGoneDetails } from 'electron'
 
-import { IPC_CHANNELS, type PerformanceMetricsDetail, type RendererTermination } from '../shared/contracts.js'
+import {
+  IPC_CHANNELS,
+  type MainStartupMetrics,
+  type PerformanceMetricsDetail,
+  type RendererTermination,
+  type RepositorySnapshot
+} from '../shared/contracts.js'
+import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
 import { AgentService, coalesceAgentTextEvents } from './agentService.js'
-import { isPathWithinApprovedRoots, RepositoryService } from './repository.js'
-import { RepositoryWatcher } from './repositoryWatcher.js'
+import { parseAgentAskRequest } from './agentRequest.js'
+import { isPathWithinApprovedRoots, parseRemotes, pullRequestTargetsRemotes } from './repository.js'
+import { runCommand } from './gitCommands.js'
+import { RepositorySessionRegistry } from './repositorySessions.js'
 import { DEFAULT_SESSION_STATE, loadSessionState, saveSessionState, type SessionState } from './sessionStore.js'
 import { TerminalService } from './terminalService.js'
 import { loadWindowState, saveWindowState } from './windowState.js'
@@ -20,6 +29,18 @@ const GEOMETRY_SAVE_DEBOUNCE_MS = 500
 // What Electron paints before first paint, during a resize and behind
 // overscroll. A dark value under a light theme flashes on every drag.
 const WINDOW_BACKGROUND = { dark: '#0c0d0f', light: '#f7f8fa' } as const
+const mainStartupOrigin = performance.now()
+const mainStartupMetrics: MainStartupMetrics = {
+  appReady: null,
+  windowCreated: null,
+  restoreSettled: null
+}
+
+function markMainStartup(milestone: keyof MainStartupMetrics): void {
+  if (mainStartupMetrics[milestone] == null) {
+    mainStartupMetrics[milestone] = performance.now() - mainStartupOrigin
+  }
+}
 
 // Ahead of the service construction below: a second launch hands its arguments
 // to the running instance and must not start a watcher on its way out. A
@@ -29,11 +50,9 @@ if (!startHidden && !app.requestSingleInstanceLock()) app.exit(0)
 app.setName(PRODUCT_NAME)
 process.title = PRODUCT_NAME
 
-const repository = new RepositoryService()
 const agentService = new AgentService()
 const terminalService = new TerminalService()
-const repositoryWatcher = new RepositoryWatcher(
-  () => repository.refresh(),
+const repositorySessions = new RepositorySessionRegistry(
   (change) => {
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.didChange, change)
@@ -41,7 +60,6 @@ const repositoryWatcher = new RepositoryWatcher(
   },
   (error) => console.error('Repository watcher failed:', error)
 )
-repository.setSelfWriteObserver((path) => repositoryWatcher.expectSelfWrite(path))
 
 const MAX_AUTOMATIC_RECOVERIES = 3
 const RECOVERY_WINDOW_MS = 60_000
@@ -54,9 +72,6 @@ let sessionState: SessionState = DEFAULT_SESSION_STATE
 // alongside the renderer boot, and without the wait the renderer asks before
 // the first git call lands and falls back to the Welcome screen.
 let restoreLastSession: Promise<unknown> | null = null
-// Bumped whenever the user opens a folder, so a session restore still resolving
-// in the background knows it has been superseded.
-let sessionGeneration = 0
 
 function rendererDiagnosticsPath(): string {
   return join(app.getPath('userData'), 'renderer-terminations.json')
@@ -92,13 +107,8 @@ async function recordRendererTermination(details: RenderProcessGoneDetails): Pro
   ).catch((error) => console.error('Could not persist renderer termination diagnostics:', error))
 }
 
-function trackSnapshot(snapshot: Awaited<ReturnType<RepositoryService['refresh']>>): typeof snapshot {
-  repositoryWatcher.sync(snapshot)
-  return snapshot
-}
-
-function startTracking(snapshot: Awaited<ReturnType<RepositoryService['open']>>): typeof snapshot {
-  repositoryWatcher.start(snapshot)
+function trackSnapshot(snapshot: RepositorySnapshot): RepositorySnapshot {
+  repositorySessions.sync(snapshot)
   return snapshot
 }
 
@@ -151,6 +161,7 @@ function createMainWindow(): BrowserWindow {
       sandbox: true
     }
   })
+  markMainStartup('windowCreated')
 
   let recoveryTimer: ReturnType<typeof setTimeout> | null = null
   const recoveryTimes: number[] = []
@@ -265,7 +276,7 @@ function createMainWindow(): BrowserWindow {
 
 async function collectPerformanceDetail(
   processMetrics: Electron.ProcessMetric[]
-): Promise<Pick<PerformanceMetricsDetail, 'memoryByProcessType' | 'mainPrivateMegabytes'>> {
+): Promise<Pick<PerformanceMetricsDetail, 'mainStartup' | 'memoryByProcessType' | 'mainPrivateMegabytes'>> {
   const mainMemory = await process.getProcessMemoryInfo()
   const megabytesByType = new Map<string, number>()
   for (const metric of processMetrics) {
@@ -275,6 +286,7 @@ async function collectPerformanceDetail(
     )
   }
   return {
+    mainStartup: { ...mainStartupMetrics },
     memoryByProcessType: [...megabytesByType]
       .map(([type, megabytes]) => ({ type, megabytes }))
       .sort((left, right) => right.megabytes - left.megabytes),
@@ -282,24 +294,60 @@ async function collectPerformanceDetail(
   }
 }
 
-// One `RepositoryService` serves every open, so a user-initiated open must not
-// interleave with the session restore still running at boot: both mutate the same
-// root, caches and watcher binding.
-async function openRepository(folderPath: string): Promise<ReturnType<typeof startTracking>> {
-  sessionGeneration += 1
+async function openRepository(folderPath: string, activate = true): Promise<RepositorySnapshot> {
   await restoreLastSession?.catch(() => undefined)
-  repositoryWatcher.stop()
-  const snapshot = await repository.open(folderPath).then(startTracking)
-  terminalService.killAll()
-  agentService.cancelAll()
-  rememberOpenedRoot(snapshot.root)
+  const snapshot = await repositorySessions.open(folderPath, activate)
+  rememberOpenedRoot(snapshot.root, activate)
   return snapshot
+}
+
+function requireRepositoryRoot(value: unknown): string {
+  if (typeof value !== 'string' || !isAbsolute(value)) {
+    throw new Error('Repository root must be an absolute path.')
+  }
+  return value
+}
+
+async function findPullRequestRoot(pullRequestUrl: string): Promise<string | null> {
+  const candidates = [...new Set([...repositorySessions.roots, ...sessionState.approvedRoots])]
+  const matches = await Promise.all(candidates.map(async (root) => {
+    if (!existsSync(root)) return false
+    try {
+      const remotes = parseRemotes(await runCommand('git', ['-C', root, 'remote', '-v']))
+      return pullRequestTargetsRemotes(remotes, pullRequestUrl)
+    } catch {
+      return false
+    }
+  }))
+  return candidates.find((_root, index) => matches[index]) ?? null
+}
+
+async function resolvePullRequestRepository(value: unknown): Promise<RepositorySnapshot | null> {
+  if (typeof value !== 'string') throw new Error('Pull request URL must be text.')
+  const pullRequestUrl = normalizeGitHubPullRequestUrl(value)
+  if (pullRequestUrl == null) throw new Error('Enter a full GitHub pull request URL.')
+  const matchingRoot = await findPullRequestRoot(pullRequestUrl)
+  if (matchingRoot != null) return openRepository(matchingRoot, false)
+
+  const repositorySlug = new URL(pullRequestUrl).pathname.split('/').slice(1, 3).join('/')
+  const result = await dialog.showOpenDialog({
+    title: `Select the local checkout for ${repositorySlug}`,
+    message: `Select the local checkout for ${repositorySlug}.`,
+    properties: ['openDirectory']
+  })
+  const folderPath = result.filePaths[0]
+  if (result.canceled || folderPath == null) return null
+  const remotes = parseRemotes(await runCommand('git', ['-C', folderPath, 'remote', '-v']))
+  if (!pullRequestTargetsRemotes(remotes, pullRequestUrl)) {
+    throw new Error(`The selected folder is not a checkout of ${repositorySlug}.`)
+  }
+  return openRepository(folderPath, false)
 }
 
 function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.getSessionSnapshot, async () => {
     await restoreLastSession
-    return repository.getSessionSnapshot()
+    return repositorySessions.getActiveSnapshot()
   })
   ipcMain.handle(IPC_CHANNELS.openFolder, async () => {
     const result = await dialog.showOpenDialog({
@@ -319,6 +367,12 @@ function registerIpcHandlers(): void {
     }
     return openRepository(folderPath)
   })
+  ipcMain.handle(IPC_CHANNELS.activateRepository, (_event, root: unknown) =>
+    repositorySessions.activate(requireRepositoryRoot(root)))
+  ipcMain.handle(IPC_CHANNELS.releaseRepository, (_event, root: unknown) =>
+    repositorySessions.release(requireRepositoryRoot(root)))
+  ipcMain.handle(IPC_CHANNELS.resolvePullRequestRepository, (_event, pullRequestUrl: unknown) =>
+    resolvePullRequestRepository(pullRequestUrl))
   ipcMain.handle(IPC_CHANNELS.readClipboardText, (_event, type: unknown) => {
     if (type == null) return clipboard.readText()
     if (typeof type !== 'string' || type === '' || type.length > 200) {
@@ -331,7 +385,7 @@ function registerIpcHandlers(): void {
       : clipboard.read(type)
   })
   ipcMain.handle(IPC_CHANNELS.revealPath, (_event, relativePath: unknown) => {
-    const snapshot = repository.getSessionSnapshot()
+    const snapshot = repositorySessions.getActiveSnapshot()
     if (snapshot == null) throw new Error('Open a repository before revealing a file.')
     if (typeof relativePath !== 'string' || relativePath === '' || isAbsolute(relativePath)) {
       throw new Error('Reveal path must be a relative repository path.')
@@ -342,29 +396,33 @@ function registerIpcHandlers(): void {
     }
     shell.showItemInFolder(candidate)
   })
-  ipcMain.handle(IPC_CHANNELS.refresh, () => repository.refresh().then(trackSnapshot))
+  ipcMain.handle(IPC_CHANNELS.refresh, () => repositorySessions.requireActive().refresh().then(trackSnapshot))
   ipcMain.handle(IPC_CHANNELS.getComparison, (_event, path: string) =>
-    repository.getComparison(path)
+    repositorySessions.requireActive().getComparison(path)
   )
   ipcMain.handle(IPC_CHANNELS.saveWorkingFile, async (_event, request: unknown) => {
+    const repository = repositorySessions.requireActive()
     const comparison = await repository.saveWorkingFile(request)
     const snapshot = repository.getSessionSnapshot()
     if (snapshot != null) trackSnapshot(snapshot)
     return comparison
   })
   ipcMain.handle(IPC_CHANNELS.getWorkingTreePatch, (_event, paths: unknown) =>
-    repository.getWorkingTreePatch(paths)
+    repositorySessions.requireActive().getWorkingTreePatch(paths)
   )
   ipcMain.handle(IPC_CHANNELS.searchContent, (_event, query: string) =>
-    repository.searchContent(query)
+    repositorySessions.requireActive().searchContent(query)
   )
-  ipcMain.on(IPC_CHANNELS.cancelContentSearch, () => repository.cancelContentSearch())
-  ipcMain.handle(IPC_CHANNELS.getGitIntegration, () => repository.getGitIntegration())
-  ipcMain.handle(IPC_CHANNELS.getPullRequestInbox, () => repository.getPullRequestInbox())
-  ipcMain.handle(IPC_CHANNELS.getClosedPullRequests, () => repository.getClosedPullRequests())
-  ipcMain.on(IPC_CHANNELS.cancelPullRequestReview, () => repository.cancelPullRequestReview())
+  ipcMain.on(IPC_CHANNELS.cancelContentSearch, () => repositorySessions.cancelActiveContentSearch())
+  ipcMain.handle(IPC_CHANNELS.getGitIntegration, () => repositorySessions.requireActive().getGitIntegration())
+  ipcMain.handle(IPC_CHANNELS.getPullRequestInbox, () => repositorySessions.requireActive().getPullRequestInbox())
+  ipcMain.handle(IPC_CHANNELS.getClosedPullRequests, () => repositorySessions.requireActive().getClosedPullRequests())
+  ipcMain.on(IPC_CHANNELS.cancelPullRequestReview, (_event, root: unknown, requestId: unknown) => {
+    if (typeof requestId !== 'string' || requestId === '') return
+    repositorySessions.require(requireRepositoryRoot(root)).cancelPullRequestReview(requestId)
+  })
   ipcMain.handle(IPC_CHANNELS.getAgentModels, async () => {
-    const snapshot = repository.getSessionSnapshot()
+    const snapshot = repositorySessions.getActiveSnapshot()
     if (snapshot == null) throw new Error('Open a repository before loading agent models.')
     return agentService.getModels(snapshot.root)
   })
@@ -373,14 +431,16 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.loginAgent, (_event, provider: unknown) =>
     agentService.login(provider))
   ipcMain.handle(IPC_CHANNELS.askAgent, async (event, request: unknown) => {
+    const parsedRequest = await parseAgentAskRequest(request)
+    const repository = repositorySessions.require(parsedRequest.subject.repositoryRoot)
     const snapshot = repository.getSessionSnapshot()
-    if (snapshot == null) throw new Error('Open a repository before asking the agent.')
+    if (snapshot == null) throw new Error('The repository tab is not ready for the agent.')
     const sender = event.sender
     const stream = coalesceAgentTextEvents((agentEvent) => {
       if (!sender.isDestroyed()) sender.send(IPC_CHANNELS.agentEvent, agentEvent)
     })
     try {
-      await agentService.ask(request, snapshot.root, stream.emit)
+      await agentService.ask(parsedRequest, snapshot.root, stream.emit)
     } finally {
       stream.flush()
     }
@@ -389,7 +449,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.respondAgentApproval, (_event, requestId: unknown, decision: unknown) =>
     agentService.respondApproval(requestId, decision))
   ipcMain.handle(IPC_CHANNELS.createTerminal, (event, columns: unknown, rows: unknown) => {
-    const snapshot = repository.getSessionSnapshot()
+    const snapshot = repositorySessions.getActiveSnapshot()
     if (snapshot == null) throw new Error('Open a project before starting a terminal.')
     return terminalService.create(event.sender, snapshot.root, columns, rows, app.getVersion())
   })
@@ -420,41 +480,51 @@ function registerIpcHandlers(): void {
     terminalService.kill(event.sender.id, sessionId)
   })
   ipcMain.handle(IPC_CHANNELS.getPullRequestConversation, (_event, selector: number | string) =>
-    repository.getPullRequestConversation(selector))
+    repositorySessions.requireActive().getPullRequestConversation(selector))
   ipcMain.handle(IPC_CHANNELS.replyToPullRequestThread, (_event, threadId: unknown, body: unknown) =>
-    repository.replyToPullRequestThread(threadId, body))
+    repositorySessions.requireActive().replyToPullRequestThread(threadId, body))
   ipcMain.handle(IPC_CHANNELS.setPullRequestThreadResolved, (_event, threadId: unknown, resolved: unknown) =>
-    repository.setPullRequestThreadResolved(threadId, resolved))
+    repositorySessions.requireActive().setPullRequestThreadResolved(threadId, resolved))
   ipcMain.handle(IPC_CHANNELS.mergePullRequest, (_event, selector: number | string, strategy: unknown) =>
-    repository.mergePullRequest(selector, strategy))
+    repositorySessions.requireActive().mergePullRequest(selector, strategy))
   ipcMain.handle(IPC_CHANNELS.markPullRequestReady, (_event, selector: number | string) =>
-    repository.markPullRequestReady(selector))
+    repositorySessions.requireActive().markPullRequestReady(selector))
   ipcMain.handle(IPC_CHANNELS.switchBranch, (_event, name: string) =>
-    repository.switchBranch(name).then(trackSnapshot)
+    repositorySessions.requireActive().switchBranch(name).then(trackSnapshot)
   )
   ipcMain.handle(IPC_CHANNELS.getLocalBranchReview, (_event, baseRef: string, headRef: string) =>
-    repository.getLocalBranchReview(baseRef, headRef)
+    repositorySessions.requireActive().getLocalBranchReview(baseRef, headRef)
   )
   ipcMain.handle(IPC_CHANNELS.getCommitReview, (_event, oid: string) =>
-    repository.getCommitReview(oid)
+    repositorySessions.requireActive().getCommitReview(oid)
   )
-  ipcMain.handle(IPC_CHANNELS.fetchRemote, () => repository.fetchRemote())
+  ipcMain.handle(IPC_CHANNELS.fetchRemote, () => repositorySessions.requireActive().fetchRemote())
   ipcMain.handle(IPC_CHANNELS.pullCurrentBranch, () =>
-    repository.pullCurrentBranch().then(trackSnapshot)
+    repositorySessions.requireActive().pullCurrentBranch().then(trackSnapshot)
   )
-  ipcMain.handle(IPC_CHANNELS.pushCurrentBranch, () => repository.pushCurrentBranch())
-  ipcMain.handle(IPC_CHANNELS.getPullRequestReview, (event, selector: number | string) =>
+  ipcMain.handle(IPC_CHANNELS.pushCurrentBranch, () => repositorySessions.requireActive().pushCurrentBranch())
+  ipcMain.handle(IPC_CHANNELS.getPullRequestReview, (event, root: unknown, selector: number | string, requestId: unknown) => {
+    const repositoryRoot = requireRepositoryRoot(root)
+    if (typeof requestId !== 'string' || requestId === '' || requestId.length > 200) {
+      throw new Error('Pull request load ID must be short non-empty text.')
+    }
     // Streamed back page by page: a review of a few thousand files takes long
     // enough to fetch that waiting for all of it reads as a hang.
-    repository.getPullRequestReview(selector, (progress) => {
-      if (!event.sender.isDestroyed()) event.sender.send(IPC_CHANNELS.pullRequestReviewProgress, progress)
-    })
-  )
+    return repositorySessions.require(repositoryRoot).getPullRequestReview(selector, (progress) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send(IPC_CHANNELS.pullRequestReviewProgress, {
+          ...progress,
+          root: repositoryRoot,
+          requestId
+        })
+      }
+    }, requestId)
+  })
   ipcMain.handle(IPC_CHANNELS.checkoutPullRequest, (_event, number: number) =>
-    repository.checkoutPullRequest(number).then(trackSnapshot)
+    repositorySessions.requireActive().checkoutPullRequest(number).then(trackSnapshot)
   )
   ipcMain.handle(IPC_CHANNELS.submitPullRequestReview, (_event, selector: number | string, commitId: unknown, reviewEvent: string, body: string, comments: unknown) =>
-    repository.submitPullRequestReview(selector, commitId, reviewEvent, body, comments)
+    repositorySessions.requireActive().submitPullRequestReview(selector, commitId, reviewEvent, body, comments)
   )
   ipcMain.handle(IPC_CHANNELS.getPerformanceMetrics, async (_event, detailed: unknown) => {
     const processMetrics = app.getAppMetrics()
@@ -499,7 +569,7 @@ function registerIpcHandlers(): void {
   })
   ipcMain.handle(IPC_CHANNELS.setVisibility, (_event, visible: unknown) => {
     if (typeof visible !== 'boolean') throw new Error('Visibility must be a boolean.')
-    repositoryWatcher.setSuspended(!visible)
+    repositorySessions.setSuspended(!visible)
   })
   ipcMain.handle(IPC_CHANNELS.findInPage, (event, query: unknown, forward: unknown, findNext: unknown) => {
     if (typeof query !== 'string' || typeof forward !== 'boolean' || typeof findNext !== 'boolean') {
@@ -522,33 +592,35 @@ function applyDevelopmentDockIcon(): void {
   if (!icon.isEmpty()) app.dock?.setIcon(icon)
 }
 
-function rememberOpenedRoot(root: string): void {
-  // Whatever the user just opened replaces the restore, so later snapshot reads
-  // must not keep waiting on it — and the restore that is still resolving must
-  // not rebind the watcher to the repository it was reopening.
-  restoreLastSession = null
-  sessionGeneration += 1
+function rememberOpenedRoot(root: string, active = true): void {
+  // A foreground open replaces the restore. A background PR resolution only
+  // authorizes its checkout; it must not replace the folder restored next time.
+  if (active) restoreLastSession = null
   const approvedRoots = sessionState.approvedRoots.includes(root)
     ? sessionState.approvedRoots
     : [...sessionState.approvedRoots, root]
-  if (sessionState.lastRoot === root && approvedRoots === sessionState.approvedRoots) return
-  sessionState = { ...sessionState, lastRoot: root, approvedRoots }
+  const lastRoot = active ? root : sessionState.lastRoot
+  if (sessionState.lastRoot === lastRoot && approvedRoots === sessionState.approvedRoots) return
+  sessionState = { ...sessionState, lastRoot, approvedRoots }
   saveSessionState(userDataPath, sessionState)
 }
 
 function beginSessionRestore(): void {
   const root = sessionState.lastRoot
-  if (startHidden || !sessionState.restoreLastFolder || root == null || !existsSync(root)) return
-  const generation = sessionGeneration
-  restoreLastSession = repository
+  if (startHidden || !sessionState.restoreLastFolder || root == null || !existsSync(root)) {
+    markMainStartup('restoreSettled')
+    return
+  }
+  restoreLastSession = repositorySessions
     .open(root)
-    .then((snapshot) => generation === sessionGeneration ? startTracking(snapshot) : snapshot)
     .catch((error) => console.warn(`Could not reopen ${root}:`, error))
+    .finally(() => markMainStartup('restoreSettled'))
 }
 
 app.whenReady().then(() => {
+  markMainStartup('appReady')
   userDataPath = app.getPath('userData')
-  repository.setPullRequestCacheDirectory(join(userDataPath, 'pr-cache'))
+  repositorySessions.setPullRequestCacheDirectory(join(userDataPath, 'pr-cache'))
   sessionState = loadSessionState(userDataPath)
   nativeTheme.themeSource = sessionState.themeType
   app.setAboutPanelOptions({ applicationName: PRODUCT_NAME })
@@ -575,7 +647,7 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  repositoryWatcher.stop()
+  repositorySessions.stopAll()
   terminalService.killAll()
   agentService.cancelAll()
   if (process.platform !== 'darwin') app.quit()

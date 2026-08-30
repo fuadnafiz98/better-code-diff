@@ -15,7 +15,7 @@ export function createPullRequestReviewComments(
 ): PullRequestReviewComment[] {
   return Object.entries(threadsByPath).flatMap(([path, threads]) =>
     threads.flatMap((thread) => {
-      if (thread.resolved) return []
+      if (thread.resolved || thread.orphaned) return []
       const startSide = githubSide(thread.range.side)
       const side = githubSide(thread.range.endSide ?? thread.range.side)
       return [{
