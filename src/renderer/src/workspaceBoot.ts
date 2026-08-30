@@ -37,14 +37,16 @@ function createModuleStore<Component>(
     },
     subscribe: (listener) => {
       listeners.add(listener)
-      return () => listeners.delete(listener)
+      return () => {
+        listeners.delete(listener)
+      }
     }
   }
 }
 
-const workspaceRoot = createModuleStore(() => import('./WorkspaceRoot'))
-const diffSurface = createModuleStore(() => import('./DiffSurface'))
-const multiFileReview = createModuleStore(() => import('./MultiFileReview'))
+const workspaceRoot = createModuleStore<WorkspaceRootComponent>(() => import('./WorkspaceRoot'))
+const diffSurface = createModuleStore<DiffSurfaceComponent>(() => import('./DiffSurface'))
+const multiFileReview = createModuleStore<MultiFileReviewComponent>(() => import('./MultiFileReview'))
 
 export const getLoadedWorkspaceRoot = workspaceRoot.getSnapshot
 export const preloadWorkspaceRoot = workspaceRoot.load
@@ -58,6 +60,8 @@ export const getLoadedMultiFileReview = multiFileReview.getSnapshot
 export const preloadMultiFileReview = multiFileReview.load
 export const subscribeMultiFileReview = multiFileReview.subscribe
 
-export function preloadWorkspaceViewer(view: WorkspaceView): Promise<unknown> {
+export function preloadWorkspaceViewer(
+  view: WorkspaceView
+): Promise<DiffSurfaceComponent | MultiFileReviewComponent> {
   return view === 'multi' ? preloadMultiFileReview() : preloadDiffSurface()
 }

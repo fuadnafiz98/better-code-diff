@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,8 +28,11 @@ describe('RepositorySessionRegistry', () => {
     const registry = new RepositorySessionRegistry(() => {}, () => {})
     registries.push(registry)
     await registry.open(root)
+    const cancelContentSearch = spyOn(registry.requireActive(), 'cancelContentSearch')
 
-    expect(() => registry.cancelActiveContentSearch()).not.toThrow()
+    registry.cancelActiveContentSearch()
+
+    expect(cancelContentSearch).toHaveBeenCalledTimes(1)
   })
 
   it('keeps independent repository sessions and changes only the requested active root', async () => {

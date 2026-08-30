@@ -53,6 +53,7 @@ export function useRepositorySearch(
   const contentRequestRef = useRef(0)
   const previousScheduledQueryRef = useRef('')
   const deferredQuery = useDeferredValue(query)
+  const hasSnapshot = snapshot != null
   const snapshotPaths = snapshot?.paths
   // Keyed on the whole snapshot this rebuilt one object per repository path on
   // every watcher tick. `paths` keeps its identity across ticks that only moved
@@ -118,11 +119,11 @@ export function useRepositorySearch(
       previousScheduledQueryRef.current = query
       setContentResults([])
       setSearchingContent(false)
-      if (snapshot != null) window.repository?.cancelContentSearch()
+      if (hasSnapshot) window.repository?.cancelContentSearch()
       return
     }
 
-    if (snapshot == null) return
+    if (!hasSnapshot) return
 
     setContentResults([])
     setSearchingContent(true)
@@ -143,7 +144,7 @@ export function useRepositorySearch(
         })
     }, delay)
     return () => window.clearTimeout(timeout)
-  }, [onError, query, snapshot])
+  }, [hasSnapshot, onError, query])
 
   // A bare object literal here defeated `memo(AppLayout)` and `memo(AgentSessionLayout)`
   // on every App render, so both boundaries cost a 40-key compare and saved nothing.

@@ -1,10 +1,13 @@
-const APP_PATH = process.env.HORUS_APP_PATH ?? '/Users/fuadnafiz98/Applications/Horus.app'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const APP_PATH = process.env.HORUS_APP_PATH ?? join(homedir(), 'Applications/Horus.app')
 const SAMPLE_COUNT = Number.parseInt(process.env.HORUS_STARTUP_SAMPLES ?? '5', 10)
 const STARTUP_TIMEOUT_MS = Number.parseInt(process.env.HORUS_STARTUP_TIMEOUT_MS ?? '6000', 10)
 
 async function run(command) {
-  const process = Bun.spawn(command, { stdout: 'ignore', stderr: 'ignore' })
-  return process.exited
+  const childProcess = Bun.spawn(command, { stdout: 'ignore', stderr: 'ignore' })
+  return childProcess.exited
 }
 
 async function waitForExit() {
@@ -100,7 +103,6 @@ async function sampleStartup(sample) {
       timeOrigin: performance.timeOrigin,
       paints: performance.getEntriesByType('paint').map(({ name, startTime }) => ({ name, startTime })),
       navigation: performance.getEntriesByType('navigation')[0]?.startTime ?? 0,
-      skeleton: document.querySelector('.workspace-skeleton') != null,
       explorer: document.querySelector('#repository-explorer') != null,
       review: document.querySelector('.multi-file-review, .multi-file-code-view') != null
     })`)

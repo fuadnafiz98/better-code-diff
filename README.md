@@ -17,8 +17,6 @@ Horus is a local-first desktop application for exploring projects and reviewing 
 
 Git is optional. Non-Git folders open in read-only preview mode.
 
-Where the product should go next is in [IDEAS.md](IDEAS.md).
-
 ## Requirements
 
 - macOS

@@ -1,8 +1,10 @@
+import type { ComponentProps } from 'react'
+
 import { ViewerProviders } from './editor/ViewerProviders'
 import RepositoryWorkspace, { type RepositoryWorkspaceProps } from './RepositoryWorkspace'
 
 export interface WorkspaceRootProps extends RepositoryWorkspaceProps {
-  theme: React.ComponentProps<typeof ViewerProviders>['theme']
+  theme: ComponentProps<typeof ViewerProviders>['theme']
   workspaceKey: string
 }
 
