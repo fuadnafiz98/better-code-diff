@@ -1,3 +1,9 @@
+import {
+  forgetStorageKey,
+  persistManagedValue,
+  type BudgetStorage
+} from '../storageBudget'
+
 export interface DraftRecord {
   path: string
   sourceCacheKey: string
@@ -14,12 +20,9 @@ export const EMPTY_DRAFTS: DraftMap = {}
 // evict all of them. Oversized drafts stay in memory for the session instead.
 const MAX_PERSISTED_DRAFT_BYTES = 512_000
 const MAX_PERSISTED_DRAFTS = 24
+const MAX_PERSISTED_DRAFTS_TOTAL_BYTES = 2 * 1024 * 1024
 
-export interface DraftStorage {
-  getItem(key: string): string | null
-  setItem(key: string, value: string): void
-  removeItem(key: string): void
-}
+export type DraftStorage = BudgetStorage
 
 export function draftStorageKey(root: string): string {
   return `horus:drafts:v1:${root}`
@@ -59,10 +62,19 @@ export function parseDrafts(raw: string | null): DraftMap {
 }
 
 export function serializeDrafts(drafts: DraftMap): string {
-  const persistable = Object.values(drafts)
+  const newestFirst = Object.values(drafts)
     .filter((draft) => draft.contents.length <= MAX_PERSISTED_DRAFT_BYTES)
     .sort((left, right) => right.savedAt - left.savedAt)
     .slice(0, MAX_PERSISTED_DRAFTS)
+  const persistable: DraftRecord[] = []
+  let totalBytes = 2
+  for (const draft of newestFirst) {
+    const encoded = JSON.stringify(draft)
+    const nextBytes = totalBytes + encoded.length + (persistable.length > 0 ? 1 : 0)
+    if (nextBytes > MAX_PERSISTED_DRAFTS_TOTAL_BYTES) continue
+    persistable.push(draft)
+    totalBytes = nextBytes
+  }
   return JSON.stringify(persistable)
 }
 
@@ -94,17 +106,18 @@ export function readDrafts(root: string, storage: DraftStorage | null): DraftMap
   }
 }
 
-export function writeDrafts(root: string, drafts: DraftMap, storage: DraftStorage | null): void {
-  if (storage == null) return
+export function writeDrafts(root: string, drafts: DraftMap, storage: DraftStorage | null): boolean {
+  if (storage == null) return false
   const key = draftStorageKey(root)
   try {
     if (Object.keys(drafts).length === 0) {
       storage.removeItem(key)
-      return
+      forgetStorageKey(storage, key)
+      return true
     }
-    storage.setItem(key, serializeDrafts(drafts))
+    return persistManagedValue(storage, key, serializeDrafts(drafts))
   } catch {
-    // A full or blocked quota must never break editing; drafts stay in memory.
+    return false
   }
 }
 

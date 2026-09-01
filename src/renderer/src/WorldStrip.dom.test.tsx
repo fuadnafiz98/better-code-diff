@@ -98,3 +98,31 @@ test('keeps an active overflow tab visible and makes the remaining tabs searchab
   expect(screen.getByRole('menuitem', { name: /#7 · acme\/repo-7/ })).toBeTruthy()
   expect(screen.queryByRole('menuitem', { name: /#6 · acme\/repo-6/ })).toBeNull()
 })
+
+test('closes the overflow menu after choosing a tab', () => {
+  const worlds: ReviewWorld[] = [createNewWorld(), desk]
+  for (let number = 1; number <= 8; number += 1) {
+    worlds.push(createPatchWorld(snapshot, review(number, `acme/repo-${number}`), number, 'ready'))
+  }
+  const focused: string[] = []
+  render(<WorldStrip worlds={worlds} activeWorldId={desk.worldId} collisionCount={0}
+    onFocus={(worldId) => { focused.push(worldId) }} onClose={() => {}} onNew={() => {}} />)
+
+  const details = screen.getByLabelText(/more tabs/).closest('details')
+  expect(details).toBeTruthy()
+  fireEvent.click(screen.getByLabelText(/more tabs/))
+  expect(details?.open).toBe(true)
+  fireEvent.click(screen.getByRole('menuitem', { name: /#7 · acme\/repo-7/ }))
+  expect(focused.at(-1)).toContain('repo-7')
+  expect(details?.open).toBe(false)
+})
+
+test('arrow keys move focus along the tablist', () => {
+  const focused: string[] = []
+  const patch = createPatchWorld(snapshot, review(221), 1, 'ready')
+  render(<WorldStrip worlds={[desk, patch]} activeWorldId={desk.worldId} collisionCount={0}
+    onFocus={(worldId) => { focused.push(worldId) }} onClose={() => {}} onNew={() => {}} />)
+
+  fireEvent.keyDown(screen.getByRole('tablist'), { key: 'ArrowRight' })
+  expect(focused).toEqual([patch.worldId])
+})

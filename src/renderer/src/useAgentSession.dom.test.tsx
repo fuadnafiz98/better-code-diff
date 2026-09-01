@@ -1,8 +1,9 @@
 import { afterEach, expect, mock, test } from 'bun:test'
-import { act, cleanup, renderHook } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 
 import type {
   AgentAskInput,
+  AgentProvider,
   AgentRequestSubject,
   AgentProviderStatuses,
   RepositoryApi
@@ -139,4 +140,53 @@ test('keeps configured write access only for a working-tree tab', async () => {
   expect(requests[0]?.subject.repositoryRoot).toBe('/repo-a')
   expect(requests[0]?.accessMode).toBe('auto')
   expect(requests[0]?.selections).toEqual([])
+})
+
+test('keeps the ask callback stable across an unrelated parent render', () => {
+  const currentSubject = subject('repo-a', 21)
+  const { result, rerender } = renderHook(() => useAgentSession({
+    context: 'Review context',
+    subject: currentSubject
+  }))
+  const firstAsk = result.current.ask
+
+  rerender()
+
+  expect(result.current.ask).toBe(firstAsk)
+})
+
+test('does not repeat the global status probe when sign-in starts', async () => {
+  const probes: Array<'claude' | 'codex' | undefined> = []
+  const disconnected: AgentProviderStatuses = {
+    claude: { ...statuses.claude, authenticated: false },
+    codex: { ...statuses.codex, authenticated: false }
+  }
+  window.repository = {
+    askAgent: async () => {},
+    cancelAgent: async () => {},
+    onAgentEvent: () => () => {},
+    loginAgent: async () => {},
+    getAgentModels: async () => ({
+      claude: [{ id: 'sonnet', label: 'Sonnet', description: '', efforts: ['high'], defaultEffort: 'high' }],
+      codex: [{ id: 'default', label: 'Default', description: '', efforts: ['high'], defaultEffort: 'high' }]
+    }),
+    getAgentStatuses: async (provider?: AgentProvider) => {
+      probes.push(provider)
+      return disconnected
+    }
+  } as unknown as RepositoryApi
+
+  const { result } = renderHook(() => useAgentSession({
+    context: 'Review context',
+    subject: subject('repo-a', 21)
+  }))
+
+  act(() => result.current.toggle())
+  await waitFor(() => expect(probes).toEqual([undefined]))
+  probes.length = 0
+
+  act(() => result.current.login('codex'))
+  await new Promise((resolve) => window.setTimeout(resolve, 50))
+  expect(probes).toEqual([])
+  await waitFor(() => expect(probes).toEqual(['codex']), { timeout: 2_500 })
 })

@@ -24,7 +24,8 @@ const samples: MemorySample[] = []
 
 export function recordMemorySample(sample: MemorySample): readonly MemorySample[] {
   const previous = samples[samples.length - 1]
-  if (previous != null && (sample.atMs <= previous.atMs || sample.atMs - previous.atMs > HISTORY_GAP_RESET_MS)) {
+  if (previous != null && sample.atMs <= previous.atMs) return samples
+  if (previous != null && sample.atMs - previous.atMs > HISTORY_GAP_RESET_MS) {
     samples.length = 0
   }
   samples.push(sample)

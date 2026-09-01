@@ -8,6 +8,7 @@ import type {
 } from '../../shared/contracts'
 import type { WorkspaceView } from './AppView'
 import type { ReviewCheckpoint, SinceReview } from './reviewCheckpoints'
+import { worldViewCache } from './worldViewCache'
 
 export interface WorldNavigation {
   selectedPath: string | null
@@ -44,7 +45,10 @@ export interface PatchWorld {
   generation: number
   requestId: string | null
   loadStatus: 'loading' | 'ready' | 'stopped' | 'error' | 'released'
+  errorMessage: string | null
   review: RepositoryReview
+  patchPages: readonly string[]
+  patchLength: number
 }
 
 export interface SinceWorld {
@@ -58,9 +62,13 @@ export interface SinceWorld {
   parentWorldId: string
   checkpointHeadOid: string
   checkpointCreatedAt: string
+  changedPaths: readonly string[]
   removedPaths: string[]
   uncertainPaths: string[]
+  loadStatus: 'ready' | 'released'
   review: Extract<RepositoryReview, { kind: 'github' }>
+  patchPages: readonly string[]
+  patchLength: number
 }
 
 export type ReviewWorld = NewWorld | DeskWorld | PatchWorld | SinceWorld
@@ -68,6 +76,15 @@ export type ReviewWorld = NewWorld | DeskWorld | PatchWorld | SinceWorld
 export interface WorldRegistryState {
   worlds: ReviewWorld[]
   activeWorldId: string | null
+}
+
+export function worldHasActiveRepositorySession(
+  world: ReviewWorld,
+  state: WorldRegistryState
+): boolean {
+  if (world.source === 'new') return false
+  const active = state.worlds.find((candidate) => candidate.worldId === state.activeWorldId)
+  return active != null && active.source !== 'new' && active.root === world.root
 }
 
 type WorldRegistryAction =
@@ -86,16 +103,28 @@ type WorldRegistryAction =
       progress: Extract<PullRequestReviewProgress, { kind: 'files' }>
     }
   | { type: 'replace-patch'; worldId: string; generation: number; review: RepositoryReview }
+  | { type: 'set-patch-expected-file-count'; worldId: string; generation: number; fileCount: number }
+  | {
+      type: 'restore-since-patch'
+      worldId: string
+      patchPages: readonly string[]
+      files: Extract<RepositoryReview, { kind: 'github' }>['files']
+      omittedFiles: Extract<RepositoryReview, { kind: 'github' }>['omittedFiles']
+    }
   | {
       type: 'set-patch-status'
       worldId: string
       generation: number
       loadStatus: PatchWorld['loadStatus']
+      errorMessage?: string | null
     }
   | { type: 'focus'; worldId: string }
   | { type: 'close'; worldId: string; nextWorld: ReviewWorld }
 
 let newWorldSequence = 0
+// Three real 141–164-file PR tabs plus a 143-file Since tab used 24.3 MB
+// more working set than one active PR. Keep a 64 MB inactive-text ceiling so
+// unusually large reviews cannot grow without bound while normal tabs stay hot.
 export const MAX_INACTIVE_PATCH_BYTES = 64 * 1024 * 1024
 
 export function createNewWorld(): NewWorld {
@@ -146,6 +175,7 @@ export function createPatchWorld(
   loadStatus: PatchWorld['loadStatus'],
   requestId: string | null = null
 ): PatchWorld {
+  const patchPages = review.patch === '' ? [] : [review.patch]
   return {
     source: 'patch',
     worldId: patchWorldId(review),
@@ -157,7 +187,10 @@ export function createPatchWorld(
     generation,
     requestId,
     loadStatus,
-    review
+    errorMessage: null,
+    review,
+    patchPages,
+    patchLength: review.patch.length
   }
 }
 
@@ -168,6 +201,7 @@ export function createSinceWorld(
   checkpoint: ReviewCheckpoint
 ): SinceWorld {
   const review = since.review
+  const patchPages = since.patchPages ?? (review.patch === '' ? [] : [review.patch])
   return {
     source: 'since',
     worldId: `since:${review.pullRequest.url}:${checkpoint.headOid}:${review.headOid}`,
@@ -179,9 +213,13 @@ export function createSinceWorld(
     parentWorldId,
     checkpointHeadOid: checkpoint.headOid,
     checkpointCreatedAt: checkpoint.createdAt,
+    changedPaths: review.files.map((file) => file.path),
     removedPaths: since.removedPaths,
     uncertainPaths: since.uncertainPaths,
-    review
+    loadStatus: 'ready',
+    review,
+    patchPages,
+    patchLength: patchPages.reduce((length, page) => length + page.length, 0)
   }
 }
 
@@ -222,43 +260,80 @@ function updatePatchWorld(
   return { ...state, worlds }
 }
 
-function reviewPayloadBytes(review: RepositoryReview): number {
-  return review.patch.length * 2
-    + review.files.reduce((bytes, file) => bytes + file.path.length * 2 + 64, 0)
-    + review.omittedFiles.reduce((bytes, file) => bytes + file.path.length * 2 + 64, 0)
+export function reviewPayloadBytes(
+  world: PatchWorld | SinceWorld,
+  cachedGraphBytes = 0
+): number {
+  // Git patches are overwhelmingly ASCII, which V8 stores as one-byte strings.
+  // Kept-mounted tabs also retain the parsed CodeView item graph; charge that
+  // separately so the 64 MB evictor matches what is actually in memory.
+  return world.patchLength
+    + world.review.files.reduce((bytes, file) => bytes + file.path.length * 2 + 64, 0)
+    + world.review.omittedFiles.reduce((bytes, file) => bytes + file.path.length * 2 + 64, 0)
+    + cachedGraphBytes
 }
 
 export function boundInactivePatchPayloads(
   state: WorldRegistryState,
-  maxBytes = MAX_INACTIVE_PATCH_BYTES
+  maxBytes = MAX_INACTIVE_PATCH_BYTES,
+  cachedGraphBytes: (worldId: string) => number = () => 0
 ): WorldRegistryState {
   let retainedBytes = 0
   let changed = false
   const worlds = [...state.worlds]
   for (let index = worlds.length - 1; index >= 0; index -= 1) {
     const world = worlds[index]
-    if (world?.source !== 'patch' || world.worldId === state.activeWorldId
-      || world.review.kind !== 'github' || world.loadStatus === 'loading'
+    if (world == null || (world.source !== 'patch' && world.source !== 'since')
+      || world.worldId === state.activeWorldId
+      // Only GitHub worlds have a reload-on-focus path today, so local
+      // branch-compare / commit-review tabs are left unbounded (known gap).
+      // Loading worlds are also skipped: they have no restore path yet, and
+      // charging them would evict a stream that cannot be rebuilt mid-flight.
+      // A skipped world is neither evicted nor added to retainedBytes.
+      || (world.source === 'patch' && world.review.kind !== 'github')
+      || world.loadStatus === 'loading'
       || world.loadStatus === 'released') continue
-    const payloadBytes = reviewPayloadBytes(world.review)
+    const payloadBytes = reviewPayloadBytes(world, cachedGraphBytes(world.worldId))
     if (retainedBytes + payloadBytes <= maxBytes) {
       retainedBytes += payloadBytes
       continue
     }
     changed = true
-    worlds[index] = {
-      ...world,
-      loadStatus: 'released',
-      requestId: null,
-      review: {
-        ...world.review,
-        files: [],
-        patch: '',
-        omittedFiles: []
-      }
-    }
+    worlds[index] = world.source === 'patch'
+      ? {
+          ...world,
+          loadStatus: 'released',
+          requestId: null,
+          patchPages: [],
+          patchLength: 0,
+          review: { ...world.review, files: [], patch: '', omittedFiles: [] }
+        }
+      : {
+          ...world,
+          loadStatus: 'released',
+          patchPages: [],
+          patchLength: 0,
+          review: { ...world.review, files: [], patch: '', omittedFiles: [] }
+        }
   }
   return changed ? { ...state, worlds } : state
+}
+
+const PAYLOAD_AFFECTING_ACTIONS: ReadonlySet<WorldRegistryAction['type']> = new Set([
+  'new-tab',
+  'open-desk',
+  'open-patch',
+  'open-since',
+  'append-patch-page',
+  'replace-patch',
+  'restore-since-patch',
+  'set-patch-status',
+  'focus',
+  'close'
+])
+
+export function actionMayChangeInactivePatchBudget(type: WorldRegistryAction['type']): boolean {
+  return PAYLOAD_AFFECTING_ACTIONS.has(type)
 }
 
 export function reduceWorldRegistry(
@@ -290,6 +365,7 @@ export function reduceWorldRegistry(
     let changed = false
     const worlds = state.worlds.map((world) => {
       if (world.source === 'new' || world.root !== action.snapshot.root) return world
+      if (world.snapshot === action.snapshot) return world
       changed = true
       return world.source === 'desk'
         ? workingTreeWorld(action.snapshot, world)
@@ -308,10 +384,11 @@ export function reduceWorldRegistry(
       if (world.review.kind !== 'github' || world.review.selector !== action.progress.selector) return world
       return {
         ...world,
+        patchPages: [...world.patchPages, action.progress.patch],
+        patchLength: world.patchLength + action.progress.patch.length,
         review: {
           ...world.review,
           files: [...world.review.files, ...action.progress.files],
-          patch: `${world.review.patch}${action.progress.patch}`,
           omittedFiles: [...world.review.omittedFiles, ...action.progress.omittedFiles]
         }
       }
@@ -319,14 +396,48 @@ export function reduceWorldRegistry(
   }
   if (action.type === 'replace-patch') {
     return updatePatchWorld(state, action.worldId, action.generation, (world) =>
-      patchWorldId(action.review) === world.worldId ? { ...world, review: action.review } : world)
+      patchWorldId(action.review) === world.worldId
+        ? {
+            ...world,
+            review: action.review,
+            patchPages: action.review.patch === '' ? [] : [action.review.patch],
+            patchLength: action.review.patch.length
+          }
+        : world)
+  }
+  if (action.type === 'set-patch-expected-file-count') {
+    return updatePatchWorld(state, action.worldId, action.generation, (world) =>
+      world.review.kind === 'github'
+        ? { ...world, review: { ...world.review, expectedFileCount: action.fileCount } }
+        : world)
+  }
+  if (action.type === 'restore-since-patch') {
+    const index = state.worlds.findIndex((world) => world.worldId === action.worldId)
+    const world = state.worlds[index]
+    if (index < 0 || world?.source !== 'since' || world.loadStatus !== 'released') return state
+    const worlds = [...state.worlds]
+    worlds[index] = {
+      ...world,
+      loadStatus: 'ready',
+      patchPages: action.patchPages,
+      patchLength: action.patchPages.reduce((length, page) => length + page.length, 0),
+      review: { ...world.review, files: action.files, omittedFiles: action.omittedFiles }
+    }
+    return { ...state, worlds }
   }
   if (action.type === 'set-patch-status') {
     return updatePatchWorld(state, action.worldId, action.generation, (world) => {
       const review = action.loadStatus !== 'ready' && world.review.kind === 'github'
         ? { ...world.review, expectedFileCount: world.review.files.length }
         : world.review
-      return { ...world, review, loadStatus: action.loadStatus }
+      return {
+        ...world,
+        review,
+        loadStatus: action.loadStatus,
+        errorMessage: action.loadStatus === 'error'
+          ? (action.errorMessage ?? world.errorMessage)
+          : null
+      }
     })
   }
   if (action.type === 'focus') {
@@ -398,7 +509,15 @@ export function useReviewWorlds({
   }, [selectedPath, state, workspaceView])
 
   const dispatch = useCallback((action: WorldRegistryAction) => {
-    setState((current) => boundInactivePatchPayloads(reduceWorldRegistry(current, action)))
+    setState((current) => {
+      const next = reduceWorldRegistry(current, action)
+      const bounded = actionMayChangeInactivePatchBudget(action.type)
+        ? boundInactivePatchPayloads(next, MAX_INACTIVE_PATCH_BYTES, (worldId) =>
+          worldViewCache.graphBytes(worldId))
+        : next
+      worldViewCache.sync(bounded)
+      return bounded
+    })
   }, [])
 
   useEffect(() => {
@@ -431,8 +550,10 @@ export function useReviewWorlds({
 
   const restoreNavigation = useCallback((worldId: string) => {
     const navigation = navigationRef.current.get(worldId)
-    onSelectPath(navigation?.selectedPath ?? null)
-    onWorkspaceViewChange(navigation?.workspaceView ?? 'multi')
+    const nextPath = navigation?.selectedPath ?? null
+    const nextView = navigation?.workspaceView ?? 'multi'
+    if (selectedPathRef.current !== nextPath) onSelectPath(nextPath)
+    if (workspaceViewRef.current !== nextView) onWorkspaceViewChange(nextView)
   }, [onSelectPath, onWorkspaceViewChange])
 
   const activateWorld = useCallback(async (world: ReviewWorld, activation: number): Promise<boolean> => {
@@ -441,6 +562,7 @@ export function useReviewWorlds({
       onActivateSnapshot(null)
       return true
     }
+    if (worldHasActiveRepositorySession(world, stateRef.current)) return true
     try {
       const nextSnapshot = await onActivateRepository(world.root)
       if (activation !== activationRef.current) return false
@@ -459,11 +581,19 @@ export function useReviewWorlds({
     if (world == null) return false
     saveActiveNavigation()
     const activation = ++activationRef.current
+    const sessionReady = worldHasActiveRepositorySession(world, stateRef.current)
+      || world.source === 'new'
+    if (sessionReady) {
+      if (world.source === 'new') onActivateSnapshot(null)
+      dispatch({ type: 'focus', worldId })
+      restoreNavigation(worldId)
+      return true
+    }
     if (!(await activateWorld(world, activation))) return false
     dispatch({ type: 'focus', worldId })
     restoreNavigation(worldId)
     return true
-  }, [activateWorld, dispatch, restoreNavigation, saveActiveNavigation])
+  }, [activateWorld, dispatch, onActivateSnapshot, restoreNavigation, saveActiveNavigation])
 
   const openNewWorld = useCallback(() => {
     saveActiveNavigation()
@@ -652,8 +782,22 @@ export function useReviewWorlds({
   const setPatchLoadStatus = useCallback((
     worldId: string,
     generation: number,
-    loadStatus: PatchWorld['loadStatus']
-  ) => dispatch({ type: 'set-patch-status', worldId, generation, loadStatus }), [dispatch])
+    loadStatus: PatchWorld['loadStatus'],
+    errorMessage: string | null = null
+  ) => dispatch({ type: 'set-patch-status', worldId, generation, loadStatus, errorMessage }), [dispatch])
+
+  const setPatchExpectedFileCount = useCallback((
+    worldId: string,
+    generation: number,
+    fileCount: number
+  ) => dispatch({ type: 'set-patch-expected-file-count', worldId, generation, fileCount }), [dispatch])
+
+  const restoreSincePatch = useCallback((
+    worldId: string,
+    patchPages: readonly string[],
+    files: Extract<RepositoryReview, { kind: 'github' }>['files'],
+    omittedFiles: Extract<RepositoryReview, { kind: 'github' }>['omittedFiles']
+  ) => dispatch({ type: 'restore-since-patch', worldId, patchPages, files, omittedFiles }), [dispatch])
 
   const syncRepositorySnapshot = useCallback((nextSnapshot: RepositorySnapshot) => {
     dispatch({ type: 'sync-repository', snapshot: nextSnapshot })
@@ -667,9 +811,16 @@ export function useReviewWorlds({
   }, [dispatch, onActivateSnapshot])
 
   const activeWorld = state.worlds.find((world) => world.worldId === state.activeWorldId) ?? null
-  const activeReview = activeWorld == null || activeWorld.source === 'desk' || activeWorld.source === 'new'
-    ? null
-    : activeWorld.review
+  const activeReview = useMemo<RepositoryReview | null>(() => {
+    if (activeWorld == null || activeWorld.source === 'desk' || activeWorld.source === 'new') return null
+    if ((activeWorld.source !== 'patch' && activeWorld.source !== 'since')
+      || activeWorld.review.kind !== 'github') return activeWorld.review
+    return {
+      ...activeWorld.review,
+      patchPages: activeWorld.patchPages,
+      patchLength: activeWorld.patchLength
+    }
+  }, [activeWorld])
   const activeNavigation = state.activeWorldId == null
     ? null
     : navigationRef.current.get(state.activeWorldId) ?? null
@@ -692,6 +843,8 @@ export function useReviewWorlds({
     openSinceWorld,
     appendPatchPage,
     replacePatchReview,
+    restoreSincePatch,
+    setPatchExpectedFileCount,
     setPatchLoadStatus,
     closeWorld,
     cycleWorld,
@@ -702,6 +855,7 @@ export function useReviewWorlds({
   }), [activeNavigation?.reviewScrollTop, activeReview, activeWorld, appendPatchPage, closeWorld,
     cycleWorld, focusDesk, focusWorld, openDeskWorld, openNewWorld, openPatchWorld, openSinceWorld,
     hasRepositoryRoot, hasWorld, isWorldActive, rememberReviewScroll, replacePatchReview, reset,
-    selectInitialPath, setPatchLoadStatus,
+    restoreSincePatch,
+    selectInitialPath, setPatchExpectedFileCount, setPatchLoadStatus,
     setNewWorldPending, state.worlds, syncRepositorySnapshot, updateNewWorldLocator])
 }

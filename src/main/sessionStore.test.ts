@@ -35,10 +35,38 @@ describe('loadSessionState', () => {
     const directory = await mkdtemp(join(tmpdir(), 'horus-session-'))
     try {
       expect(loadSessionState(directory)).toEqual(DEFAULT_SESSION_STATE)
-      saveSessionState(directory, { lastRoot: '/work/horus', approvedRoots: ['/work/horus'], restoreLastFolder: false, themeType: 'light' })
+      await saveSessionState(directory, { lastRoot: '/work/horus', approvedRoots: ['/work/horus'], restoreLastFolder: false, themeType: 'light' })
       expect(loadSessionState(directory)).toEqual({
         lastRoot: '/work/horus',
         approvedRoots: ['/work/horus'],
+        restoreLastFolder: false,
+        themeType: 'light'
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('serializes rapid saves in call order', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'horus-session-order-'))
+    try {
+      const first = saveSessionState(directory, {
+        lastRoot: '/work/first',
+        approvedRoots: ['/work/first'],
+        restoreLastFolder: true,
+        themeType: 'dark'
+      })
+      const second = saveSessionState(directory, {
+        lastRoot: '/work/second',
+        approvedRoots: ['/work/first', '/work/second'],
+        restoreLastFolder: false,
+        themeType: 'light'
+      })
+      await Promise.all([first, second])
+
+      expect(loadSessionState(directory)).toEqual({
+        lastRoot: '/work/second',
+        approvedRoots: ['/work/first', '/work/second'],
         restoreLastFolder: false,
         themeType: 'light'
       })

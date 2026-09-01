@@ -49,6 +49,89 @@ function contentSecurityPolicyPlugin(): Plugin {
 // it, so the base64-inlined wasm chunk — 622,336 bytes in the last build — is
 // shipped and never fetched. The stub throws instead of resolving empty so a
 // future engine switch fails loudly at the import rather than deep inside shiki.
+// Keep in lockstep with EDITOR_THEMES in src/renderer/src/preferences.ts.
+// The preferences test fails CI if a selectable theme is missing here.
+const SHIKI_THEME_ALLOWLIST = new Set([
+  'pierre-dark',
+  'pierre-dark-soft',
+  'github-dark',
+  'vitesse-dark',
+  'pierre-light',
+  'github-light',
+  'vitesse-light',
+  'light-plus'
+])
+
+function trimShikiThemesPlugin(): Plugin {
+  return {
+    name: 'horus:trim-shiki-themes',
+    enforce: 'pre',
+    transform(_code, id) {
+      const normalized = id.split('?')[0]?.replaceAll('\\', '/') ?? id
+      // @pierre/diffs createHighlighter() reads shiki's bundledThemes map
+      // (shiki/dist/themes.mjs). Pierre collections are a second registry.
+      if (normalized.endsWith('/shiki/dist/themes.mjs') || normalized.endsWith('/shiki/dist/themes.js')) {
+        const names = [...SHIKI_THEME_ALLOWLIST].filter((name) => !name.startsWith('pierre-'))
+        const info = names.map((name) => {
+          const type = name.includes('light') || name === 'light-plus' ? 'light' : 'dark'
+          return `{id:${JSON.stringify(name)},displayName:${JSON.stringify(name)},type:${JSON.stringify(type)},import:()=>import(${JSON.stringify(`@shikijs/themes/${name}`)})}`
+        })
+        return [
+          `const bundledThemesInfo=[${info.join(',')}];`,
+          'const bundledThemes=Object.fromEntries(bundledThemesInfo.map((i)=>[i.id,i.import]));',
+          'export{bundledThemes,bundledThemesInfo};'
+        ].join('\n')
+      }
+      if (normalized.endsWith('/collections/shiki.js')) {
+        const names = [...SHIKI_THEME_ALLOWLIST].filter((name) => !name.startsWith('pierre-'))
+        const light = names.filter((name) => name.includes('light') || name === 'light-plus')
+        const lightNames = new Set(light)
+        const dark = names.filter((name) => !lightNames.has(name))
+        const imports = names.map((name) =>
+          `${JSON.stringify(name)}: () => import(${JSON.stringify(`@shikijs/themes/${name}`)})`
+        )
+        return [
+          'import { createThemeCollection } from "../modules/createThemeCollection.js";',
+          'import { createTheme } from "../modules/createTheme.js";',
+          'const SHIKI_COLLECTION = "shiki";',
+          `const LIGHT_SHIKI_THEMES = ${JSON.stringify(light)};`,
+          `const DARK_SHIKI_THEMES = ${JSON.stringify(dark)};`,
+          'const LIGHT_SHIKI_THEME_NAMES = new Set(LIGHT_SHIKI_THEMES);',
+          'function shikiColorScheme(name) { return LIGHT_SHIKI_THEME_NAMES.has(name) ? "light" : "dark"; }',
+          `const SHIKI_THEME_IMPORTS = { ${imports.join(',')} };`,
+          'function createShikiTheme(name) { return createTheme({ name, collection: SHIKI_COLLECTION, colorScheme: shikiColorScheme(name), load: SHIKI_THEME_IMPORTS[name] }); }',
+          'export const shikiThemes = createThemeCollection({ themes: [...LIGHT_SHIKI_THEMES, ...DARK_SHIKI_THEMES].map(createShikiTheme) });'
+        ].join('\n')
+      }
+      if (normalized.endsWith('/collections/pierre.js')) {
+        const names = [...SHIKI_THEME_ALLOWLIST].filter((name) => name.startsWith('pierre-'))
+        const light = names.filter((name) => name.includes('light'))
+        const lightNames = new Set(light)
+        const dark = names.filter((name) => !lightNames.has(name))
+        const imports = names.map((name) =>
+          `${JSON.stringify(name)}: () => import(${JSON.stringify(`@pierre/theme/${name}`)})`
+        )
+        const labels = Object.fromEntries(names.map((name) => [name, name]))
+        return [
+          'import { createThemeCollection } from "../modules/createThemeCollection.js";',
+          'import { createTheme } from "../modules/createTheme.js";',
+          'const PIERRE_COLLECTION = "pierre";',
+          `const DARK_PIERRE_THEMES = ${JSON.stringify(dark)};`,
+          `const LIGHT_PIERRE_THEMES = ${JSON.stringify(light)};`,
+          'const PIERRE_THEMES = [...LIGHT_PIERRE_THEMES, ...DARK_PIERRE_THEMES];',
+          'const LIGHT_PIERRE_THEME_NAMES = new Set(LIGHT_PIERRE_THEMES);',
+          'function pierreColorScheme(name) { return LIGHT_PIERRE_THEME_NAMES.has(name) ? "light" : "dark"; }',
+          `const PIERRE_THEME_DISPLAY_NAMES = ${JSON.stringify(labels)};`,
+          `const PIERRE_THEME_IMPORTS = { ${imports.join(',')} };`,
+          'function createPierreTheme(name) { return createTheme({ name, collection: PIERRE_COLLECTION, colorScheme: pierreColorScheme(name), displayName: PIERRE_THEME_DISPLAY_NAMES[name], load: PIERRE_THEME_IMPORTS[name] }); }',
+          'export const pierreThemes = createThemeCollection({ themes: PIERRE_THEMES.map(createPierreTheme) });'
+        ].join('\n')
+      }
+      return null
+    }
+  }
+}
+
 function dropShikiWasmPlugin(): Plugin {
   const stubId = '\0horus:shiki-wasm-stub'
   return {
@@ -94,14 +177,29 @@ export default defineConfig({
   },
   renderer: {
     root: resolve('src/renderer'),
-    plugins: [react(), contentSecurityPolicyPlugin(), dropShikiWasmPlugin()],
+    resolve: {
+      // @pierre/trees still nests theme 1.1.0. Dedupe onto the root 2.0.0 so
+      // Explorer and the highlighter share one pierre-light chunk.
+      dedupe: ['@pierre/theme']
+    },
+    plugins: [
+      react({
+        babel: {
+          plugins: [['babel-plugin-react-compiler', { target: '19' }]]
+        }
+      }),
+      contentSecurityPolicyPlugin(),
+      dropShikiWasmPlugin(),
+      trimShikiThemesPlugin()
+    ],
     build: {
       minify: 'esbuild',
-      cssMinify: 'esbuild'
+      cssMinify: 'esbuild',
+      sourcemap: 'hidden'
     },
     worker: {
       format: 'es',
-      plugins: () => [dropShikiWasmPlugin()]
+      plugins: () => [dropShikiWasmPlugin(), trimShikiThemesPlugin()]
     }
   }
 })

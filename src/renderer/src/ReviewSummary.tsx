@@ -63,7 +63,7 @@ export function ReviewSummary({
       <header>
         <div><IconCodeComments /><strong>Review notes</strong><span>{entries.length}</span></div>
         <button type="button" data-copy-state={copyState} onClick={() => void copyComments()}>
-          <span className="icon-swap copy-icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
+          <span className="icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
             <IconCopy /><IconCheck />
           </span>
           <span className="review-copy-label">

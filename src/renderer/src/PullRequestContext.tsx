@@ -4,6 +4,7 @@ import { IconBrandGithub, IconChevronSm } from '@pierre/icons'
 import type { PullRequestConversation } from '../../shared/contracts'
 import { GitHubMarkdownContent } from './GitHubMarkdownContent'
 import { formatCommentAge } from './RemoteReviewThreads'
+import { useReviewClock } from './reviewClock'
 
 function reviewStateLabel(state: string): string {
   return state.toLowerCase().replaceAll('_', ' ')
@@ -14,6 +15,7 @@ export function PullRequestContext({ conversation }: {
 }): React.JSX.Element | null {
   const [expanded, setExpanded] = useState(true)
   const contentId = useId()
+  const now = useReviewClock()
   const body = conversation?.body.trim() ?? ''
   const reviews = conversation?.reviews ?? []
   if (body === '' && reviews.length === 0) return null
@@ -50,7 +52,7 @@ export function PullRequestContext({ conversation }: {
                     <em data-review-state={review.state.toLowerCase()}>{reviewStateLabel(review.state)}</em>
                   </div>
                   {review.submittedAt == null ? null : (
-                    <div className="pr-row-meta">{formatCommentAge(review.submittedAt, Date.now())}</div>
+                    <div className="pr-row-meta">{formatCommentAge(review.submittedAt, now)}</div>
                   )}
                   {review.body.trim() === '' ? null : (
                     <GitHubMarkdownContent source={review.body} className="pr-context-review-body" />

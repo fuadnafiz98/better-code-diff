@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 import type { CodeViewItem } from '@pierre/diffs'
 
 import {
@@ -7,8 +7,11 @@ import {
   markViewedFile,
   parseStoredViewedFiles,
   reviewFileSignature,
+  saveStoredViewedFiles,
   viewedFileStorageKey
 } from './viewedFileStorage'
+
+afterEach(() => localStorage.clear())
 
 function diffItem(path: string, objectId: string | undefined, additions: string[] = ['+a']): CodeViewItem<unknown> {
   return {
@@ -104,5 +107,20 @@ describe('dropChangedViewedFiles', () => {
   it('returns the same object when nothing changed', () => {
     const signatures = { 'src/a.ts': 'sig-a' }
     expect(dropChangedViewedFiles(signatures, ['src/z.ts'])).toBe(signatures)
+  })
+})
+
+describe('saveStoredViewedFiles', () => {
+  it('returns true for a persistable map and false when over the cap', () => {
+    expect(saveStoredViewedFiles('better-code-diff:viewed-files:/repo:ok', { 'src/a.ts': 'sig' })).toBe(true)
+    expect(localStorage.getItem('better-code-diff:viewed-files:/repo:ok')).toContain('src/a.ts')
+  })
+
+  it('returns false when the payload exceeds the per-key cap', () => {
+    const signatures: Record<string, string> = {}
+    for (let index = 0; index < 8_000; index += 1) {
+      signatures[`src/file-${index}.ts`] = 'sig-xxxxxxxxxxxxxxxx'
+    }
+    expect(saveStoredViewedFiles('better-code-diff:viewed-files:/repo:test', signatures)).toBe(false)
   })
 })

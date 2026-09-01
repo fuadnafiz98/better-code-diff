@@ -1,0 +1,10 @@
+{
+  "ignore": {
+    "files": [
+      "grok-github-fast.html",
+      "src/renderer/src/main.tsx",
+      "src/renderer/src/AppErrorBoundary.tsx",
+      "src/renderer/test/setup.ts"
+    ]
+  }
+}

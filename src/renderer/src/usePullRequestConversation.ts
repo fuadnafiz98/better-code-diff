@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type { PullRequestConversation, RemoteReviewThread, RepositoryReview } from '../../shared/contracts'
 import { getErrorMessage } from './repositoryApi'
+import { worldViewCache } from './worldViewCache'
 
 // Every tick is a `gh api graphql` process. At 15 s a half-hour review was ~120
 // spawns of a query that almost always returns the same bytes, and with GitHub
@@ -79,21 +80,35 @@ export function groupRemoteThreadsByPath(
 // GitHub is the source of truth for other people's comments, so an open review
 // re-reads the conversation on a timer and after every write of our own.
 export function usePullRequestConversation(
+  root: string,
   repositoryReview: RepositoryReview | null,
-  onError: (message: string | null) => void
+  onError: (message: string | null) => void,
+  worldId: string | null = null
 ): PullRequestConversationApi {
   const selector = repositoryReview?.kind === 'github' ? repositoryReview.selector : null
-  const [conversation, setConversation] = useState<PullRequestConversation | null>(null)
+  const [conversationWorldId, setConversationWorldId] = useState(worldId)
+  const [conversation, setConversation] = useState<PullRequestConversation | null>(
+    () => worldId == null ? null : worldViewCache.get(worldId)?.conversation ?? null
+  )
+  if (conversationWorldId !== worldId) {
+    setConversationWorldId(worldId)
+    setConversation(worldId == null ? null : worldViewCache.get(worldId)?.conversation ?? null)
+  }
   const [pendingThreadId, setPendingThreadId] = useState<string | null>(null)
   const [refreshRevision, setRefreshRevision] = useState(0)
+  const refreshGenerationRef = useRef(0)
   const onErrorRef = useRef(onError)
   useEffect(() => {
     onErrorRef.current = onError
   }, [onError])
+  useLayoutEffect(() => {
+    if (worldId != null) worldViewCache.rememberConversation(worldId, conversation)
+  }, [conversation, worldId])
 
   useEffect(() => {
     if (selector == null) {
       setConversation(null)
+      if (worldId != null) worldViewCache.rememberConversation(worldId, null)
       return
     }
     let cancelled = false
@@ -111,11 +126,15 @@ export function usePullRequestConversation(
       if (repository == null || loading) return
       loading = true
       try {
-        const next = await repository.getPullRequestConversation(selector)
+        const next = await repository.getPullRequestConversation(root, selector)
         if (cancelled) return
         // An unchanged conversation must keep its identity, or every poll would
         // rebuild every annotated review item.
-        setConversation((current) => sameConversation(current, next) ? current : next)
+        setConversation((current) => {
+          const resolved = sameConversation(current, next) ? current : next
+          if (worldId != null) worldViewCache.rememberConversation(worldId, resolved)
+          return resolved
+        })
         // Backing off on an unreachable GitHub is the difference between a
         // failing subprocess every 30 s forever and one every five minutes.
         delay = nextConversationPollDelay(delay, next.available)
@@ -148,7 +167,11 @@ export function usePullRequestConversation(
       void load().finally(schedule)
     }
 
-    void load().finally(schedule)
+    const cached = worldId == null ? null : worldViewCache.get(worldId)?.conversation ?? null
+    const forced = refreshRevision !== refreshGenerationRef.current
+    refreshGenerationRef.current = refreshRevision
+    if (cached == null || forced) void load().finally(schedule)
+    else schedule()
     // Returning focus catches up immediately instead of waiting out a backed-off
     // interval, and resets the back-off because the user is watching again.
     const handleVisibility = (): void => {
@@ -164,7 +187,7 @@ export function usePullRequestConversation(
       document.removeEventListener('visibilitychange', handleVisibility)
       document.removeEventListener('scroll', noteScroll, true)
     }
-  }, [refreshRevision, selector])
+  }, [refreshRevision, root, selector, worldId])
 
   const refresh = useCallback(() => setRefreshRevision((revision) => revision + 1), [])
 
@@ -186,12 +209,12 @@ export function usePullRequestConversation(
   }, [])
 
   const reply = useCallback((threadId: string, body: string) => {
-    void runThreadAction(threadId, (repository) => repository.replyToPullRequestThread(threadId, body))
-  }, [runThreadAction])
+    void runThreadAction(threadId, (repository) => repository.replyToPullRequestThread(root, threadId, body))
+  }, [root, runThreadAction])
 
   const setResolved = useCallback((threadId: string, resolved: boolean) => {
-    void runThreadAction(threadId, (repository) => repository.setPullRequestThreadResolved(threadId, resolved))
-  }, [runThreadAction])
+    void runThreadAction(threadId, (repository) => repository.setPullRequestThreadResolved(root, threadId, resolved))
+  }, [root, runThreadAction])
 
   const threadsByPath = useMemo(
     () => groupRemoteThreadsByPath(conversation?.threads ?? []),

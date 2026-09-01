@@ -1,14 +1,18 @@
 import { expect, test } from 'bun:test'
 
-import type { PullRequestReview, RepositorySnapshot } from '../../shared/contracts'
+import type { LocalBranchReview, PullRequestReview, RepositorySnapshot } from '../../shared/contracts'
 import {
+  actionMayChangeInactivePatchBudget,
   boundInactivePatchPayloads,
   createNewWorld,
   createPatchWorld,
   createSinceWorld,
   findCollisionPaths,
-  reduceWorldRegistry
+  reduceWorldRegistry,
+  reviewPayloadBytes,
+  worldHasActiveRepositorySession
 } from './useReviewWorlds'
+import { estimateParsedGraphBytes } from './worldViewCache'
 
 const snapshot = (head = 'desk-1'): RepositorySnapshot => ({
   root: '/repo',
@@ -91,6 +95,41 @@ test('a patch page only updates its matching world generation', () => {
 
   expect(stale).toBe(state)
   expect(current.worlds[0]?.source === 'patch' ? current.worlds[0].review.files : []).toHaveLength(1)
+  expect(current.worlds[0]?.source === 'patch' ? current.worlds[0].patchPages : []).toEqual(['page'])
+  expect(current.worlds[0]?.source === 'patch' ? current.worlds[0].patchLength : 0).toBe(4)
+  expect(current.worlds[0]?.source === 'patch' ? current.worlds[0].review.patch : null).toBe('')
+})
+
+test('the terminal stream count updates metadata without replacing patch pages', () => {
+  const patch = createPatchWorld(snapshot(), { ...review(), files: [] }, 2, 'loading')
+  const state = reduceWorldRegistry(
+    { worlds: [patch], activeWorldId: patch.worldId },
+    {
+      type: 'append-patch-page',
+      worldId: patch.worldId,
+      generation: 2,
+      progress: {
+        kind: 'files',
+        selector: '7',
+        files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }],
+        patch: 'page',
+        omittedFiles: []
+      }
+    }
+  )
+  const done = reduceWorldRegistry(state, {
+    type: 'set-patch-expected-file-count',
+    worldId: patch.worldId,
+    generation: 2,
+    fileCount: 1
+  })
+  const world = done.worlds[0]
+
+  expect(world?.source === 'patch' && world.review.kind === 'github'
+    ? world.review.expectedFileCount
+    : null).toBe(1)
+  expect(world?.source === 'patch' ? world.patchPages : null).toEqual(['page'])
+  expect(world?.source === 'patch' ? world.patchLength : null).toBe(4)
 })
 
 test('collision radar reports exact dirty-path intersections only', () => {
@@ -175,5 +214,148 @@ test('inactive GitHub patch payloads are released when they exceed the memory bu
 
   expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].loadStatus : null).toBe('released')
   expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].review.patch : null).toBe('')
+  expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].patchPages : null).toEqual([])
+  expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].patchLength : null).toBe(0)
   expect(state.worlds[1]).toBe(second)
+})
+
+test('inactive Since worlds are released and can restore their filtered pages', () => {
+  const parent = createPatchWorld(snapshot(), review(), 1, 'ready')
+  const checkpoint = {
+    version: 1 as const,
+    pullRequestUrl: review().pullRequest.url,
+    baseOid: '1'.repeat(40),
+    headOid: '2'.repeat(40),
+    createdAt: '2026-08-28T10:00:00Z',
+    manifest: []
+  }
+  const since = createSinceWorld(snapshot(), parent.worldId, {
+    review: { ...review(), patch: 'line one\nline two\n' },
+    patchPages: ['line one\n', 'line two\n'],
+    removedPaths: [],
+    uncertainPaths: []
+  }, checkpoint)
+  const released = boundInactivePatchPayloads({
+    worlds: [since, parent],
+    activeWorldId: parent.worldId
+  }, 1)
+  const releasedSince = released.worlds[0]
+
+  expect(releasedSince?.source === 'since' ? releasedSince.loadStatus : null).toBe('released')
+  expect(releasedSince?.source === 'since' ? releasedSince.patchPages : null).toEqual([])
+  expect(releasedSince?.source === 'since' ? releasedSince.review.files : null).toEqual([])
+  expect(releasedSince?.source === 'since' ? releasedSince.changedPaths : null).toEqual(['src/a.ts'])
+
+  const restored = reduceWorldRegistry(released, {
+    type: 'restore-since-patch',
+    worldId: since.worldId,
+    patchPages: ['line two\n'],
+    files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }],
+    omittedFiles: []
+  })
+  expect(restored.worlds[0]?.source === 'since' ? restored.worlds[0].loadStatus : null).toBe('ready')
+  expect(restored.worlds[0]?.source === 'since' ? restored.worlds[0].patchLength : null).toBe(9)
+  expect(restored.worlds[0]?.source === 'since' ? restored.worlds[0].review.files : null).toHaveLength(1)
+})
+
+test('locator typing skips the inactive patch payload scan', () => {
+  expect(actionMayChangeInactivePatchBudget('update-locator')).toBe(false)
+  expect(actionMayChangeInactivePatchBudget('sync-repository')).toBe(false)
+  expect(actionMayChangeInactivePatchBudget('append-patch-page')).toBe(true)
+  expect(actionMayChangeInactivePatchBudget('set-patch-status')).toBe(true)
+  expect(actionMayChangeInactivePatchBudget('focus')).toBe(true)
+})
+
+test('inactive GitHub worlds are released once retained payload exceeds the 64 MB budget', () => {
+  const patch = (number: number, bytes: number) => createPatchWorld(
+    snapshot(),
+    { ...review(number), patch: 'x'.repeat(bytes) },
+    number,
+    'ready'
+  )
+  const active = patch(4, 1)
+  const state = boundInactivePatchPayloads({
+    worlds: [patch(1, 30 * 1024 * 1024), patch(2, 30 * 1024 * 1024), patch(3, 20 * 1024 * 1024), active],
+    activeWorldId: active.worldId
+  })
+
+  expect(state.worlds.filter((world) => world.source === 'patch' && world.loadStatus === 'released'))
+    .toHaveLength(1)
+  expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].loadStatus : null).toBe('released')
+  expect(state.worlds[1]?.source === 'patch' ? state.worlds[1].loadStatus : null).toBe('ready')
+  expect(state.worlds[2]?.source === 'patch' ? state.worlds[2].loadStatus : null).toBe('ready')
+  expect(state.worlds[3]).toBe(active)
+})
+
+test('same-root tab switches reuse the live repository session', () => {
+  const desk = reduceWorldRegistry(
+    { worlds: [], activeWorldId: null },
+    { type: 'open-desk', snapshot: snapshot() }
+  )
+  const first = createPatchWorld(snapshot(), review(1), 1, 'ready')
+  const second = createPatchWorld(snapshot(), review(2), 2, 'ready')
+  const focused = reduceWorldRegistry(
+    reduceWorldRegistry(desk, { type: 'open-patch', world: first, originWorldId: desk.activeWorldId }),
+    { type: 'open-patch', world: second, originWorldId: first.worldId }
+  )
+  const firstWorld = focused.worlds.find((world) => world.worldId === first.worldId)!
+  const secondWorld = focused.worlds.find((world) => world.worldId === second.worldId)!
+  expect(worldHasActiveRepositorySession(firstWorld, focused)).toBe(true)
+  expect(worldHasActiveRepositorySession(secondWorld, focused)).toBe(true)
+  expect(worldHasActiveRepositorySession(createNewWorld(), focused)).toBe(false)
+})
+
+test('sync-repository keeps world identity when the snapshot object is unchanged', () => {
+  const current = snapshot()
+  const desk = reduceWorldRegistry(
+    { worlds: [], activeWorldId: null },
+    { type: 'open-desk', snapshot: current }
+  )
+  expect(reduceWorldRegistry(desk, { type: 'sync-repository', snapshot: current })).toBe(desk)
+})
+
+test('review payload bytes charge a retained parsed graph on top of patch text', () => {
+  const world = createPatchWorld(snapshot(), { ...review(1), patch: 'abcd' }, 1, 'ready')
+  const graphBytes = estimateParsedGraphBytes([{ id: 'review:src/a.ts' }])
+  expect(reviewPayloadBytes(world)).toBeLessThan(reviewPayloadBytes(world, graphBytes))
+  expect(reviewPayloadBytes(world, graphBytes) - reviewPayloadBytes(world)).toBe(graphBytes)
+})
+
+test('a retained parsed graph can evict an inactive world the patch text alone would keep', () => {
+  const first = createPatchWorld(snapshot(), { ...review(1), patch: 'aa' }, 1, 'ready')
+  const second = createPatchWorld(snapshot(), { ...review(2), patch: 'bb' }, 2, 'ready')
+  const graphBytes = new Map<string, number>([[first.worldId, 80]])
+  const state = boundInactivePatchPayloads({
+    worlds: [first, second],
+    activeWorldId: second.worldId
+  }, 50, (worldId) => graphBytes.get(worldId) ?? 0)
+
+  expect(state.worlds[0]?.source === 'patch' ? state.worlds[0].loadStatus : null).toBe('released')
+  expect(state.worlds[1]).toBe(second)
+})
+
+test('local branch-compare and loading GitHub worlds stay outside the budget', () => {
+  const localReview: LocalBranchReview = {
+    kind: 'local',
+    id: 'main...feature',
+    title: 'feature',
+    baseRefName: 'main',
+    headRefName: 'feature',
+    baseOid: 'base',
+    headOid: 'head',
+    files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }],
+    patch: 'y'.repeat(80 * 1024 * 1024),
+    omittedFiles: []
+  }
+  const local = createPatchWorld(snapshot(), localReview, 1, 'ready')
+  const loading = createPatchWorld(snapshot(), { ...review(2), patch: 'z'.repeat(80 * 1024 * 1024) }, 2, 'loading')
+  const active = createPatchWorld(snapshot(), review(3), 3, 'ready')
+  const state = boundInactivePatchPayloads({
+    worlds: [local, loading, active],
+    activeWorldId: active.worldId
+  }, 1)
+
+  expect(state.worlds[0]).toBe(local)
+  expect(state.worlds[1]).toBe(loading)
+  expect(state.worlds[2]).toBe(active)
 })

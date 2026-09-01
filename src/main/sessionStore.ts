@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 export type WindowThemeType = 'dark' | 'light'
@@ -18,6 +19,7 @@ export const DEFAULT_SESSION_STATE: SessionState = {
 }
 
 const FILE_NAME = 'last-session.json'
+let pendingSave: Promise<void> = Promise.resolve()
 
 export function parseSessionState(raw: unknown): SessionState {
   if (typeof raw !== 'object' || raw == null) return DEFAULT_SESSION_STATE
@@ -48,10 +50,13 @@ export function loadSessionState(directory: string): SessionState {
   }
 }
 
-export function saveSessionState(directory: string, state: SessionState): void {
-  try {
-    writeFileSync(join(directory, FILE_NAME), JSON.stringify(state, null, 2), 'utf8')
-  } catch (error) {
-    console.error('Could not persist the last session:', error)
-  }
+export function saveSessionState(directory: string, state: SessionState): Promise<void> {
+  const path = join(directory, FILE_NAME)
+  const serialized = JSON.stringify(state, null, 2)
+  pendingSave = pendingSave
+    .then(() => writeFile(path, serialized, 'utf8'))
+    .catch((error) => {
+      console.error('Could not persist the last session:', error)
+    })
+  return pendingSave
 }

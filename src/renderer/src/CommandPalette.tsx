@@ -117,6 +117,8 @@ function CommandPalette({
   const [activeIndex, setActiveIndex] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const dialogRef = useRef<HTMLDialogElement>(null)
+  const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const scrollActiveRowRef = useRef(false)
   const selector = parsePullRequestSelector(query)
 
   useLayoutEffect(() => {
@@ -202,7 +204,19 @@ function CommandPalette({
     [actions, query, selector]
   )
   const groups = useMemo(() => groupPaletteEntries(results), [results])
-  const activeAction = results[Math.min(activeIndex, results.length - 1)]
+  const clampedIndex = results.length === 0 ? 0 : Math.min(activeIndex, results.length - 1)
+  const activeAction = results[clampedIndex]
+
+  useLayoutEffect(() => {
+    if (!scrollActiveRowRef.current) return
+    scrollActiveRowRef.current = false
+    rowRefs.current[clampedIndex]?.scrollIntoView({ block: 'nearest' })
+  }, [clampedIndex])
+
+  const moveActive = (direction: 1 | -1): void => {
+    scrollActiveRowRef.current = true
+    setActiveIndex(nextPaletteIndex(clampedIndex, direction, results.length))
+  }
 
   const displayPullRequest = (): void => {
     if (!gitRepositoryOpen || selector == null) return
@@ -248,7 +262,7 @@ function CommandPalette({
             onKeyDown={(event) => {
               if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
               event.preventDefault()
-              setActiveIndex((current) => nextPaletteIndex(current, event.key === 'ArrowDown' ? 1 : -1, results.length))
+              moveActive(event.key === 'ArrowDown' ? 1 : -1)
             }}
             placeholder="Type a command, PR number, or GitHub URL"
             spellCheck={false}
@@ -283,6 +297,7 @@ function CommandPalette({
                 return (
                   <button
                     key={action.id}
+                    ref={(node) => { rowRefs.current[index] = node }}
                     type="button"
                     className={action.id === activeAction?.id ? 'primary-result' : undefined}
                     disabled={action.disabledReason != null}

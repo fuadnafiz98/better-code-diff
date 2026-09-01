@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -7,9 +7,11 @@ import { promisify } from 'node:util'
 import { describe, expect, it } from 'bun:test'
 
 import type { PullRequestReview } from '../shared/contracts.js'
+import { COMMAND_ABORTED_MESSAGE } from './gitCommands.js'
 
 import {
   buildPullRequestPatchFromFiles,
+  chunkPatchByFileCount,
   chunkPathspecs,
   classifySearchCompletion,
   createNewFilePatch,
@@ -31,6 +33,7 @@ import {
   parsePorcelainV2Status,
   parsePullRequestConversation,
   PullRequestReviewCache,
+  pullRequestReviewReply,
   pullRequestFilePageWave,
   pullRequestTargetsRemotes,
   replaceStatusEntry,
@@ -539,6 +542,65 @@ describe('buildPullRequestPatchFromFiles', () => {
   })
 })
 
+describe('streamed pull request payloads', () => {
+  const review = (): PullRequestReview => ({
+    kind: 'github',
+    selector: '7',
+    baseOid: 'base',
+    headOid: 'head',
+    commitId: 'head',
+    viewerCanSubmitDecision: true,
+    pullRequest: {
+      number: 7,
+      title: 'Large review',
+      url: 'https://github.com/acme/repo/pull/7',
+      state: 'OPEN',
+      isDraft: false,
+      author: { login: 'author' },
+      headRefName: 'feature',
+      baseRefName: 'main',
+      reviewDecision: null,
+      updatedAt: '2026-08-30T00:00:00Z',
+      additions: 60,
+      deletions: 0,
+      changedFiles: 60
+    },
+    files: Array.from({ length: 60 }, (_unused, index) => ({
+      path: `src/file-${index}.ts`, additions: 1, deletions: 0
+    })),
+    patch: 'large patch',
+    omittedFiles: [{ path: 'large.bin', reason: 'too-large', additions: 0, deletions: 0 }],
+    expectedFileCount: 60
+  })
+
+  it('the streamed reply omits bytes the pages already delivered', () => {
+    expect(pullRequestReviewReply(review(), true)).toMatchObject({
+      files: [], patch: '', omittedFiles: [], expectedFileCount: 60
+    })
+  })
+
+  it('a non-streamed cached reply keeps the full review', () => {
+    const cached = review()
+    expect(pullRequestReviewReply(cached, false)).toBe(cached)
+  })
+
+  it('the fast path emits multiple pages for a 60-file diff', () => {
+    const patch = Array.from({ length: 60 }, (_unused, index) => [
+      `diff --git a/src/file-${index}.ts b/src/file-${index}.ts`,
+      `--- a/src/file-${index}.ts`,
+      `+++ b/src/file-${index}.ts`,
+      '@@ -0,0 +1 @@',
+      `+${index}`,
+      ''
+    ].join('\n')).join('')
+    const pages = chunkPatchByFileCount(patch)
+
+    expect(pages).toHaveLength(3)
+    expect(pages.map((page) => filesFromPatch(page).length)).toEqual([25, 25, 10])
+    expect(pages.join('')).toBe(patch)
+  })
+})
+
 describe('filesFromPatch', () => {
   it('recovers every file GitHub truncated out of its own list', () => {
     const patch = [
@@ -922,6 +984,13 @@ describe('PullRequestReviewCache', () => {
       const hit = await cache.read(url, 'oid-1')
       expect(hit?.patch).toBe('diff --git a/src/a.ts b/src/a.ts\n')
       expect(hit?.files).toEqual([{ path: 'src/a.ts', additions: 1, deletions: 0 }])
+      const names = await readdir(join(directory, 'pr-cache'))
+      expect(names.filter((name) => name.endsWith('.json'))).toHaveLength(1)
+      expect(names.filter((name) => name.endsWith('.patch'))).toHaveLength(1)
+      const metadataName = names.find((name) => name.endsWith('.json'))
+      const metadata = JSON.parse(await readFile(join(directory, 'pr-cache', metadataName ?? ''), 'utf8'))
+      expect(metadata.patch).toBeUndefined()
+      expect(metadata.patchLength).toBe(review().patch.length)
       // A force-push moves the head oid, which is the key, so the old entry can
       // never be served for the new diff.
       expect(await cache.read(url, 'oid-2')).toBeNull()
@@ -938,7 +1007,12 @@ describe('PullRequestReviewCache', () => {
       const cache = new PullRequestReviewCache(cacheDirectory)
       const url = 'https://github.com/acme/app/pull/7'
       await cache.write(url, 'oid-1', review())
-      const [entryName] = (await readdir(cacheDirectory)).filter((name) => name.endsWith('.json'))
+      const names = await readdir(cacheDirectory)
+      const entryName = names.find((name) => name.endsWith('.json'))
+      const patchName = names.find((name) => name.endsWith('.patch'))
+      await writeFile(join(cacheDirectory, patchName ?? ''), 'truncated', 'utf8')
+      expect(await cache.read(url, 'oid-1')).toBeNull()
+
       await writeFile(join(cacheDirectory, entryName ?? ''), '{ not json', 'utf8')
       expect(await cache.read(url, 'oid-1')).toBeNull()
 
@@ -957,8 +1031,14 @@ describe('PullRequestReviewCache', () => {
       for (let index = 0; index < 24; index += 1) {
         await cache.write(`https://github.com/acme/app/pull/${index}`, `oid-${index}`, review())
       }
-      expect((await readdir(cacheDirectory)).filter((name) => name.endsWith('.json')).length)
-        .toBeLessThanOrEqual(20)
+      await writeFile(join(cacheDirectory, 'orphan.patch'), 'orphan', 'utf8')
+      await cache.sweep()
+      const names = await readdir(cacheDirectory)
+      const metadataCount = names.filter((name) => name.endsWith('.json')).length
+      const patchCount = names.filter((name) => name.endsWith('.patch')).length
+      expect(metadataCount).toBeLessThanOrEqual(20)
+      expect(patchCount).toBe(metadataCount)
+      expect(names).not.toContain('orphan.patch')
       // The most recent write always survives its own sweep.
       expect(await cache.read('https://github.com/acme/app/pull/23', 'oid-23')).not.toBeNull()
     } finally {
@@ -971,6 +1051,128 @@ describe('RepositoryService', () => {
   it('treats an empty content search as cancellation before a folder is open', async () => {
     const repository = new RepositoryService()
     expect(await repository.searchContent('')).toEqual([])
+  })
+
+  it('trims caches and fully releases repository state on dispose', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-dispose-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 2\n', 'utf8')
+
+      await repository.open(repositoryPath)
+      await repository.getComparison('value.ts')
+      expect(repository.getHeadCacheStatsForTests()).toMatchObject({
+        entries: 1,
+        workingEntries: 1,
+        objectReaderSpawns: 1
+      })
+
+      repository.trimCaches(0)
+      expect(repository.getHeadCacheStatsForTests()).toMatchObject({
+        entries: 0,
+        bytes: 0,
+        workingEntries: 0,
+        workingBytes: 0,
+        objectReaderSpawns: 1
+      })
+
+      await repository.getComparison('value.ts')
+      repository.dispose()
+      expect(repository.getSessionSnapshot()).toBeNull()
+      expect(repository.getHeadCacheStatsForTests()).toEqual({
+        entries: 0,
+        bytes: 0,
+        workingEntries: 0,
+        workingBytes: 0,
+        objectReaderSpawns: 0
+      })
+
+      expect((await repository.open(repositoryPath)).root).toBe(await realpath(repositoryPath))
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('deduplicates overlapping working-tree patches regardless of path order', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-patch-dedupe-'))
+    const repository = new RepositoryService()
+    const tracePath = join(repositoryPath, 'git-trace.json')
+    const previousTrace = process.env.GIT_TRACE2_EVENT
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 1\n', 'utf8')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 2\n', 'utf8')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 2\n', 'utf8')
+      await repository.open(repositoryPath)
+
+      process.env.GIT_TRACE2_EVENT = tracePath
+      const [first, second] = await Promise.all([
+        repository.getWorkingTreePatch(['a.ts', 'b.ts']),
+        repository.getWorkingTreePatch(['b.ts', 'a.ts'])
+      ])
+      expect(second).toEqual(first)
+
+      const events = (await readFile(tracePath, 'utf8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as { event?: string; argv?: string[] })
+      const diffStarts = events.filter((event) =>
+        event.event === 'start' && event.argv?.includes('diff') === true
+      )
+      expect(diffStarts).toHaveLength(2)
+    } finally {
+      if (previousTrace == null) delete process.env.GIT_TRACE2_EVENT
+      else process.env.GIT_TRACE2_EVENT = previousTrace
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('aborts a working-tree patch superseded by a different path set', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-patch-abort-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 1\n', 'utf8')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 2\n', 'utf8')
+      await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 2\n', 'utf8')
+      await repository.open(repositoryPath)
+
+      const superseded = repository.getWorkingTreePatch(['a.ts'])
+      const current = repository.getWorkingTreePatch(['b.ts'])
+      await expect(superseded).rejects.toThrow(COMMAND_ABORTED_MESSAGE)
+      expect((await current).patch).toContain('export const b = 2')
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('shares one remotes request for the life of an open repository', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-remotes-cache-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await runGit(repositoryPath, 'remote', 'add', 'origin', 'git@github.com:acme/example.git')
+      await repository.open(repositoryPath)
+
+      const [first, second] = await Promise.all([repository.getRemotes(), repository.getRemotes()])
+      expect(second).toBe(first)
+      expect(first).toEqual([{
+        name: 'origin',
+        fetchUrl: 'git@github.com:acme/example.git',
+        pushUrl: 'git@github.com:acme/example.git'
+      }])
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
   })
 
   it('loads status, file comparisons, and ripgrep content results', async () => {
@@ -1268,12 +1470,14 @@ describe('RepositoryService', () => {
 
       const repository = new RepositoryService()
       const snapshot = await repository.open(folderPath)
+      const refreshed = await repository.refresh()
       const comparison = await repository.getComparison('src/value.ts')
       const searchResults = await repository.searchContent('searchable')
 
       expect(snapshot.kind).toBe('folder')
       expect(snapshot.branch).toBeNull()
       expect(snapshot.paths).toEqual(['README.md', 'src/value.ts'])
+      expect(refreshed.paths).toBe(snapshot.paths)
       expect(snapshot.statuses).toEqual([])
       expect(comparison.mode).toBe('file')
       expect(comparison.oldFile).toBeNull()

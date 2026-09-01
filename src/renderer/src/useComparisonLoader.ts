@@ -80,6 +80,7 @@ export function useComparisonLoader({
     // return trip render the empty state for a whole round trip, because the path
     // had not changed and so nothing marked the view as loading.
     if (workspaceView === 'multi') {
+      if (lastPathRef.current !== selectedPath) setComparison(null)
       setLoading(false)
       return
     }

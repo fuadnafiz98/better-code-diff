@@ -4,6 +4,7 @@ import {
   useEffect,
   useEffectEvent,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -24,6 +25,7 @@ import type { TerminalSession } from '../../shared/contracts'
 import type { EditorThemeType } from './preferences'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import { clampTerminalHeight, resistedTerminalHeight, resizedTerminalHeight } from './terminalPanel'
+import { useDebouncedPersist } from './useDebouncedPersist'
 
 type TerminalStatus = 'starting' | 'running' | 'exited' | 'failed'
 
@@ -471,16 +473,20 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
     requireRepositoryApi().setTerminalVisibility(sessionId, open)
   }, [open, session])
 
-  useEffect(() => {
+  const settledSettings = useMemo(
+    () => ({ fontFamily, fontSize, lineHeight, scrollback, themeType }),
+    [fontFamily, fontSize, lineHeight, scrollback, themeType]
+  )
+  useDebouncedPersist(settledSettings, (settings) => {
     const terminal = terminalRef.current
     if (terminal == null) return
-    terminal.options.fontFamily = fontFamily
-    terminal.options.fontSize = fontSize
-    terminal.options.lineHeight = lineHeight
-    terminal.options.scrollback = scrollback
-    terminal.options.theme = themeFor(themeType)
+    terminal.options.fontFamily = settings.fontFamily
+    terminal.options.fontSize = settings.fontSize
+    terminal.options.lineHeight = settings.lineHeight
+    terminal.options.scrollback = settings.scrollback
+    terminal.options.theme = themeFor(settings.themeType)
     fitRef.current?.()
-  }, [fontFamily, fontSize, lineHeight, scrollback, themeType])
+  }, 150)
 
   useEffect(() => {
     if (!open) return
@@ -491,15 +497,6 @@ export const TerminalDock = forwardRef<TerminalDockHandle, TerminalDockProps>(fu
         status !== 'exited' && status !== 'failed') {
       void startTerminal(false)
     }
-    const firstFrame = window.requestAnimationFrame(() => {
-      const secondFrame = window.requestAnimationFrame(() => {
-        fitRef.current?.()
-        terminalRef.current?.focus()
-      })
-      resizeFrameRef.current = secondFrame
-    })
-    resizeFrameRef.current = firstFrame
-    return () => window.cancelAnimationFrame(resizeFrameRef.current)
   }, [open, startTerminal, status])
 
   const resizeWithKeyboard = (event: KeyboardEvent<HTMLDivElement>): void => {

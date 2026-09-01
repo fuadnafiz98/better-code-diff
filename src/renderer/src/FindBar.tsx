@@ -21,11 +21,15 @@ export function FindBar(): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [result, setResult] = useState<FindInPageResult | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const focusReturnRef = useRef<HTMLElement | null>(null)
 
   const close = (): void => {
     setOpen(false)
     setResult(null)
     void window.repository?.stopFindInPage()
+    const focusTarget = focusReturnRef.current
+    focusReturnRef.current = null
+    window.requestAnimationFrame(() => focusTarget?.focus())
   }
 
   const findNext = (forward: boolean): void => {
@@ -38,6 +42,11 @@ export function FindBar(): React.JSX.Element {
     const commandKey = event.metaKey || event.ctrlKey
     if (commandKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'f') {
       event.preventDefault()
+      if (!open) {
+        focusReturnRef.current = document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null
+      }
       setOpen(true)
       window.requestAnimationFrame(() => inputRef.current?.select())
       return

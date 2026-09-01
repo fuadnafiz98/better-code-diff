@@ -14,7 +14,7 @@ export const REDUCED_MOTION_CSS = `
   @media (prefers-reduced-motion: reduce) {
     button {
       transition-property: background-color, color, border-color !important;
-      transition-duration: 160ms !important;
+      transition-duration: var(--duration-base) !important;
       transition-timing-function: ease !important;
     }
 
@@ -55,12 +55,12 @@ export const VIEWER_BASE_CSS = `
      the slot. */
   button {
     touch-action: manipulation;
-    transition: scale 110ms var(--ease-out), background-color 100ms var(--ease-out);
+    transition: scale var(--duration-fast) var(--ease-out), background-color var(--duration-fast) var(--ease-out);
   }
 
   button:active:not(:disabled) {
     scale: 0.96;
-    transition-duration: 0s, 100ms;
+    transition-duration: 0s, var(--duration-fast);
   }
 
   [data-separator="line-info-basic"] {

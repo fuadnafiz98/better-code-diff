@@ -50,7 +50,7 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
   // Mapping pointer X straight onto the width snaps the divider to the pointer on
   // the first frame, by however far from its edge the 5px handle was grabbed.
   // Carrying the grab offset keeps the drag 1:1 from the moment it starts.
-  const dragRef = useRef<{ pointerX: number; width: number } | null>(null)
+  const dragRef = useRef<{ pointerX: number; width: number; workspaceWidth: number } | null>(null)
 
   // Past a bound the pointer keeps moving while a hard clamp freezes the divider,
   // which reads as the app hanging. Resistance during the drag says "nothing more
@@ -59,11 +59,15 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
     const workspace = getWorkspace(resizer)
     const drag = dragRef.current
     if (workspace == null || drag == null) return
-    const bounds = workspace.getBoundingClientRect()
     const raw = drag.width + (pointerX - drag.pointerX)
-    const maximum = clampSidebarWidth(MAX_SIDEBAR_WIDTH, bounds.width)
-    liveWidthRef.current = clampSidebarWidth(raw, bounds.width)
-    applyWidth(workspace, Math.round(withResistance(raw, MIN_SIDEBAR_WIDTH, maximum, bounds.width)))
+    const maximum = clampSidebarWidth(MAX_SIDEBAR_WIDTH, drag.workspaceWidth)
+    liveWidthRef.current = clampSidebarWidth(raw, drag.workspaceWidth)
+    applyWidth(workspace, Math.round(withResistance(
+      raw,
+      MIN_SIDEBAR_WIDTH,
+      maximum,
+      drag.workspaceWidth
+    )))
   }, [])
 
   const endDrag = useCallback((resizer: HTMLDivElement) => {
@@ -96,7 +100,11 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
         event.preventDefault()
         event.currentTarget.setPointerCapture(event.pointerId)
         workspace.dataset.resizing = 'sidebar'
-        dragRef.current = { pointerX: event.clientX, width: liveWidthRef.current }
+        dragRef.current = {
+          pointerX: event.clientX,
+          width: liveWidthRef.current,
+          workspaceWidth: workspace.getBoundingClientRect().width
+        }
       }}
       onPointerMove={(event) => {
         if (!event.currentTarget.hasPointerCapture(event.pointerId)) return

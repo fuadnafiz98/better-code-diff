@@ -1,7 +1,13 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 
 import type { ReviewThread } from './ReviewComments'
-import { parseStoredReviewThreads, reviewThreadStorageKey } from './reviewThreadStorage'
+import {
+  parseStoredReviewThreads,
+  reviewThreadStorageKey,
+  saveStoredReviewThreads
+} from './reviewThreadStorage'
+
+afterEach(() => localStorage.clear())
 
 const validThread = {
   id: 'thread-1',
@@ -59,5 +65,18 @@ describe('parseStoredReviewThreads', () => {
       'src/c.ts': 'not an array'
     })
     expect(parseStoredReviewThreads(stored)).toEqual({ 'src/a.ts': [validThread] })
+  })
+})
+
+describe('saveStoredReviewThreads', () => {
+  it('returns false when the payload exceeds the per-key cap', () => {
+    const threads = {
+      'src/a.ts': Array.from({ length: 4_000 }, (_unused, index) => ({
+        ...validThread,
+        id: `thread-${index}`,
+        body: 'x'.repeat(200)
+      }))
+    }
+    expect(saveStoredReviewThreads('better-code-diff:review-threads:/repo:test', threads)).toBe(false)
   })
 })

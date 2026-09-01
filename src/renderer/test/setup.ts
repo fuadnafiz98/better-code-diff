@@ -8,6 +8,7 @@ if (globalThis.document == null) {
     navigator: { configurable: true, value: browser.navigator },
     localStorage: { configurable: true, value: browser.localStorage },
     HTMLElement: { configurable: true, value: browser.HTMLElement },
+    HTMLDivElement: { configurable: true, value: browser.HTMLDivElement },
     HTMLTemplateElement: { configurable: true, value: browser.HTMLTemplateElement },
     HTMLDialogElement: { configurable: true, value: browser.HTMLDialogElement },
     Element: { configurable: true, value: browser.Element },

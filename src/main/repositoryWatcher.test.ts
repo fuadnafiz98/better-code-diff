@@ -48,6 +48,20 @@ describe('collectChangedPaths', () => {
     expect(collectChangedPaths(previous, next, new Set(['.git/HEAD'])))
       .toEqual(['src/existing.ts'])
   })
+
+  it('expands multiple changed directories over the combined path set', () => {
+    const previous = snapshot({
+      paths: ['docs/guide.md', 'src/existing.ts', 'unchanged.txt'],
+      statuses: []
+    })
+    const next = snapshot({
+      paths: ['docs/guide.md', 'src/new.ts', 'unchanged.txt'],
+      statuses: []
+    })
+
+    expect(collectChangedPaths(previous, next, new Set(['docs', 'src/'])))
+      .toEqual(['docs/guide.md', 'src/existing.ts', 'src/new.ts'])
+  })
 })
 
 describe('normalizeChangedPath', () => {

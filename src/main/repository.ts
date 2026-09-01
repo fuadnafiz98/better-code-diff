@@ -51,6 +51,7 @@ import {
 } from './gitCommands.js'
 import {
   buildPullRequestPatchFromFiles,
+  chunkPatchByFileCount,
   chunkPathspecs,
   createNewFilePatch,
   diffFilesFromChurn,
@@ -74,6 +75,7 @@ export {
 } from './gitCommands.js'
 export {
   buildPullRequestPatchFromFiles,
+  chunkPatchByFileCount,
   chunkPathspecs,
   createNewFilePatch,
   diffFilesFromChurn,
@@ -86,6 +88,21 @@ export {
   type DiffChurnEntry,
   type RawPullRequestFile
 } from './patchBuilder.js'
+
+export function pullRequestReviewReply(
+  review: PullRequestReview,
+  streamed: boolean
+): PullRequestReview {
+  return streamed
+    ? {
+        ...review,
+        files: [],
+        patch: '',
+        omittedFiles: [],
+        expectedFileCount: review.files.length
+      }
+    : review
+}
 
 const MAX_SEARCH_RESULTS = 200
 // The byte cap is the real guard: at a 2 MB per-entry ceiling 512 typical source
@@ -103,7 +120,7 @@ const PULL_REQUEST_LIST_LIMIT = 30
 // restart — can serve it from disk instead of repeating a download the code's own
 // comment measures at nearly two minutes for a 3000-file review. A force-push
 // produces a new oid and therefore a new key, so staleness is impossible.
-const PULL_REQUEST_CACHE_VERSION = 2
+const PULL_REQUEST_CACHE_VERSION = 3
 const MAX_PULL_REQUEST_CACHE_ENTRIES = 20
 const MAX_PULL_REQUEST_CACHE_BYTES = 200 * 1024 * 1024
 
@@ -113,6 +130,14 @@ export interface CachedPullRequestReview {
   files: PullRequestFile[]
   patch: string
   omittedFiles: OmittedDiffFile[]
+}
+
+interface CachedPullRequestReviewMetadata {
+  version: number
+  headRefOid: string
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+  patchLength: number
 }
 const MAX_REVIEW_BODY_LENGTH = 65_536
 // `gh search prs --json` only exposes these pull request fields; richer fields need `gh pr view`.
@@ -929,6 +954,7 @@ export interface ContentSearchMetrics {
 
 export class PullRequestReviewCache {
   #directory: string
+  #pendingPatchWrites = new Map<string, number>()
 
   constructor(directory: string) {
     this.#directory = directory
@@ -936,22 +962,43 @@ export class PullRequestReviewCache {
 
   // Hashed rather than composed from the slug: a pull request URL is remote input
   // and must never decide a path segment.
-  #entryPath(url: string, headRefOid: string): string {
-    return resolve(this.#directory, `${createCacheKey(url, headRefOid)}.json`)
+  #entryPaths(url: string, headRefOid: string): { metadata: string; patch: string } {
+    const base = resolve(this.#directory, createCacheKey(url, headRefOid))
+    return { metadata: `${base}.json`, patch: `${base}.patch` }
+  }
+
+  #beginPatchCommit(path: string): void {
+    this.#pendingPatchWrites.set(path, (this.#pendingPatchWrites.get(path) ?? 0) + 1)
+  }
+
+  #endPatchCommit(path: string): void {
+    const remaining = (this.#pendingPatchWrites.get(path) ?? 1) - 1
+    if (remaining === 0) this.#pendingPatchWrites.delete(path)
+    else this.#pendingPatchWrites.set(path, remaining)
   }
 
   async read(url: string, headRefOid: string): Promise<CachedPullRequestReview | null> {
     if (headRefOid === '') return null
     try {
-      const entry = JSON.parse(await readFile(this.#entryPath(url, headRefOid), 'utf8')) as CachedPullRequestReview
+      const paths = this.#entryPaths(url, headRefOid)
+      const entry = JSON.parse(await readFile(paths.metadata, 'utf8')) as CachedPullRequestReviewMetadata
       if (
         entry.version !== PULL_REQUEST_CACHE_VERSION
         || entry.headRefOid !== headRefOid
-        || typeof entry.patch !== 'string'
         || !Array.isArray(entry.files)
         || !Array.isArray(entry.omittedFiles)
+        || !Number.isSafeInteger(entry.patchLength)
+        || entry.patchLength < 0
       ) return null
-      return entry
+      const patch = await readFile(paths.patch, 'utf8')
+      if (patch.length !== entry.patchLength) return null
+      return {
+        version: entry.version,
+        headRefOid: entry.headRefOid,
+        files: entry.files,
+        patch,
+        omittedFiles: entry.omittedFiles
+      }
     } catch {
       // A missing, truncated or half-written entry is simply a miss.
       return null
@@ -960,36 +1007,60 @@ export class PullRequestReviewCache {
 
   async write(url: string, headRefOid: string, review: PullRequestReview): Promise<void> {
     if (headRefOid === '' || review.files.length === 0) return
-    const entry: CachedPullRequestReview = {
+    const entry: CachedPullRequestReviewMetadata = {
       version: PULL_REQUEST_CACHE_VERSION,
       headRefOid,
       files: review.files,
-      patch: review.patch,
-      omittedFiles: review.omittedFiles
+      omittedFiles: review.omittedFiles,
+      patchLength: review.patch.length
     }
+    const paths = this.#entryPaths(url, headRefOid)
+    const writeId = randomUUID()
+    const temporaryPatchPath = `${paths.patch}.${writeId}.tmp`
+    const temporaryMetadataPath = `${paths.metadata}.${writeId}.tmp`
+    let committingPatch = false
     try {
       await mkdir(this.#directory, { recursive: true })
-      const entryPath = this.#entryPath(url, headRefOid)
-      const temporaryPath = `${entryPath}.${randomUUID()}`
-      await writeFile(temporaryPath, JSON.stringify(entry), 'utf8')
-      await rename(temporaryPath, entryPath)
+      await writeFile(temporaryPatchPath, review.patch, 'utf8')
+      committingPatch = true
+      this.#beginPatchCommit(paths.patch)
+      await rename(temporaryPatchPath, paths.patch)
+      await writeFile(temporaryMetadataPath, JSON.stringify(entry), 'utf8')
+      await rename(temporaryMetadataPath, paths.metadata)
       await this.sweep()
     } catch {
       // The cache is an optimisation; failing to write it must never fail a review.
+      await Promise.all([
+        unlink(temporaryPatchPath).catch(() => {}),
+        unlink(temporaryMetadataPath).catch(() => {})
+      ])
+    } finally {
+      if (committingPatch) this.#endPatchCommit(paths.patch)
     }
   }
 
   async sweep(): Promise<void> {
     const names = await readdir(this.#directory).catch(() => [] as string[])
+    const metadataNames = new Set(names.filter((name) => name.endsWith('.json')))
     const entries = await mapWithConcurrency(
-      names.filter((name) => name.endsWith('.json')),
+      [...metadataNames],
       MAX_PATCH_COMMAND_CONCURRENCY,
       async (name) => {
-        const entryPath = resolve(this.#directory, name)
+        const metadataPath = resolve(this.#directory, name)
+        const patchPath = resolve(this.#directory, `${name.slice(0, -'.json'.length)}.patch`)
         try {
-          const metadata = await stat(entryPath)
-          return { path: entryPath, bytes: metadata.size, modifiedAt: metadata.mtimeMs }
+          const [metadata, patch] = await Promise.all([stat(metadataPath), stat(patchPath)])
+          return {
+            metadataPath,
+            patchPath,
+            bytes: metadata.size + patch.size,
+            modifiedAt: metadata.mtimeMs
+          }
         } catch {
+          await Promise.all([
+            unlink(metadataPath).catch(() => {}),
+            unlink(patchPath).catch(() => {})
+          ])
           return null
         }
       }
@@ -1001,7 +1072,20 @@ export class PullRequestReviewCache {
       bytes += entry.bytes
       return index >= MAX_PULL_REQUEST_CACHE_ENTRIES || bytes > MAX_PULL_REQUEST_CACHE_BYTES
     })
-    await Promise.all(expired.map((entry) => unlink(entry.path).catch(() => {})))
+    const orphanPatches: string[] = []
+    for (const name of names) {
+      if (!name.endsWith('.patch')) continue
+      if (metadataNames.has(`${name.slice(0, -'.patch'.length)}.json`)) continue
+      const path = resolve(this.#directory, name)
+      if (!this.#pendingPatchWrites.has(path)) orphanPatches.push(path)
+    }
+    await Promise.all([
+      ...orphanPatches.map((path) => unlink(path).catch(() => {})),
+      ...expired.flatMap((entry) => [
+        unlink(entry.metadataPath).catch(() => {}),
+        unlink(entry.patchPath).catch(() => {})
+      ])
+    ])
   }
 }
 
@@ -1009,15 +1093,19 @@ export class RepositoryService {
   #root: string | null = null
   #kind: RepositorySnapshot['kind'] = 'folder'
   #snapshot: RepositorySnapshot | null = null
+  #snapshotRevision = 0
   #pathSet = new Set<string>()
   #statusByPath = new Map<string, RepositoryStatusEntry>()
   #headFileCache = new Map<string, { promise: Promise<ReadVersion | null>; bytes: number }>()
   #headFileCacheBytes = 0
   #objectReader: GitObjectReader | null = null
   #trackedPathsCache: { buffer: Buffer; untrackedPaths: string[]; paths: string[] } | null = null
+  #folderPathsCache: { buffer: Buffer; paths: string[] } | null = null
   #workingFileCache = new Map<string, { read: WorkingFileRead; bytes: number }>()
   #workingFileCacheBytes = 0
   #pendingComparisons = new Map<string, Promise<FileComparison>>()
+  #pendingWorkingTreePatches = new Map<string, Promise<WorkingTreePatch>>()
+  #workingTreePatchAbort: AbortController | null = null
   #selfWriteObserver: ((path: string) => void) | null = null
   #checkFieldsSupported = true
   #reviewAborts = new Map<string, AbortController>()
@@ -1027,6 +1115,7 @@ export class RepositoryService {
   #githubViewerLogin: string | null = null
   // undefined means "not resolved yet"; null means "resolved, no GitHub remote".
   #githubSlug: string | null | undefined = undefined
+  #remotes: Promise<GitRemote[]> | undefined
   // A pull request's owner, repository, and number never change, so the identity
   // lookup is resolved once instead of on every conversation poll.
   #pullRequestIdentities = new Map<string, { owner: string; name: string; number: number }>()
@@ -1057,18 +1146,60 @@ export class RepositoryService {
     this.#contentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
   }
 
-  getHeadCacheStatsForTests(): { entries: number; bytes: number; objectReaderSpawns: number } {
+  getHeadCacheStatsForTests(): {
+    entries: number
+    bytes: number
+    workingEntries: number
+    workingBytes: number
+    objectReaderSpawns: number
+  } {
     return {
       entries: this.#headFileCache.size,
       bytes: this.#headFileCacheBytes,
+      workingEntries: this.#workingFileCache.size,
+      workingBytes: this.#workingFileCacheBytes,
       objectReaderSpawns: this.#objectReader?.spawnCountForTests ?? 0
     }
   }
 
   dispose(): void {
     this.#cancelActiveSearch()
+    this.cancelPullRequestReview()
+    this.#clearHeadFileCache()
+    this.#workingFileCache.clear()
+    this.#workingFileCacheBytes = 0
+    this.#pendingComparisons.clear()
+    this.#workingTreePatchAbort?.abort()
+    this.#workingTreePatchAbort = null
+    this.#pendingWorkingTreePatches.clear()
+    this.#pullRequestIdentities.clear()
+    this.#trackedPathsCache = null
+    this.#folderPathsCache = null
+    this.#githubSlug = undefined
+    this.#remotes = undefined
+    this.#githubViewerLogin = null
     this.#objectReader?.dispose()
     this.#objectReader = null
+    this.#root = null
+    this.#kind = 'folder'
+    this.#snapshot = null
+    this.#snapshotRevision = 0
+    this.#pathSet.clear()
+    this.#statusByPath.clear()
+  }
+
+  trimCaches(floorBytes: number): void {
+    const targetBytes = Math.max(0, Math.floor(floorBytes))
+    while (this.#headFileCacheBytes > targetBytes) {
+      const oldestObject = this.#headFileCache.keys().next().value
+      if (oldestObject == null) break
+      this.#deleteHeadCacheEntry(oldestObject)
+    }
+    while (this.#workingFileCacheBytes > targetBytes) {
+      const oldestPath = this.#workingFileCache.keys().next().value
+      if (oldestPath == null) break
+      this.#deleteWorkingCacheEntry(oldestPath)
+    }
   }
 
   async open(folderPath: string): Promise<RepositorySnapshot> {
@@ -1077,22 +1208,9 @@ export class RepositoryService {
       '-C', selectedRoot, 'rev-parse', '--show-toplevel'
     ]).catch(() => null)
 
+    this.dispose()
     this.#kind = rootResult == null ? 'folder' : 'git'
     this.#root = rootResult?.stdout.toString('utf8').trim() || selectedRoot
-    this.#githubViewerLogin = null
-    this.#githubSlug = undefined
-    this.#pullRequestIdentities.clear()
-    this.#cancelActiveSearch()
-    this.#clearHeadFileCache()
-    this.#objectReader?.dispose()
-    this.#objectReader = null
-    this.#trackedPathsCache = null
-    // A read still in flight would otherwise be served, keyed by path alone, into
-    // the repository that just replaced it.
-    this.#pendingComparisons.clear()
-    this.cancelPullRequestReview()
-    this.#workingFileCache.clear()
-    this.#workingFileCacheBytes = 0
     return this.refresh()
   }
 
@@ -1156,7 +1274,11 @@ export class RepositoryService {
       root,
       [1]
     )
-    const paths = prepareVisiblePaths(pathsResult.stdout)
+    const cached = this.#folderPathsCache
+    const paths = cached != null && cached.buffer.equals(pathsResult.stdout)
+      ? cached.paths
+      : prepareVisiblePaths(pathsResult.stdout)
+    if (paths !== cached?.paths) this.#folderPathsCache = { buffer: pathsResult.stdout, paths }
     const snapshot: RepositorySnapshot = {
       root,
       name: basename(root),
@@ -1263,6 +1385,7 @@ export class RepositoryService {
       await unlink(temporaryPath).catch(() => {})
     }
 
+    this.#snapshotRevision += 1
     this.#deleteWorkingCacheEntry(path)
     this.#pendingComparisons.delete(path)
     // A single-file write cannot change the tracked path list, the branch or HEAD,
@@ -1298,7 +1421,6 @@ export class RepositoryService {
 
   async getWorkingTreePatch(pathsValue: unknown): Promise<WorkingTreePatch> {
     this.#requireGitRepository()
-    const root = this.#requireRoot()
     if (!Array.isArray(pathsValue) || pathsValue.length > this.#pathSet.size) {
       throw new Error('Working tree patch paths must be a valid list.')
     }
@@ -1308,8 +1430,30 @@ export class RepositoryService {
       }
       return path
     })
+    // A watcher refresh changes the logical working tree even when the visible
+    // path list stays the same. Include its revision so a newer edit aborts an
+    // older same-path build instead of reusing a stale patch.
+    const key = `${this.#snapshotRevision}\0${[...paths].sort().join('\0')}`
+    const pending = this.#pendingWorkingTreePatches.get(key)
+    if (pending != null) return pending
+
+    this.#workingTreePatchAbort?.abort()
+    const abort = new AbortController()
+    this.#workingTreePatchAbort = abort
+    const patch = this.#loadWorkingTreePatch(paths, abort.signal).finally(() => {
+      if (this.#pendingWorkingTreePatches.get(key) === patch) {
+        this.#pendingWorkingTreePatches.delete(key)
+      }
+      if (this.#workingTreePatchAbort === abort) this.#workingTreePatchAbort = null
+    })
+    this.#pendingWorkingTreePatches.set(key, patch)
+    return patch
+  }
+
+  async #loadWorkingTreePatch(paths: string[], signal: AbortSignal): Promise<WorkingTreePatch> {
     if (paths.length === 0) return { patch: '', omittedFiles: [] }
 
+    const root = this.#requireRoot()
     const snapshot = this.#requireSnapshot()
     const untrackedPaths = paths.filter((path) => this.#statusByPath.get(path)?.status === 'untracked')
     const trackedPaths = snapshot.head == null
@@ -1324,7 +1468,7 @@ export class RepositoryService {
         chunkPathspecs(trackedPaths),
         MAX_PATCH_COMMAND_CONCURRENCY,
         async (chunk) => parseNumstat(
-          (await this.#git(['diff', '--numstat', '-z', '--find-renames', head, '--', ...chunk])).stdout
+          (await this.#git(['diff', '--numstat', '-z', '--find-renames', head, '--', ...chunk], signal)).stdout
         )
       )
       const oversized = selectOversizedDiffFiles(churnChunks.flat())
@@ -1335,7 +1479,7 @@ export class RepositoryService {
         chunkPathspecs(includedPaths),
         MAX_PATCH_COMMAND_CONCURRENCY,
         async (chunk) => (
-          await this.#git(['diff', '--no-color', '--find-renames', '--unified=3', head, '--', ...chunk])
+          await this.#git(['diff', '--no-color', '--find-renames', '--unified=3', head, '--', ...chunk], signal)
         ).stdout.toString('utf8')
       )
       for (const patch of patchChunks) {
@@ -1347,7 +1491,7 @@ export class RepositoryService {
     const newFilePatches = await mapWithConcurrency(
       newPaths,
       MAX_PATCH_COMMAND_CONCURRENCY,
-      (path) => this.#createNewFilePatch(path, root)
+      (path) => this.#createNewFilePatch(path, root, signal)
     )
     for (const newFilePatch of newFilePatches) {
       if (newFilePatch.patch !== '') patchParts.push(newFilePatch.patch)
@@ -1360,9 +1504,12 @@ export class RepositoryService {
 
   async #createNewFilePatch(
     path: string,
-    root: string
+    root: string,
+    signal: AbortSignal
   ): Promise<{ patch: string; omitted: OmittedDiffFile | null }> {
+    if (signal.aborted) throw new Error(COMMAND_ABORTED_MESSAGE)
     const version = await this.#readWorkingFile(path, root)
+    if (signal.aborted) throw new Error(COMMAND_ABORTED_MESSAGE)
     if (version == null) return { patch: '', omitted: null }
     if (version.oversized) {
       return { patch: '', omitted: { path, reason: 'too-large', additions: 0, deletions: 0 } }
@@ -1581,12 +1728,14 @@ export class RepositoryService {
     }
     const mergeFlag = strategy === 'merge' ? '--merge' : strategy === 'rebase' ? '--rebase' : '--squash'
     const ghExecutable = await getGhExecutable()
-    const remotes = parseRemotes(await this.#git(['remote', '-v']))
-    const detailsResult = await runGitHubReadCommand(
-      ghExecutable,
-      ['pr', 'view', normalizedSelector, '--json', 'number,url'],
-      this.#requireRoot()
-    )
+    const [remotes, detailsResult] = await Promise.all([
+      this.getRemotes(),
+      runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'view', normalizedSelector, '--json', 'number,url'],
+        this.#requireRoot()
+      )
+    ])
     const details = parseJson<{ number: number; url: string }>(detailsResult, 'GitHub CLI')
     validatePullRequestTarget(details.url, details.number)
     // Merging is irreversible, so it is refused unless the pull request lives in the open repository.
@@ -1602,12 +1751,14 @@ export class RepositoryService {
     const ghExecutable = await getGhExecutable()
     // Marking ready is a remote write, so it is held to the same rule as merging:
     // a pasted URL must name the repository that is open.
-    const remotes = parseRemotes(await this.#git(['remote', '-v']))
-    const detailsResult = await runGitHubReadCommand(
-      ghExecutable,
-      ['pr', 'view', normalizedSelector, '--json', 'number,url'],
-      this.#requireRoot()
-    )
+    const [remotes, detailsResult] = await Promise.all([
+      this.getRemotes(),
+      runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'view', normalizedSelector, '--json', 'number,url'],
+        this.#requireRoot()
+      )
+    ])
     const details = parseJson<{ number: number; url: string }>(detailsResult, 'GitHub CLI')
     validatePullRequestTarget(details.url, details.number)
     if (!pullRequestTargetsRemotes(remotes, details.url)) {
@@ -1620,7 +1771,7 @@ export class RepositoryService {
   // once instead of spawning `git remote -v` on every poll tick.
   async #getGitHubSlug(): Promise<string | null> {
     if (this.#githubSlug !== undefined) return this.#githubSlug
-    const remotes = parseRemotes(await this.#git(['remote', '-v']))
+    const remotes = await this.getRemotes()
     let slug: string | null = null
     for (const remote of remotes) {
       slug = githubRepoSlugFromRemoteUrl(remote.fetchUrl) ?? githubRepoSlugFromRemoteUrl(remote.pushUrl)
@@ -1687,10 +1838,10 @@ export class RepositoryService {
       })
     )
 
-    const [branchesResult, remoteBranchesResult, remotesResult, commitsResult, defaultBranchResult, aheadBehindResult, githubResult] = await Promise.all([
+    const [branchesResult, remoteBranchesResult, remotes, commitsResult, defaultBranchResult, aheadBehindResult, githubResult] = await Promise.all([
       branchesPromise,
       this.#git(['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/remotes']),
-      this.#git(['remote', '-v']),
+      this.getRemotes(),
       this.#gitAllowFailure(['log', '-100', '--format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1e']),
       this.#gitAllowFailure(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']),
       this.#gitAllowFailure(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}']),
@@ -1707,7 +1858,7 @@ export class RepositoryService {
     return {
       branches,
       remoteBranches: parseRemoteBranches(remoteBranchesResult),
-      remotes: parseRemotes(remotesResult),
+      remotes,
       commits: parseCommits(commitsResult),
       defaultBranch,
       ahead: counts.ahead,
@@ -1944,11 +2095,13 @@ export class RepositoryService {
     const collectedFiles: PullRequestFile[] = []
     const collectedOmitted: OmittedDiffFile[] = []
     const patchParts: string[] = []
+    let emittedPage = false
     const emit = (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }): void => {
       const limited = limitPatchFileSize(page.patch, MAX_DIFF_FILE_BYTES)
       patchParts.push(limited.patch)
       collectedFiles.push(...page.files)
       collectedOmitted.push(...page.omittedFiles, ...limited.omittedFiles)
+      emittedPage = true
       onProgress?.({
         kind: 'files',
         selector: normalizedSelector,
@@ -1970,8 +2123,12 @@ export class RepositoryService {
       patch: patchParts.join(''),
       omittedFiles: collectedOmitted
     }
+    const streamed = onProgress != null && emittedPage
+    if (streamed) {
+      onProgress({ kind: 'done', selector: normalizedSelector, fileCount: collectedFiles.length })
+    }
     if (!signal.aborted) await this.#pullRequestCache?.write(pullRequest.url, headRefOid, review)
-    return review
+    return pullRequestReviewReply(review, streamed)
   }
 
   /**
@@ -1992,11 +2149,13 @@ export class RepositoryService {
         signal
       )
       const patch = diffResult.stdout.toString('utf8')
-      emit({
-        patch,
-        files: filesFromPatch(patch),
-        omittedFiles: []
-      })
+      for (const page of chunkPatchByFileCount(patch)) {
+        emit({
+          patch: page,
+          files: filesFromPatch(page),
+          omittedFiles: []
+        })
+      }
       return
     } catch (error) {
       if (signal.aborted) return
@@ -2081,7 +2240,7 @@ export class RepositoryService {
     }
     validatePullRequestTarget(targetDetails.url, targetDetails.number)
     // A pasted URL would otherwise submit a review to a repository that is not the open one.
-    const remotes = parseRemotes(await this.#git(['remote', '-v']))
+    const remotes = await this.getRemotes()
     if (!pullRequestTargetsRemotes(remotes, targetDetails.url)) {
       throw new Error('This pull request belongs to a different repository than the open one.')
     }
@@ -2317,9 +2476,21 @@ export class RepositoryService {
     return this.#objectReader.read(object)
   }
 
-  async #git(args: readonly string[]): Promise<CommandResult> {
+  getRemotes(): Promise<GitRemote[]> {
+    this.#requireGitRepository()
+    if (this.#remotes === undefined) {
+      const request = this.#git(['remote', '-v']).then(parseRemotes)
+      this.#remotes = request
+      void request.catch(() => {
+        if (this.#remotes === request) this.#remotes = undefined
+      })
+    }
+    return this.#remotes
+  }
+
+  async #git(args: readonly string[], signal?: AbortSignal): Promise<CommandResult> {
     if (this.#kind !== 'git') throw new Error('The open folder is not a Git repository.')
-    return runCommand('git', ['-C', this.#requireRoot(), ...args])
+    return runCommand('git', ['-C', this.#requireRoot(), ...args], undefined, [], undefined, signal)
   }
 
   #requireGitRepository(): void {
@@ -2342,6 +2513,7 @@ export class RepositoryService {
     // steady-state tick hands back the same array `#visiblePaths` already reused.
     if (this.#snapshot?.paths !== snapshot.paths) this.#pathSet = new Set(snapshot.paths)
     this.#snapshot = snapshot
+    this.#snapshotRevision += 1
     this.#statusByPath = new Map(snapshot.statuses.map((status) => [status.path, status]))
   }
 

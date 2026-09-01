@@ -1,8 +1,13 @@
 import type { ReviewThread } from './ReviewComments'
 import type { ReviewCommentAnchor } from './reviewThreadAnchors'
+import {
+  browserBudgetStorage,
+  forgetStorageKey,
+  persistManagedValue
+} from './storageBudget'
 
 const STORAGE_PREFIX = 'better-code-diff:review-threads:'
-const MAX_SERIALIZED_BYTES = 512 * 1024
+const MAX_SERIALIZED_UTF16_UNITS = 512 * 1024
 
 export function reviewThreadStorageKey(root: string, reviewIdentity: string): string {
   return `${STORAGE_PREFIX}${root}:${reviewIdentity}`
@@ -81,16 +86,19 @@ export function loadStoredReviewThreads(key: string): Record<string, ReviewThrea
 export function saveStoredReviewThreads(
   key: string,
   threadsByPath: Readonly<Record<string, ReviewThread[]>>
-): void {
+): boolean {
+  const storage = browserBudgetStorage()
+  if (storage == null) return false
   try {
     if (Object.values(threadsByPath).every((threads) => threads.length === 0)) {
-      localStorage.removeItem(key)
-      return
+      storage.removeItem(key)
+      forgetStorageKey(storage, key)
+      return true
     }
     const serialized = JSON.stringify(threadsByPath)
-    if (serialized.length > MAX_SERIALIZED_BYTES) return
-    localStorage.setItem(key, serialized)
+    if (serialized.length > MAX_SERIALIZED_UTF16_UNITS) return false
+    return persistManagedValue(storage, key, serialized)
   } catch {
-    // Persistence is best effort; drafts still live in memory for the session.
+    return false
   }
 }

@@ -233,6 +233,10 @@ export interface PullRequestReview {
   pullRequest: PullRequestSummary
   files: PullRequestFile[]
   patch: string
+  /** Renderer-only streamed storage. IPC replies leave this field undefined. */
+  patchPages?: readonly string[]
+  /** Sum of the streamed page lengths without joining them. */
+  patchLength?: number
   omittedFiles: OmittedDiffFile[]
   // What GitHub says the pull request touches. A streamed review arrives a page at
   // a time, so `files` climbs towards this rather than matching it immediately.
@@ -258,6 +262,13 @@ export type PullRequestReviewProgress =
       patch: string
       files: PullRequestFile[]
       omittedFiles: OmittedDiffFile[]
+      root?: string
+      requestId?: string
+    }
+  | {
+      kind: 'done'
+      selector: string
+      fileCount: number
       root?: string
       requestId?: string
     }
@@ -503,13 +514,14 @@ export interface RepositoryApi {
   pushCurrentBranch(): Promise<GitIntegrationSnapshot>
   getPullRequestReview(root: string, selector: number | string, requestId: string): Promise<PullRequestReview>
   cancelPullRequestReview(root: string, requestId: string): void
-  getPullRequestConversation(selector: number | string): Promise<PullRequestConversation>
-  replyToPullRequestThread(threadId: string, body: string): Promise<void>
-  setPullRequestThreadResolved(threadId: string, resolved: boolean): Promise<void>
-  mergePullRequest(selector: number | string, strategy: PullRequestMergeStrategy): Promise<void>
-  markPullRequestReady(selector: number | string): Promise<void>
+  getPullRequestConversation(root: string, selector: number | string): Promise<PullRequestConversation>
+  replyToPullRequestThread(root: string, threadId: string, body: string): Promise<void>
+  setPullRequestThreadResolved(root: string, threadId: string, resolved: boolean): Promise<void>
+  mergePullRequest(root: string, selector: number | string, strategy: PullRequestMergeStrategy): Promise<void>
+  markPullRequestReady(root: string, selector: number | string): Promise<void>
   checkoutPullRequest(number: number): Promise<RepositorySnapshot>
   submitPullRequestReview(
+    root: string,
     selector: number | string,
     commitId: string,
     event: PullRequestReviewEvent,

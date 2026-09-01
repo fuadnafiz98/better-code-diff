@@ -37,7 +37,7 @@ export const SPLIT_DIFF_RESIZE_CSS = `
 
   [data-split-resize-handle] {
     position: absolute;
-    z-index: 10;
+    z-index: var(--z-sticky);
     top: anchor(--horus-split-pre top);
     bottom: anchor(--horus-split-pre bottom);
     left: calc(anchor(--horus-split-edge left) - 6px);
@@ -75,11 +75,12 @@ export const SPLIT_DIFF_RESIZE_CSS = `
     inset-inline-start: 1px;
     width: 10px;
     border: 1px solid var(--diffs-modified-base);
-    border-radius: 5px;
+    border-radius: var(--corner-inline);
   }
 `
 
 interface SplitResizeBinding {
+  syncHandle(percentage: number): void
   teardown(): void
 }
 
@@ -158,24 +159,39 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
   if (root == null) return
   const existingBinding = bindings.get(node)
   if (existingBinding != null) {
-    createHandle(root, percentage)
+    existingBinding.syncHandle(percentage)
     return
   }
   let activePointer: number | null = null
   let activeHandle: HTMLElement | null = null
+  let handle = createHandle(root, percentage)
+  let pendingFrame: number | null = null
+  let pendingValue = percentage
   // Where the drag started, so the divider follows the pointer instead of
   // teleporting under it: pressing 8px off centre used to snap the split there.
-  let dragOrigin: { clientX: number; percentage: number } | null = null
+  let dragOrigin: {
+    clientX: number
+    percentage: number
+    left: number
+    width: number
+  } | null = null
 
-  const updateFromPointer = (event: PointerEvent): void => {
-    const bounds = node.getBoundingClientRect()
-    if (dragOrigin == null || !Number.isFinite(bounds.width) || bounds.width <= 0) {
-      const raw = ((event.clientX - bounds.left) / bounds.width) * 100
-      applySplitPercentage(surface, raw, bounds.width)
-      return
+  const pointerValue = (event: PointerEvent): number => {
+    if (dragOrigin == null) return DEFAULT_SPLIT_PERCENT
+    if (!Number.isFinite(dragOrigin.width) || dragOrigin.width <= 0) {
+      return splitPercentageFromPointer(event.clientX, dragOrigin.left, dragOrigin.width)
     }
-    const delta = ((event.clientX - dragOrigin.clientX) / bounds.width) * 100
-    applySplitPercentage(surface, dragOrigin.percentage + delta, bounds.width)
+    const delta = ((event.clientX - dragOrigin.clientX) / dragOrigin.width) * 100
+    return dragOrigin.percentage + delta
+  }
+
+  const queuePointerValue = (event: PointerEvent): void => {
+    pendingValue = pointerValue(event)
+    if (pendingFrame != null) return
+    pendingFrame = window.requestAnimationFrame(() => {
+      pendingFrame = null
+      applySplitPercentage(surface, pendingValue, dragOrigin?.width)
+    })
   }
 
   const onPointerDown = (event: Event): void => {
@@ -184,12 +200,16 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
     if (handle == null || (pointerEvent.button !== 0 && pointerEvent.pointerType !== 'touch')) return
 
     event.preventDefault()
+    const bounds = node.getBoundingClientRect()
     activePointer = pointerEvent.pointerId
     activeHandle = handle
     dragOrigin = {
       clientX: pointerEvent.clientX,
-      percentage: splitPercentages.get(surface) ?? DEFAULT_SPLIT_PERCENT
+      percentage: splitPercentages.get(surface) ?? DEFAULT_SPLIT_PERCENT,
+      left: bounds.left,
+      width: bounds.width
     }
+    pendingValue = dragOrigin.percentage
     handle.dataset.dragging = ''
     handle.setPointerCapture?.(pointerEvent.pointerId)
   }
@@ -198,7 +218,7 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
     const pointerEvent = event as PointerEvent
     if (activePointer !== pointerEvent.pointerId) return
     event.preventDefault()
-    updateFromPointer(pointerEvent)
+    queuePointerValue(pointerEvent)
   }
 
   const finishPointer = (event: Event): void => {
@@ -208,7 +228,10 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
       activeHandle.releasePointerCapture(pointerEvent.pointerId)
     }
     activeHandle?.removeAttribute('data-dragging')
-    applySplitPercentage(surface, splitPercentages.get(surface) ?? DEFAULT_SPLIT_PERCENT)
+    if (event.type !== 'pointercancel') pendingValue = pointerValue(pointerEvent)
+    if (pendingFrame != null) window.cancelAnimationFrame(pendingFrame)
+    pendingFrame = null
+    applySplitPercentage(surface, pendingValue)
     activePointer = null
     activeHandle = null
     dragOrigin = null
@@ -245,7 +268,6 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
 
   const onSplitResize = (event: Event): void => {
     const nextPercentage = (event as CustomEvent<number>).detail
-    const handle = createHandle(root, nextPercentage)
     handle?.setAttribute('aria-valuenow', String(Math.round(nextPercentage)))
   }
 
@@ -256,10 +278,14 @@ export function syncSplitDiffResizeLifecycle(node: HTMLElement, phase: string): 
   root.addEventListener('dblclick', onDoubleClick, true)
   root.addEventListener('keydown', onKeyDown, true)
   surface.addEventListener('horus:split-resize', onSplitResize)
-  createHandle(root, percentage)
 
   bindings.set(node, {
+    syncHandle: (nextPercentage) => {
+      handle = createHandle(root, nextPercentage)
+      handle?.setAttribute('aria-valuenow', String(Math.round(nextPercentage)))
+    },
     teardown: () => {
+      if (pendingFrame != null) window.cancelAnimationFrame(pendingFrame)
       root.removeEventListener('pointerdown', onPointerDown, true)
       root.removeEventListener('pointermove', onPointerMove, true)
       root.removeEventListener('pointerup', finishPointer, true)

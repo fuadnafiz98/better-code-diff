@@ -19,6 +19,15 @@ test('blocks review submission until orphaned comments are handled', () => {
   expect(submit).not.toHaveBeenCalled()
 })
 
+test('shows a failed submit message while the bar is expanded', async () => {
+  render(<PullRequestReviewBar submitting={false} message="Nope" inlineCommentCount={0}
+    orphanedCommentCount={0} viewerCanSubmitDecision={true} onOpen={() => {}}
+    onSubmit={async () => false} />)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Review' }))
+  expect(screen.getByRole('alert').textContent).toBe('Nope')
+})
+
 test('keeps approval available when there are no orphans', () => {
   render(<PullRequestReviewBar submitting={false} message={null} inlineCommentCount={0}
     orphanedCommentCount={0} viewerCanSubmitDecision={true} onOpen={() => {}} onSubmit={async () => true} />)

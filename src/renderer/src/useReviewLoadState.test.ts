@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 
-import { canAppendPatch, FOLDER_REVIEW_PAGE_SIZE, reviewLoadStateFromExternalItems, reviewProgress, type ReviewProgressInput } from './useReviewLoadState'
+import {
+  canAppendPatch,
+  canAppendPatchPages,
+  FOLDER_REVIEW_PAGE_SIZE,
+  parsePatchPageBatch,
+  reviewLoadStateFromExternalItems,
+  reviewProgress,
+  type ReviewProgressInput
+} from './useReviewLoadState'
 
 const BASE: ReviewProgressInput = {
   streamingFileCount: null,
@@ -96,5 +104,41 @@ describe('canAppendPatch', () => {
 
   test('an empty cache always appends from zero', () => {
     expect(canAppendPatch({ key: 'pr-7', length: 0, tail: '' }, 'pr-7', 'anything')).toBe(true)
+  })
+})
+
+const patchPage = (path: string, before: string, after: string): string => [
+  `diff --git a/${path} b/${path}`,
+  'index 1111111..2222222 100644',
+  `--- a/${path}`,
+  `+++ b/${path}`,
+  '@@ -1 +1 @@',
+  `-${before}`,
+  `+${after}`,
+  ''
+].join('\n')
+
+describe('paged patch parsing', () => {
+  const firstPage = patchPage('a.ts', 'old-a', 'new-a')
+  const secondPage = patchPage('b.ts', 'old-b', 'new-b')
+
+  test('appends only new pages', () => {
+    const initial = parsePatchPageBatch({ key: '', pageRefs: [], items: [] }, 'pr-7', [firstPage])
+    const firstItem = initial.items[0]
+    const appended = parsePatchPageBatch(initial, 'pr-7', [firstPage, secondPage])
+
+    expect(canAppendPatchPages(initial, 'pr-7', [firstPage, secondPage])).toBe(true)
+    expect(appended.items.map((item) => item.id)).toEqual(['review:a.ts', 'review:b.ts'])
+    expect(appended.items[0]).toBe(firstItem)
+  })
+
+  test('a replaced page forces a full reparse', () => {
+    const initial = parsePatchPageBatch({ key: '', pageRefs: [], items: [] }, 'pr-7', [firstPage, secondPage])
+    const replacement = patchPage('c.ts', 'old-c', 'new-c')
+    const reparsed = parsePatchPageBatch(initial, 'pr-7', [replacement, secondPage])
+
+    expect(canAppendPatchPages(initial, 'pr-7', [replacement, secondPage])).toBe(false)
+    expect(reparsed.items.map((item) => item.id)).toEqual(['review:c.ts', 'review:b.ts'])
+    expect(reparsed.items).not.toContain(initial.items[0])
   })
 })

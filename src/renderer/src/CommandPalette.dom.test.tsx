@@ -35,4 +35,24 @@ describe('CommandPaletteController', () => {
     fireEvent.click(button)
     expect(onRunCommand).not.toHaveBeenCalled()
   })
+
+  test('clamps the active row when the result list shrinks', () => {
+    const recentFiles = Array.from({ length: 5 }, (_, index) => `src/file-${index}.ts`)
+    const ref = createRef<CommandPaletteHandle>()
+    render(<CommandPaletteController ref={ref} gitRepositoryOpen projectOpen
+      keybindings={DEFAULT_KEYBINDINGS} recentFiles={recentFiles}
+      onOpenPullRequest={() => {}} onOpenRepository={() => {}}
+      onOpenSettings={() => {}} onToggleTerminal={() => {}} onOpenFile={() => {}} />)
+
+    act(() => ref.current?.toggle())
+    const input = screen.getByPlaceholderText('Type a command, PR number, or GitHub URL')
+    for (let step = 0; step < 40; step += 1) {
+      fireEvent.keyDown(input, { key: 'ArrowDown' })
+    }
+    fireEvent.change(input, { target: { value: 'zzzz-no-palette-match' } })
+    expect(screen.getByText('No matching command')).toBeTruthy()
+    fireEvent.change(input, { target: { value: '' } })
+    const highlighted = document.querySelector('.primary-result')
+    expect(highlighted).toBeTruthy()
+  })
 })

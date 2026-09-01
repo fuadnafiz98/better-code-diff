@@ -1,5 +1,6 @@
 import { isAbsolute, join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import { readFile, writeFile } from 'node:fs/promises'
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme, screen, shell, type RenderProcessGoneDetails } from 'electron'
@@ -21,8 +22,16 @@ import { DEFAULT_SESSION_STATE, loadSessionState, saveSessionState, type Session
 import { TerminalService } from './terminalService.js'
 import { loadWindowState, saveWindowState } from './windowState.js'
 
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception in main:', error)
+})
+
 const PRODUCT_NAME = 'Horus'
 const startHidden = process.env.HORUS_BACKGROUND === '1'
+const remoteDebuggingPort = process.env.HORUS_REMOTE_DEBUGGING_PORT?.trim()
+if (remoteDebuggingPort != null && remoteDebuggingPort !== '') {
+  app.commandLine.appendSwitch('remote-debugging-port', remoteDebuggingPort)
+}
 const DEFAULT_WINDOW_WIDTH = 1_440
 const DEFAULT_WINDOW_HEIGHT = 920
 const GEOMETRY_SAVE_DEBOUNCE_MS = 500
@@ -311,9 +320,12 @@ function requireRepositoryRoot(value: unknown): string {
 async function findPullRequestRoot(pullRequestUrl: string): Promise<string | null> {
   const candidates = [...new Set([...repositorySessions.roots, ...sessionState.approvedRoots])]
   const matches = await Promise.all(candidates.map(async (root) => {
-    if (!existsSync(root)) return false
+    if (await stat(root).catch(() => null) == null) return false
     try {
-      const remotes = parseRemotes(await runCommand('git', ['-C', root, 'remote', '-v']))
+      const openRepository = repositorySessions.tryGet(root)
+      const remotes = openRepository == null
+        ? parseRemotes(await runCommand('git', ['-C', root, 'remote', '-v']))
+        : await openRepository.getRemotes()
       return pullRequestTargetsRemotes(remotes, pullRequestUrl)
     } catch {
       return false
@@ -418,8 +430,8 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.getPullRequestInbox, () => repositorySessions.requireActive().getPullRequestInbox())
   ipcMain.handle(IPC_CHANNELS.getClosedPullRequests, () => repositorySessions.requireActive().getClosedPullRequests())
   ipcMain.on(IPC_CHANNELS.cancelPullRequestReview, (_event, root: unknown, requestId: unknown) => {
-    if (typeof requestId !== 'string' || requestId === '') return
-    repositorySessions.require(requireRepositoryRoot(root)).cancelPullRequestReview(requestId)
+    if (typeof root !== 'string' || typeof requestId !== 'string' || requestId === '') return
+    repositorySessions.tryGet(root)?.cancelPullRequestReview(requestId)
   })
   ipcMain.handle(IPC_CHANNELS.getAgentModels, async () => {
     const snapshot = repositorySessions.getActiveSnapshot()
@@ -479,16 +491,16 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.killTerminal, (event, sessionId: unknown) => {
     terminalService.kill(event.sender.id, sessionId)
   })
-  ipcMain.handle(IPC_CHANNELS.getPullRequestConversation, (_event, selector: number | string) =>
-    repositorySessions.requireActive().getPullRequestConversation(selector))
-  ipcMain.handle(IPC_CHANNELS.replyToPullRequestThread, (_event, threadId: unknown, body: unknown) =>
-    repositorySessions.requireActive().replyToPullRequestThread(threadId, body))
-  ipcMain.handle(IPC_CHANNELS.setPullRequestThreadResolved, (_event, threadId: unknown, resolved: unknown) =>
-    repositorySessions.requireActive().setPullRequestThreadResolved(threadId, resolved))
-  ipcMain.handle(IPC_CHANNELS.mergePullRequest, (_event, selector: number | string, strategy: unknown) =>
-    repositorySessions.requireActive().mergePullRequest(selector, strategy))
-  ipcMain.handle(IPC_CHANNELS.markPullRequestReady, (_event, selector: number | string) =>
-    repositorySessions.requireActive().markPullRequestReady(selector))
+  ipcMain.handle(IPC_CHANNELS.getPullRequestConversation, (_event, root: unknown, selector: number | string) =>
+    repositorySessions.require(requireRepositoryRoot(root)).getPullRequestConversation(selector))
+  ipcMain.handle(IPC_CHANNELS.replyToPullRequestThread, (_event, root: unknown, threadId: unknown, body: unknown) =>
+    repositorySessions.require(requireRepositoryRoot(root)).replyToPullRequestThread(threadId, body))
+  ipcMain.handle(IPC_CHANNELS.setPullRequestThreadResolved, (_event, root: unknown, threadId: unknown, resolved: unknown) =>
+    repositorySessions.require(requireRepositoryRoot(root)).setPullRequestThreadResolved(threadId, resolved))
+  ipcMain.handle(IPC_CHANNELS.mergePullRequest, (_event, root: unknown, selector: number | string, strategy: unknown) =>
+    repositorySessions.require(requireRepositoryRoot(root)).mergePullRequest(selector, strategy))
+  ipcMain.handle(IPC_CHANNELS.markPullRequestReady, (_event, root: unknown, selector: number | string) =>
+    repositorySessions.require(requireRepositoryRoot(root)).markPullRequestReady(selector))
   ipcMain.handle(IPC_CHANNELS.switchBranch, (_event, name: string) =>
     repositorySessions.requireActive().switchBranch(name).then(trackSnapshot)
   )
@@ -523,8 +535,8 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.checkoutPullRequest, (_event, number: number) =>
     repositorySessions.requireActive().checkoutPullRequest(number).then(trackSnapshot)
   )
-  ipcMain.handle(IPC_CHANNELS.submitPullRequestReview, (_event, selector: number | string, commitId: unknown, reviewEvent: string, body: string, comments: unknown) =>
-    repositorySessions.requireActive().submitPullRequestReview(selector, commitId, reviewEvent, body, comments)
+  ipcMain.handle(IPC_CHANNELS.submitPullRequestReview, (_event, root: unknown, selector: number | string, commitId: unknown, reviewEvent: string, body: string, comments: unknown) =>
+    repositorySessions.require(requireRepositoryRoot(root)).submitPullRequestReview(selector, commitId, reviewEvent, body, comments)
   )
   ipcMain.handle(IPC_CHANNELS.getPerformanceMetrics, async (_event, detailed: unknown) => {
     const processMetrics = app.getAppMetrics()
@@ -561,7 +573,7 @@ function registerIpcHandlers(): void {
     if (sessionState.themeType === themeType && sessionState.restoreLastFolder === restoreLastFolder) return
     const repainting = sessionState.themeType !== themeType
     sessionState = { ...sessionState, themeType, restoreLastFolder }
-    saveSessionState(userDataPath, sessionState)
+    void saveSessionState(userDataPath, sessionState)
     // setBackgroundColor can flash on some macOS versions, so only on a real change.
     if (!repainting) return
     nativeTheme.themeSource = themeType
@@ -602,7 +614,7 @@ function rememberOpenedRoot(root: string, active = true): void {
   const lastRoot = active ? root : sessionState.lastRoot
   if (sessionState.lastRoot === lastRoot && approvedRoots === sessionState.approvedRoots) return
   sessionState = { ...sessionState, lastRoot, approvedRoots }
-  saveSessionState(userDataPath, sessionState)
+  void saveSessionState(userDataPath, sessionState)
 }
 
 function beginSessionRestore(): void {

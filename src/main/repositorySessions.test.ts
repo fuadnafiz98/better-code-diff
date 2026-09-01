@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from 'bun:test'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -85,10 +85,38 @@ describe('RepositorySessionRegistry', () => {
     registries.push(registry)
     const first = await registry.open(firstRoot)
     const second = await registry.open(secondRoot)
+    const firstRepository = registry.require(first.root)
+    const dispose = spyOn(firstRepository, 'dispose')
     registry.release(first.root)
 
     expect(registry.roots).toEqual([second.root])
     expect(registry.activeRoot).toBe(second.root)
-    expect(() => registry.require(first.root)).toThrow('no longer open')
+    expect(dispose).toHaveBeenCalledTimes(1)
+    expect(registry.tryGet(first.root)).toBeNull()
+    expect(() => registry.require(first.root)).toThrow('The repository tab is no longer open.')
+    expect(registry.require(second.root).getSessionSnapshot()?.root).toBe(second.root)
+  })
+
+  it('trims the caches of repositories that become inactive', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'horus-repository-trim-'))
+    directories.push(parent)
+    const firstRoot = join(parent, 'first')
+    const secondRoot = join(parent, 'second')
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)])
+    const contents = Buffer.alloc(1_500_000, 97)
+    const paths = Array.from({ length: 6 }, (_unused, index) => `large-${index}.txt`)
+    await Promise.all(paths.map((path) => writeFile(join(firstRoot, path), contents)))
+
+    const registry = new RepositorySessionRegistry(() => {}, () => {})
+    registries.push(registry)
+    const first = await registry.open(firstRoot)
+    const second = await registry.open(secondRoot, false)
+    const firstRepository = registry.require(first.root)
+    for (const path of paths) await firstRepository.getComparison(path)
+
+    expect(firstRepository.getHeadCacheStatsForTests().workingBytes).toBeGreaterThan(8 * 1024 * 1024)
+    registry.activate(second.root)
+
+    expect(firstRepository.getHeadCacheStatsForTests().workingBytes).toBeLessThanOrEqual(8 * 1024 * 1024)
   })
 })

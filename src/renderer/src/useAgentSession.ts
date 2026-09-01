@@ -148,6 +148,10 @@ export function useAgentSession({ context, subject }: AgentSessionOptions): Agen
   const [statuses, setStatuses] = useState<AgentProviderStatuses>(DEFAULT_STATUSES)
   const [loadingStatuses, setLoadingStatuses] = useState(false)
   const [authenticatingProvider, setAuthenticatingProvider] = useState<AgentProvider | null>(null)
+  const authenticatingProviderRef = useRef(authenticatingProvider)
+  useEffect(() => {
+    authenticatingProviderRef.current = authenticatingProvider
+  }, [authenticatingProvider])
   const [statusError, setStatusError] = useState<string | null>(null)
   const [attachmentsBySubject, setAttachmentsBySubject] = useState<
     Readonly<Record<string, readonly AgentAttachment[]>>
@@ -201,13 +205,14 @@ export function useAgentSession({ context, subject }: AgentSessionOptions): Agen
     void repository.getAgentStatuses(only ?? undefined)
       .then((next) => {
         setStatuses(next)
-        if (authenticatingProvider != null && next[authenticatingProvider].authenticated) {
+        const authenticating = authenticatingProviderRef.current
+        if (authenticating != null && next[authenticating].authenticated) {
           setAuthenticatingProvider(null)
         }
       })
       .catch((error: unknown) => setStatusError(getErrorMessage(error)))
       .finally(() => setLoadingStatuses(false))
-  }, [authenticatingProvider])
+  }, [])
 
   const refreshStatuses = useCallback(() => { probeStatuses(null) }, [probeStatuses])
 
@@ -303,12 +308,13 @@ export function useAgentSession({ context, subject }: AgentSessionOptions): Agen
     contextRef.current = context
   }, [context])
 
+  const askAnswer = answer.ask
   const ask = useCallback((prompt: string) => {
     if (subject == null || subjectKey == null) {
       setStatusError('Open a repository tab before asking the agent.')
       return
     }
-    answer.ask({
+    askAnswer({
       provider,
       model,
       effort,
@@ -321,12 +327,12 @@ export function useAgentSession({ context, subject }: AgentSessionOptions): Agen
       sessionScope: subjectKey
     })
     setAttachmentsBySubject((current) => ({ ...current, [subjectKey]: NO_ATTACHMENTS }))
-  }, [accessMode, answer, attachments, effort, model, provider, subject, subjectKey])
+  }, [accessMode, askAnswer, attachments, effort, model, provider, subject, subjectKey])
 
   const toggle = useCallback(() => setOpen((current) => !current), [])
   const close = useCallback(() => setOpen(false), [])
 
-  return {
+  return useMemo(() => ({
     answer,
     open,
     provider,
@@ -353,5 +359,30 @@ export function useAgentSession({ context, subject }: AgentSessionOptions): Agen
     ask,
     toggle,
     close
-  }
+  }), [
+    accessMode,
+    accessModeLocked,
+    answer,
+    ask,
+    attach,
+    attachments,
+    authenticatingProvider,
+    close,
+    effort,
+    efforts,
+    loadingModels,
+    loadingStatuses,
+    login,
+    model,
+    models,
+    open,
+    provider,
+    refreshStatuses,
+    removeAttachment,
+    setEffort,
+    setModel,
+    statusError,
+    statuses,
+    toggle
+  ])
 }

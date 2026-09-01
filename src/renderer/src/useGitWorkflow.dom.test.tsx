@@ -18,10 +18,15 @@ afterEach(() => {
 function deferred<Value>(): {
   promise: Promise<Value>
   resolve(value: Value): void
+  reject(error: unknown): void
 } {
   let resolve!: (value: Value) => void
-  const promise = new Promise<Value>((settle) => { resolve = settle })
-  return { promise, resolve }
+  let reject!: (error: unknown) => void
+  const promise = new Promise<Value>((settle, fail) => {
+    resolve = settle
+    reject = fail
+  })
+  return { promise, resolve, reject }
 }
 
 function review(number: number): PullRequestReview {
@@ -114,6 +119,46 @@ test('simultaneous pull-request requests keep independent tabs', async () => {
     && world.review.kind === 'github'
     && world.review.pullRequest.number === 2)).toBe(true)
   expect(result.current.actionKey).toBeNull()
+})
+
+test('a rejected load for a background world does not raise the global error', async () => {
+  const pending = deferred<PullRequestReview>()
+  const errors: Array<string | null> = []
+  const onError = (message: string | null): void => { errors.push(message) }
+  let progressListener: ((progress: PullRequestReviewProgress) => void) | null = null
+  let requestId = ''
+  window.repository = {
+    getPullRequestReview: (_root: string, _selector: number | string, nextRequestId: string) => {
+      requestId = nextRequestId
+      return pending.promise
+    },
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: (listener: (progress: PullRequestReviewProgress) => void) => {
+      progressListener = listener
+      return () => { progressListener = null }
+    }
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow({ ...workflowOptions(), onError }))
+  const metadataReview = { ...review(9), files: [], patch: '' }
+
+  let request!: Promise<void>
+  act(() => { request = result.current.openPullRequestReview(9) })
+  act(() => progressListener?.({
+    kind: 'metadata', selector: '9', review: metadataReview, root: '/repo', requestId
+  }))
+  await waitFor(() => expect(result.current.activeWorld?.source).toBe('patch'))
+  const patchWorldId = result.current.activeWorld?.worldId
+  const deskWorldId = result.current.worlds.find((world) => world.source === 'desk')?.worldId
+  await act(() => result.current.focusWorld(deskWorldId!))
+
+  pending.reject(new Error('boom'))
+  await act(() => request)
+
+  expect(errors.some((message) => message != null)).toBe(false)
+  const patchWorld = result.current.worlds.find((world) => world.worldId === patchWorldId)
+  expect(patchWorld?.source === 'patch' ? patchWorld.loadStatus : null).toBe('error')
+  expect(patchWorld?.source === 'patch' ? patchWorld.errorMessage : null).toBe('boom')
 })
 
 test('a PR stream keeps updating its world after the user returns to Desk', async () => {
@@ -244,6 +289,14 @@ test('a successful submitted review advances the checkpoint', async () => {
 
   expect(submitted).toBe(true)
   expect(submitPullRequestReview).toHaveBeenCalledTimes(1)
+  expect(submitPullRequestReview).toHaveBeenCalledWith(
+    repositorySnapshot.root,
+    '5',
+    '5'.repeat(40),
+    'comment',
+    'Looks good.',
+    []
+  )
   expect(result.current.reviewCheckpoint?.headOid).toBe('5'.repeat(40))
   expect(result.current.submissionMessage).toBe('Review submitted to GitHub. Checkpoint advanced.')
 })

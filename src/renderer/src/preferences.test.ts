@@ -1,9 +1,30 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 
 import { DEFAULT_KEYBINDINGS } from './keybindings'
-import { getEditorThemeType, KEYBINDINGS_VERSION, loadKeybindings, loadPreferences } from './preferences'
+import {
+  EDITOR_THEMES,
+  getEditorThemeType,
+  KEYBINDINGS_VERSION,
+  loadKeybindings,
+  loadPreferences
+} from './preferences'
 
 afterEach(() => localStorage.clear())
+
+describe('EDITOR_THEMES', () => {
+  it('matches the Shiki allowlist shipped by the renderer build', () => {
+    expect(Object.keys(EDITOR_THEMES).sort()).toEqual([
+      'github-dark',
+      'github-light',
+      'light-plus',
+      'pierre-dark',
+      'pierre-dark-soft',
+      'pierre-light',
+      'vitesse-dark',
+      'vitesse-light'
+    ])
+  })
+})
 
 describe('getEditorThemeType', () => {
   it('classifies bundled light and dark themes', () => {

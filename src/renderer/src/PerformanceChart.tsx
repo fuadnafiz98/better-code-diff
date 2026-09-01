@@ -39,16 +39,30 @@ function sampleValue(sample: MemorySample, metric: PerformanceChartMetric, secon
 
 interface PerformanceChartProps {
   history: readonly MemorySample[]
+  historyVersion?: number
 }
 
-export const PerformanceChart = memo(function PerformanceChart({ history }: PerformanceChartProps): React.JSX.Element {
+export const PerformanceChart = memo(function PerformanceChart({
+  history,
+  historyVersion = 0
+}: PerformanceChartProps): React.JSX.Element {
   const [metric, setMetric] = useState<PerformanceChartMetric>('memory')
   const [metricInput, setMetricInput] = useState<'keyboard' | 'pointer'>('pointer')
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
   const [keyboardExploring, setKeyboardExploring] = useState(false)
   const gradientId = useId().replaceAll(':', '')
-  const trendPerHour = useMemo(() => memoryTrendPerHour(history), [history])
-  const chart = useMemo(() => buildPerformanceChart(history, metric, CHART_WIDTH, CHART_HEIGHT), [history, metric])
+  const historySnapshot = useMemo(
+    () => ({ history, version: historyVersion }),
+    [history, historyVersion]
+  )
+  const trendPerHour = useMemo(
+    () => memoryTrendPerHour(historySnapshot.history),
+    [historySnapshot]
+  )
+  const chart = useMemo(
+    () => buildPerformanceChart(historySnapshot.history, metric, CHART_WIDTH, CHART_HEIGHT),
+    [historySnapshot, metric]
+  )
   const firstSample = history[0]
   const latestSample = history[history.length - 1]
   const inspectedSample = activeIndex == null ? null : history[activeIndex] ?? null

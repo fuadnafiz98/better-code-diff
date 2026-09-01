@@ -35,7 +35,7 @@ const CODE_ROWS: readonly SkeletonRow[] = [
 const SKELETON_CSS = `
 .workspace-skeleton { min-width: 0; min-height: 0; }
 .workspace-skeleton-rows { flex: 1; min-height: 0; overflow: hidden; padding: 6px 12px; display: flex; flex-direction: column; gap: 10px; }
-.workspace-skeleton-code { padding: 14px 18px; gap: 9px; }
+.workspace-skeleton-code { padding: 16px var(--gutter); gap: 9px; }
 .workspace-skeleton-bar { height: 9px; flex: none; border-radius: 4px; corner-shape: squircle; background: var(--control-fill); position: relative; overflow: hidden; }
 .workspace-skeleton-toolbar { display: flex; flex-direction: column; justify-content: center; gap: 6px; }
 .workspace-skeleton-toolbar .workspace-skeleton-bar:first-child { width: 168px; }
@@ -48,7 +48,7 @@ const SKELETON_CSS = `
 }
 @keyframes workspace-skeleton-sweep { to { transform: translateX(100%); } }
 @media (prefers-reduced-motion: reduce) {
-  .workspace-skeleton-bar::after { animation: workspace-skeleton-fade 1600ms ease-in-out infinite; transform: none; }
+  .workspace-skeleton-bar::after { animation: workspace-skeleton-fade 1600ms ease-in-out infinite; animation-duration: 1600ms !important; animation-iteration-count: infinite !important; transform: none; }
   @keyframes workspace-skeleton-fade { 0%, 100% { opacity: 0; } 50% { opacity: 0.5; } }
 }
 `
@@ -81,7 +81,15 @@ export function WorkspaceSkeleton(): React.JSX.Element {
     <>
       <style href="workspace-skeleton" precedence="medium">{SKELETON_CSS}</style>
       <aside className="sidebar workspace-skeleton" aria-hidden="true">
-        <div className="sidebar-heading"><strong>Files</strong></div>
+        <div className="sidebar-heading">
+          <strong>Explorer</strong>
+          <div className="sidebar-heading-actions">
+            <div className="workspace-skeleton-bar" style={{ width: 28, height: 10 }} />
+            <div className="workspace-skeleton-bar" style={{ width: 30, height: 30, borderRadius: 9 }} />
+            <div className="workspace-skeleton-bar" style={{ width: 30, height: 30, borderRadius: 9 }} />
+            <div className="workspace-skeleton-bar" style={{ width: 30, height: 30, borderRadius: 9 }} />
+          </div>
+        </div>
         <div className="workspace-skeleton-rows">
           {TREE_ROWS.map((row) => (
             <SkeletonBar key={row.id} width={row.width} indent={row.depth * 14} />
@@ -89,12 +97,13 @@ export function WorkspaceSkeleton(): React.JSX.Element {
         </div>
       </aside>
       <div className="sidebar-resizer" aria-hidden="true" />
-      <section className="diff-panel diff-mode workspace-skeleton">
+      <section className="diff-panel workspace-skeleton">
         <div className="diff-toolbar" aria-hidden="true">
           <div className="diff-toolbar-context workspace-skeleton-toolbar">
             <div className="workspace-skeleton-bar" />
             <div className="workspace-skeleton-bar" />
           </div>
+          <div className="diff-controls" style={{ minInlineSize: 336 }} />
         </div>
         <div className="workspace-skeleton-rows workspace-skeleton-code" role="status">
           <span className="sr-only">Preparing workspace…</span>

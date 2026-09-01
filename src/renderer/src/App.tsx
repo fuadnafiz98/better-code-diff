@@ -28,10 +28,7 @@ import {
   type DiffStyle,
   type WorkspaceView
 } from './AppView'
-import {
-  CommandPaletteController,
-  type CommandPaletteHandle
-} from './CommandPalette'
+import type { CommandPaletteHandle } from './CommandPalette'
 import { commandFromEvent, formatTerminalToggleShortcut, type AppCommand } from './keybindings'
 import {
   CODE_FONTS,
@@ -76,6 +73,7 @@ import {
   subscribeWorkspaceRoot
 } from './workspaceBoot'
 import { markRendererStartup } from './startupMetrics'
+import { useDebouncedPersist } from './useDebouncedPersist'
 
 const TerminalDock = lazy(() => import('./TerminalDock'))
 const RepositoryPanel = lazy(async () => ({
@@ -84,6 +82,55 @@ const RepositoryPanel = lazy(async () => ({
 const SettingsPage = lazy(async () => ({
   default: (await import('./SettingsPage')).SettingsPage
 }))
+let commandPaletteModule: Promise<typeof import('./CommandPalette')> | null = null
+function preloadCommandPalette(): Promise<typeof import('./CommandPalette')> {
+  commandPaletteModule ??= import('./CommandPalette')
+  return commandPaletteModule
+}
+const CommandPaletteController = lazy(async () => ({
+  default: (await preloadCommandPalette()).CommandPaletteController
+}))
+
+function useCommandPaletteLoader(onError: (message: string) => void): {
+  controllerRef: RefObject<CommandPaletteHandle | null>
+  mounted: boolean
+  attach(handle: CommandPaletteHandle | null): void
+  close(): void
+  toggle(): void
+} {
+  const controllerRef = useRef<CommandPaletteHandle>(null)
+  const [mounted, setMounted] = useState(false)
+  const openOnMountRef = useRef(false)
+  const attach = useCallback((handle: CommandPaletteHandle | null) => {
+    controllerRef.current = handle
+    if (handle == null || !openOnMountRef.current) return
+    openOnMountRef.current = false
+    handle.toggle()
+  }, [])
+  const close = useCallback(() => {
+    openOnMountRef.current = false
+    controllerRef.current?.close()
+  }, [])
+  const toggle = useCallback(() => {
+    const controller = controllerRef.current
+    if (controller != null) {
+      controller.toggle()
+      return
+    }
+    openOnMountRef.current = true
+    setMounted(true)
+    void preloadCommandPalette().catch((error: unknown) => {
+      openOnMountRef.current = false
+      onError(getErrorMessage(error))
+    })
+  }, [onError])
+  return useMemo(
+    () => ({ controllerRef, mounted, attach, close, toggle }),
+    [attach, close, mounted, toggle]
+  )
+}
+
+const NO_PATHS: readonly string[] = Object.freeze([])
 // The titlebar reserves 92px for the traffic lights; in fullscreen there are
 // none, so the CSS collapses the reserve off this attribute.
 function useFullscreenSync(): void {
@@ -139,12 +186,16 @@ function useAppShortcuts({
   settingsOpen
 }: AppShortcutOptions): void {
   const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
+    if (event.key === 'Meta') void preloadCommandPalette()
+    // Leaf surfaces (comment drafts, find, open dialogs) preventDefault first.
+    // Settings is a modal <dialog>: Escape reaches it as `cancel`, which runs its
+    // own 160ms exit. Closing it from here would skip that.
+    if (event.defaultPrevented || event.repeat) return
+    if (event.key === 'Escape' && document.querySelector('dialog[open]') != null) return
     if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
       event.preventDefault()
       return
     }
-    // Settings is a modal <dialog>: Escape reaches it as `cancel`, which runs its
-    // own 140ms exit. Closing it from here would skip that.
     if (event.key === 'Escape' && settingsOpen) return
     if (event.key === 'Escape' && gitWorkflow.panelOpen) {
       event.preventDefault()
@@ -156,7 +207,6 @@ function useAppShortcuts({
       search.dismiss()
       return
     }
-    if (event.defaultPrevented || event.repeat) return
     if (!settingsOpen && event.metaKey && !event.ctrlKey && !event.altKey) {
       if (!event.shiftKey && event.key.toLowerCase() === 't') {
         event.preventDefault()
@@ -218,6 +268,8 @@ interface AppLayoutProps {
   recentFolders: RecentFolder[]
   search: RepositorySearchController
   commandPaletteRef: React.RefObject<CommandPaletteHandle | null>
+  commandPaletteMounted: boolean
+  setCommandPaletteHandle(handle: CommandPaletteHandle | null): void
   terminalDockRef: React.RefObject<TerminalDockHandle | null>
   gitWorkflow: ReturnType<typeof useGitWorkflow>
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>
@@ -260,15 +312,16 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
   }, [branches])
   // Both surfaces have a closed-state rule in styles.css that only bites while
   // the node is still in the tree, so presence holds them for the exit.
-  const reviewLoadingPresence = usePresence(gitWorkflow.actionKey?.startsWith('review:') ?? false, 140)
+  const reviewLoadingPresence = usePresence(gitWorkflow.actionKey?.startsWith('review:') ?? false, 160)
   const repositoryPanelPresence = usePresence(gitWorkflow.panelOpen, 220)
   // The message is null the moment the banner is dismissed; the exit still needs text.
-  const errorPresence = useRetainedPresence(view.error, 140)
+  const errorPresence = useRetainedPresence(view.error, 160)
   // Content hits for the file being edited become inline hint markers.
   const contentSearch = useMemo(
     () => ({ query: search.query, results: search.contentResults }),
     [search.contentResults, search.query]
   )
+  const workspaceContentSearch = view.workspaceView === 'file' ? contentSearch : undefined
   // Keep the tab/review summary stable while answer tokens stream.
   const agentSubject = useMemo(
     () => agentSubjectForWorld(gitWorkflow.activeWorld),
@@ -333,14 +386,16 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
         onCheckout={(pullRequest) => void gitWorkflow.checkoutPullRequest(pullRequest)} />
     </Suspense> : null}
 
-    <CommandPaletteController ref={view.commandPaletteRef} gitRepositoryOpen={view.snapshot?.kind === 'git'}
-      projectOpen={view.snapshot != null}
-      keybindings={view.preferences.keybindings} onOpenPullRequest={view.openPullRequestFromPalette}
-      onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettings}
-      onToggleTerminal={view.toggleTerminal}
-      onRunCommand={view.runCommand}
-      recentFiles={view.recentFiles} onOpenFile={view.setSelectedPath}
-      branches={paletteBranches} onSwitchBranch={(branch) => void gitWorkflow.switchBranch(branch)} />
+    {view.commandPaletteMounted ? <Suspense fallback={null}>
+      <CommandPaletteController ref={view.setCommandPaletteHandle}
+        gitRepositoryOpen={view.snapshot?.kind === 'git'} projectOpen={view.snapshot != null}
+        keybindings={view.preferences.keybindings} onOpenPullRequest={view.openPullRequestFromPalette}
+        onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettings}
+        onToggleTerminal={view.toggleTerminal}
+        onRunCommand={view.runCommand}
+        recentFiles={view.recentFiles} onOpenFile={view.setSelectedPath}
+        branches={paletteBranches} onSwitchBranch={(branch) => void gitWorkflow.switchBranch(branch)} />
+    </Suspense> : null}
     {view.settingsOpen ? <Suspense fallback={null}>
       <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
         onClose={() => view.setSettingsOpen(false)} />
@@ -361,7 +416,7 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
       <div className="workspace-host" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
         <div className={`workspace ${view.sidebarVisible ? '' : 'sidebar-hidden'} ${agent.open ? 'agent-open' : ''}`}>
           {WorkspaceRoot == null ? <WorkspaceSkeleton /> : (
-              <WorkspaceRoot workspaceKey={`${view.snapshot.root}:${gitWorkflow.activeWorld?.worldId ?? 'desk'}`}
+              <WorkspaceRoot workspaceKey={view.snapshot.root}
                 theme={view.preferences.editorTheme}
                 snapshot={view.snapshot} selectedPath={view.selectedPath} comparison={view.comparison}
                 loadingDiff={view.loadingDiff} diffStyle={view.diffStyle} workspaceView={view.workspaceView}
@@ -376,20 +431,24 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
                 checkpointRemovedFileCount={gitWorkflow.checkpointRemovedFileCount}
                 reviewReady={gitWorkflow.reviewReady}
                 sinceRemovedPaths={gitWorkflow.activeWorld?.source === 'since'
-                  ? gitWorkflow.activeWorld.removedPaths : []}
+                  ? gitWorkflow.activeWorld.removedPaths : NO_PATHS}
                 sinceUncertainPaths={gitWorkflow.activeWorld?.source === 'since'
-                  ? gitWorkflow.activeWorld.uncertainPaths : []}
+                  ? gitWorkflow.activeWorld.uncertainPaths : NO_PATHS}
                 collisionPaths={collisionPaths}
                 initialReviewScrollTop={gitWorkflow.initialReviewScrollTop}
                 onReviewScrollPositionChange={gitWorkflow.rememberReviewScroll}
-                contentSearch={contentSearch}
+                contentSearch={workspaceContentSearch}
                 onSelectPath={view.setSelectedPath} onDiffStyleChange={view.setDiffStyle}
                 onWorkspaceViewChange={view.setWorkspaceView} onClosePullRequestReview={gitWorkflow.closeReview}
                 onSetReviewCheckpoint={gitWorkflow.setReviewCheckpoint}
                 onOpenSinceReview={gitWorkflow.openSinceReview}
                 submittingPullRequestReview={gitWorkflow.submittingReview} pullRequestReviewMessage={gitWorkflow.submissionMessage}
                 onSubmitPullRequestReview={gitWorkflow.submitReview} onComparisonSaved={view.onComparisonSaved}
-                onError={view.setError} />
+                onError={view.setError}
+                patchLoadError={gitWorkflow.activeWorld?.source === 'patch'
+                  ? gitWorkflow.activeWorld.errorMessage
+                  : null}
+                reviewWorldId={gitWorkflow.activeWorld?.worldId ?? `desk:${view.snapshot.root}`} />
           )}
           <AgentDock session={agent}
             confirm={view.confirm}
@@ -476,14 +535,14 @@ export function App({
     getLoadedWorkspaceRoot,
     getLoadedWorkspaceRoot
   )
-  const commandPaletteRef = useRef<CommandPaletteHandle>(null)
+  const commandPalette = useCommandPaletteLoader(setError)
   const [recentFiles, setRecentFiles] = useState<readonly string[]>([])
   const confirmation = useConfirm()
   const search = useRepositorySearch(snapshot, setSelectedPath, setError)
   const closeOverlays = useCallback(() => {
-    commandPaletteRef.current?.close()
+    commandPalette.close()
     setSettingsOpen(false)
-  }, [])
+  }, [commandPalette])
   const terminal = useTerminalVisibility({
     enabled: snapshot != null,
     keybindings: preferences.keybindings,
@@ -544,6 +603,10 @@ export function App({
     onWorkspaceViewChange: changeWorkspaceView,
     confirm: confirmation.confirm
   })
+  const openPullRequestReview = gitWorkflow.openPullRequestReview
+  const openWorkingTree = gitWorkflow.openWorkingTree
+  const reviewWorlds = gitWorkflow.worlds
+  const syncRepositorySnapshot = gitWorkflow.syncRepositorySnapshot
 
   const comparisonLoader = useComparisonLoader({
     snapshot,
@@ -554,10 +617,13 @@ export function App({
   })
 
   const openPullRequestFromPalette = useCallback((selector: number | string) => {
-    void gitWorkflow.openPullRequestReview(selector)
-  }, [gitWorkflow.openPullRequestReview])
+    void openPullRequestReview(selector)
+  }, [openPullRequestReview])
 
-  const openSettings = useCallback(() => setSettingsOpen(true), [])
+  const openSettings = useCallback(() => {
+    commandPalette.close()
+    setSettingsOpen(true)
+  }, [commandPalette])
 
   const toggleSidebar = useCallback(() => {
     setSidebarVisible((visible) => !visible)
@@ -571,7 +637,7 @@ export function App({
       const nextSnapshot = await requireRepositoryApi().openFolder()
       if (nextSnapshot != null) {
         setSelectedPath(null)
-        gitWorkflow.openWorkingTree(nextSnapshot)
+        openWorkingTree(nextSnapshot)
         changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
         setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
       }
@@ -580,7 +646,7 @@ export function App({
     } finally {
       setOpening(false)
     }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
 
   const openRecentFolder = useCallback(async (folder: RecentFolder) => {
     ensureWorkspaceRoot()
@@ -589,7 +655,7 @@ export function App({
     try {
       const nextSnapshot = await requireRepositoryApi().openPath(folder.path)
       setSelectedPath(null)
-      gitWorkflow.openWorkingTree(nextSnapshot)
+      openWorkingTree(nextSnapshot)
       changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
       setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
     } catch (openError) {
@@ -597,10 +663,10 @@ export function App({
     } finally {
       setOpeningRecentPath(null)
     }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
 
   const handleRepositoryChange = useEffectEvent((change: RepositoryChangeEvent): void => {
-    const previousWorld = gitWorkflow.worlds.find((world) => world.source !== 'new'
+    const previousWorld = reviewWorlds.find((world) => world.source !== 'new'
       && world.root === change.snapshot.root)
     const previousSnapshot = previousWorld == null || previousWorld.source === 'new'
       ? null
@@ -609,7 +675,7 @@ export function App({
       ...change.snapshot,
       paths: change.snapshot.paths ?? previousSnapshot?.paths ?? []
     }
-    gitWorkflow.syncRepositorySnapshot(nextSnapshot)
+    syncRepositorySnapshot(nextSnapshot)
     if (appliedSnapshotRef.current?.root !== change.snapshot.root) return
     comparisonLoader.invalidate(change.changedPaths)
     startTransition(() => {
@@ -630,27 +696,34 @@ export function App({
     void startupSessionSnapshot.then((restoredSnapshot) => {
       if (cancelled || restoredSnapshot == null) return
       ensureWorkspaceRoot()
-      gitWorkflow.openWorkingTree(restoredSnapshot)
+      openWorkingTree(restoredSnapshot)
       changeWorkspaceView(automaticWorkspaceView(restoredSnapshot, null))
       setRecentFolders((current) => rememberRecentFolder(current, restoredSnapshot))
     }).catch((sessionError: unknown) => {
       if (!cancelled) setError(getErrorMessage(sessionError))
     })
     return () => { cancelled = true }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, gitWorkflow.openWorkingTree, startupSessionSnapshot])
+  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree, startupSessionSnapshot])
 
   useEffect(() => {
     const root = document.documentElement
     root.style.setProperty('--font-ui', INTERFACE_FONTS[preferences.interfaceFont].fontFamily)
     root.style.setProperty('--font-mono', CODE_FONTS[preferences.codeFont].fontFamily)
-    savePreferences(preferences)
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      'content',
+      getEditorThemeType(preferences.editorTheme) === 'light' ? '#f7f8fa' : '#0c0d0f'
+    )
+  }, [preferences.codeFont, preferences.editorTheme, preferences.interfaceFont])
+
+  useDebouncedPersist(preferences, (settledPreferences) => {
+    savePreferences(settledPreferences)
     // Main paints the window background before the renderer exists, so it needs
     // its own copy of the two preferences that decide what the first frame looks like.
     void window.repository?.setStartupPreferences({
-      themeType: getEditorThemeType(preferences.editorTheme),
-      restoreLastFolder: preferences.restoreLastFolder
+      themeType: getEditorThemeType(settledPreferences.editorTheme),
+      restoreLastFolder: settledPreferences.restoreLastFolder
     })
-  }, [preferences])
+  }, 150)
 
   useEffect(() => {
     saveRecentFolders(recentFolders)
@@ -670,6 +743,8 @@ export function App({
       : [selectedPath, ...current.filter((path) => path !== selectedPath)].slice(0, RECENT_FILE_LIMIT))
   }, [selectedPath])
 
+  const toggleTerminal = terminal.toggle
+
   // Shared by the keyboard shortcuts and the command palette, so every command
   // the palette lists actually does something.
   const runCommand = useCallback((command: AppCommand) => {
@@ -677,10 +752,10 @@ export function App({
     // the palette reaches this too, and everything else would act on inert UI.
     if (settingsOpen && command !== 'openSettings' && command !== 'openCommandPalette') return
     if (command === 'openSettings') {
-      commandPaletteRef.current?.close()
+      commandPalette.close()
       setSettingsOpen(true)
     } else if (command === 'openCommandPalette') {
-      commandPaletteRef.current?.toggle()
+      commandPalette.toggle()
     } else if (command === 'goToFile' || command === 'searchContent') {
       search.inputRef.current?.focus()
     } else if (command === 'openFolder') {
@@ -692,12 +767,12 @@ export function App({
     } else if (command === 'toggleFoldUnchanged') {
       setPreferences((current) => ({ ...current, foldUnchanged: !current.foldUnchanged }))
     } else if (command === 'toggleTerminal' && hasSnapshot) {
-      terminal.toggle()
+      toggleTerminal()
     }
-  }, [hasSnapshot, openFolder, search.inputRef, settingsOpen, terminal.toggle, toggleSidebar])
+  }, [commandPalette, hasSnapshot, openFolder, search.inputRef, settingsOpen, toggleSidebar, toggleTerminal])
 
   useAppShortcuts({
-    commandPaletteRef,
+    commandPaletteRef: commandPalette.controllerRef,
     gitWorkflow,
     keybindings: preferences.keybindings,
     runCommand,
@@ -712,7 +787,9 @@ export function App({
     terminalOpen: terminal.open, terminalMounted: terminal.mounted,
     terminalHeight: terminal.height, terminalResizing: terminal.resizing,
     preferences, settingsOpen,
-    recentFolders, search, commandPaletteRef, terminalDockRef: terminal.dockRef, gitWorkflow,
+    recentFolders, search, commandPaletteRef: commandPalette.controllerRef,
+    commandPaletteMounted: commandPalette.mounted, setCommandPaletteHandle: commandPalette.attach,
+    terminalDockRef: terminal.dockRef, gitWorkflow,
     setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath, onComparisonSaved: comparisonLoader.save,
     setDiffStyle, setWorkspaceView: changeWorkspaceView,
     setTerminalHeight: terminal.setHeight, setTerminalResizing: terminal.setResizing,

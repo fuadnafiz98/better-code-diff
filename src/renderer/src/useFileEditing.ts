@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FileContents } from '@pierre/diffs'
-import { Editor, type EditorOptions } from '@pierre/diffs/edit'
+import type { Editor, EditorOptions } from '@pierre/diffs/edit'
 
 import type { FileComparison, RepositoryReview } from '../../shared/contracts'
 import type { FileEditControls, WorkspaceView } from './AppView'
@@ -16,10 +16,21 @@ import {
 } from './editor/draftStore'
 import { resolveDiskState, resolveDraftFile, type DraftText } from './editor/editSession'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
+import { notifyStorageWriteFailed } from './storageBudget'
 import { showToast } from './toast'
 
+let editorModule: Promise<typeof import('@pierre/diffs/edit')> | null = null
+let EditorConstructor: typeof import('@pierre/diffs/edit').Editor | null = null
+
+export async function preloadDiffEditor(): Promise<void> {
+  editorModule ??= import('@pierre/diffs/edit')
+  const loaded = await editorModule
+  EditorConstructor = loaded.Editor
+}
+
 export function createDiffEditor<LAnnotation>(options: EditorOptions<LAnnotation>): Editor<LAnnotation> {
-  return new Editor(options)
+  if (EditorConstructor == null) throw new Error('The editor module is not loaded.')
+  return new EditorConstructor(options)
 }
 
 interface FileEditSession {
@@ -218,7 +229,9 @@ export function useFileEditing({
     if (persistTimerRef.current != null) window.clearTimeout(persistTimerRef.current)
     persistTimerRef.current = window.setTimeout(() => {
       persistTimerRef.current = null
-      writeDrafts(root, next, browserDraftStorage())
+      if (!writeDrafts(root, next, browserDraftStorage())) {
+        notifyStorageWriteFailed('drafts', showToast)
+      }
     }, DRAFT_PERSIST_DEBOUNCE_MS)
   }, [root])
 
@@ -246,8 +259,13 @@ export function useFileEditing({
 
   const startEditing = useCallback(async () => {
     if (session != null && activeSession == null) {
-      onSelectPath(session.path)
-      onWorkspaceViewChange('file')
+      try {
+        await preloadDiffEditor()
+        onSelectPath(session.path)
+        onWorkspaceViewChange('file')
+      } catch (error) {
+        onError(getErrorMessage(error))
+      }
       return
     }
     if (repositoryReview != null || selectedPath == null) return
@@ -256,7 +274,10 @@ export function useFileEditing({
       editRequestRef.current = requestId
       onError(null)
       try {
-        const loadedComparison = await requireRepositoryApi().getComparison(selectedPath)
+        const [loadedComparison] = await Promise.all([
+          requireRepositoryApi().getComparison(selectedPath),
+          preloadDiffEditor()
+        ])
         if (requestId !== editRequestRef.current || selectedPathRef.current !== selectedPath) return
         const nextSession = createSession(loadedComparison, draftContents.get(selectedPath))
         if (nextSession == null) throw new Error('This working file is not editable.')
@@ -269,8 +290,13 @@ export function useFileEditing({
       return
     }
     if (comparison == null) return
-    const nextSession = createSession(comparison, draftContents.get(comparison.path))
-    if (nextSession != null) setSession(nextSession)
+    try {
+      await preloadDiffEditor()
+      const nextSession = createSession(comparison, draftContents.get(comparison.path))
+      if (nextSession != null) setSession(nextSession)
+    } catch (error) {
+      onError(getErrorMessage(error))
+    }
   }, [activeSession, comparison, draftContents, onComparisonChange, onError, onSelectPath, onWorkspaceViewChange,
     repositoryReview, selectedPath, session, workspaceView])
 

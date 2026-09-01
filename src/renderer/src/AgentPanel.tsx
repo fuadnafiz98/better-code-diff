@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import {
   IconArrow, IconBraces, IconCheck, IconChevronSm, IconClockArrow, IconCodeSearch,
   IconCommentAdd, IconCopy, IconFileCode, IconGear, IconInProgress, IconRefresh,
@@ -83,13 +83,20 @@ export const AgentPanel = memo(function AgentPanel({
   const [draft, setDraft] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const composerRef = useRef<HTMLTextAreaElement>(null)
-  const transcriptRef = useRef<HTMLDivElement>(null)
   const started = history.length > 0 || question !== '' || blocks.length > 0 || activity.length > 0 || error != null
   const providerStatus = statuses[provider]
   const ready = providerStatus.authenticated
-  const selectedModel = models.find((option) => option.id === model)
-  const latestRunning = [...activity].reverse().find((item) =>
-    item.status === 'running' || item.status === 'waiting')
+  const selectedModel = useMemo(
+    () => models.find((option) => option.id === model),
+    [model, models]
+  )
+  const latestRunning = useMemo(() => {
+    for (let index = activity.length - 1; index >= 0; index -= 1) {
+      const item = activity[index]
+      if (item?.status === 'running' || item?.status === 'waiting') return item
+    }
+    return undefined
+  }, [activity])
   const liveLabel = latestRunning?.status === 'waiting'
     ? 'Waiting for approval'
     : latestRunning?.title || (blocks.length > 0 ? 'Writing answer' : 'Inspecting repository')
@@ -99,13 +106,6 @@ export const AgentPanel = memo(function AgentPanel({
   useEffect(() => {
     if (latestAttachmentId != null) composerRef.current?.focus()
   }, [latestAttachmentId])
-
-  useEffect(() => {
-    const transcript = transcriptRef.current
-    if (transcript == null || !streaming) return
-    const distanceFromBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight
-    if (distanceFromBottom < 120) transcript.scrollTop = transcript.scrollHeight
-  }, [activity, blocks, streaming, usage])
 
   const send = (prompt: string): void => {
     const trimmed = prompt.trim()
@@ -139,7 +139,7 @@ export const AgentPanel = memo(function AgentPanel({
         </div>
       </header>
 
-      <div className="agent-dock-transcript" ref={transcriptRef}>
+      <div className="agent-dock-transcript">
         {!ready || statusError != null ? (
           <ProviderConnection provider={provider} status={providerStatus} loading={loadingStatuses}
             authenticating={authenticatingProvider === provider} error={statusError}
@@ -198,6 +198,7 @@ export const AgentPanel = memo(function AgentPanel({
             {answer === '' || streaming ? null : <AnswerActions answer={answer} />}
           </article>
         )}
+        <span className="agent-scroll-anchor" aria-hidden="true" />
       </div>
 
       <div className="agent-composer">
@@ -439,10 +440,18 @@ function UsageMeter({ label, value, suffix = '' }: { label: string; value: numbe
 
 function AnswerActions({ answer }: { answer: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false)
+  const copiedTimerRef = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (copiedTimerRef.current != null) window.clearTimeout(copiedTimerRef.current)
+  }, [])
   const copyAnswer = async (): Promise<void> => {
     await navigator.clipboard.writeText(answer)
     setCopied(true)
-    window.setTimeout(() => setCopied(false), 1_600)
+    if (copiedTimerRef.current != null) window.clearTimeout(copiedTimerRef.current)
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = null
+      setCopied(false)
+    }, 1_600)
   }
   return <div className="agent-answer-actions"><button type="button" onClick={() => {
     void copyAnswer()

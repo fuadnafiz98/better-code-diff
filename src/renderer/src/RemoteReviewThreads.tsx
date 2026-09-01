@@ -1,9 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { IconApproved, IconBrandGithub, IconCheck, IconRefresh, IconReply } from '@pierre/icons'
 
 import type { RemoteReviewThread } from '../../shared/contracts'
-import { parseMarkdown } from './markdown'
-import { MarkdownContent } from './MarkdownContent'
+import { GitHubMarkdownContent } from './GitHubMarkdownContent'
+import { useReviewClock } from './reviewClock'
 
 const RELATIVE_TIME_FORMATTER = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
 
@@ -20,8 +20,7 @@ export function formatCommentAge(value: string, now: number): string {
 // GitHub bodies are markdown, and review bots write dense markdown: backticks,
 // lists, fenced snippets. Rendered as plain text it reads like source.
 function RemoteComment({ body }: { body: string }): React.JSX.Element {
-  const blocks = useMemo(() => parseMarkdown(body), [body])
-  return <MarkdownContent blocks={blocks} className="review-remote-body" />
+  return <GitHubMarkdownContent source={body} variant="comment" className="review-remote-body" />
 }
 
 interface RemoteReviewThreadCardProps {
@@ -39,7 +38,7 @@ export function RemoteReviewThreadCard({
 }: RemoteReviewThreadCardProps): React.JSX.Element {
   const [replyBody, setReplyBody] = useState('')
   const [composing, setComposing] = useState(false)
-  const now = Date.now()
+  const now = useReviewClock()
 
   const author = thread.comments[0]?.authorLogin ?? 'GitHub'
   const resolveLabel = thread.resolved ? 'Reopen thread on GitHub' : 'Resolve thread on GitHub'

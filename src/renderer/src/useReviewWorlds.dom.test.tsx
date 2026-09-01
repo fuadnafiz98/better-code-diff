@@ -5,8 +5,12 @@ import { useState } from 'react'
 import type { PullRequestReview, RepositorySnapshot } from '../../shared/contracts'
 import type { WorkspaceView } from './AppView'
 import { useReviewWorlds } from './useReviewWorlds'
+import { worldViewCache } from './worldViewCache'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  worldViewCache.clear()
+})
 
 const snapshot: RepositorySnapshot = {
   root: '/repo',
@@ -46,7 +50,95 @@ const review: PullRequestReview = {
   expectedFileCount: 1
 }
 
-test('switching worlds restores path, view, and review scroll without keeping a viewer mounted', async () => {
+test('same-root world switches do not reactivate the repository session', async () => {
+  const activations: string[] = []
+  const { result } = renderHook(() => {
+    const [selectedPath, setSelectedPath] = useState<string | null>(null)
+    const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('multi')
+    const worlds = useReviewWorlds({
+      snapshot,
+      selectedPath,
+      workspaceView,
+      onActivateSnapshot: () => {},
+      onActivateRepository: async (root) => {
+        activations.push(root)
+        return snapshot
+      },
+      onReleaseRepository: async () => {},
+      onActivationError: () => {},
+      onSelectPath: setSelectedPath,
+      onWorkspaceViewChange: setWorkspaceView
+    })
+    return { worlds }
+  })
+
+  await waitFor(() => expect(result.current.worlds.worlds).toHaveLength(1))
+  let firstPatch!: string
+  let secondPatch!: string
+  act(() => {
+    firstPatch = result.current.worlds.openPatchWorld(snapshot, review, 1, false)!
+  })
+  act(() => {
+    secondPatch = result.current.worlds.openPatchWorld(snapshot, {
+      ...review,
+      selector: '10',
+      pullRequest: { ...review.pullRequest, number: 10, url: 'https://github.com/acme/repo/pull/10' }
+    }, 2, false)!
+  })
+  activations.length = 0
+  await act(() => result.current.worlds.focusWorld(firstPatch))
+  await act(() => result.current.worlds.focusWorld(secondPatch))
+  expect(activations).toEqual([])
+})
+
+test('same-root focus does not rewrite an already-matching path and view', async () => {
+  const pathWrites: Array<string | null> = []
+  const viewWrites: WorkspaceView[] = []
+  const { result } = renderHook(() => {
+    const [selectedPath, setSelectedPath] = useState<string | null>('patch.ts')
+    const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('multi')
+    const worlds = useReviewWorlds({
+      snapshot,
+      selectedPath,
+      workspaceView,
+      onActivateSnapshot: () => {},
+      onActivateRepository: async () => snapshot,
+      onReleaseRepository: async () => {},
+      onActivationError: () => {},
+      onSelectPath: (path) => {
+        pathWrites.push(path)
+        setSelectedPath(path)
+      },
+      onWorkspaceViewChange: (view) => {
+        viewWrites.push(view)
+        setWorkspaceView(view)
+      }
+    })
+    return { worlds }
+  })
+
+  await waitFor(() => expect(result.current.worlds.worlds).toHaveLength(1))
+  let firstPatch!: string
+  let secondPatch!: string
+  act(() => {
+    firstPatch = result.current.worlds.openPatchWorld(snapshot, review, 1, false)!
+  })
+  act(() => {
+    secondPatch = result.current.worlds.openPatchWorld(snapshot, {
+      ...review,
+      selector: '10',
+      pullRequest: { ...review.pullRequest, number: 10, url: 'https://github.com/acme/repo/pull/10' }
+    }, 2, false)!
+  })
+  pathWrites.length = 0
+  viewWrites.length = 0
+  await act(() => result.current.worlds.focusWorld(firstPatch))
+  await act(() => result.current.worlds.focusWorld(secondPatch))
+  expect(pathWrites).toEqual([])
+  expect(viewWrites).toEqual([])
+})
+
+test('switching worlds restores path, view, and review scroll from the world cache', async () => {
   const { result } = renderHook(() => {
     const [selectedPath, setSelectedPath] = useState<string | null>('desk.ts')
     const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('file')

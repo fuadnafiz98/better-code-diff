@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, watch, type FSWatcher } from 'node:fs'
+import { readFileSync, watch, type FSWatcher } from 'node:fs'
+import { access } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 
 import type { RepositoryChangeEvent, RepositorySnapshot } from '../shared/contracts.js'
@@ -97,20 +98,30 @@ export function collectChangedPaths(
   const nextPaths = new Set(next.paths)
   const previousStatuses = statusSignature(previous)
   const nextStatuses = statusSignature(next)
+  const visiblePaths = new Set([...previousPaths, ...nextPaths])
+  const statusPaths = new Set([...previousStatuses.keys(), ...nextStatuses.keys()])
   const changedPaths = new Set<string>()
+  const directoryPrefixes = new Set<string>()
 
   for (const path of filesystemPaths) {
     if (path === '*') {
-      const paths = previous.kind === 'git'
-        ? new Set([...previousStatuses.keys(), ...nextStatuses.keys()])
-        : new Set([...previousPaths, ...nextPaths])
+      const paths = previous.kind === 'git' ? statusPaths : visiblePaths
       for (const visiblePath of paths) changedPaths.add(visiblePath)
     } else if (!path.startsWith('.git/') && (previousPaths.has(path) || nextPaths.has(path))) {
       changedPaths.add(path)
     } else if (!path.startsWith('.git/')) {
-      const directoryPrefix = `${path.replace(/\/$/, '')}/`
-      for (const visiblePath of new Set([...previousPaths, ...nextPaths])) {
-        if (visiblePath.startsWith(directoryPrefix)) changedPaths.add(visiblePath)
+      directoryPrefixes.add(`${path.replace(/\/$/, '')}/`)
+    }
+  }
+  if (directoryPrefixes.size > 0) {
+    for (const visiblePath of visiblePaths) {
+      let slash = visiblePath.indexOf('/')
+      while (slash >= 0) {
+        if (directoryPrefixes.has(visiblePath.slice(0, slash + 1))) {
+          changedPaths.add(visiblePath)
+          break
+        }
+        slash = visiblePath.indexOf('/', slash + 1)
       }
     }
   }
@@ -120,13 +131,11 @@ export function collectChangedPaths(
   for (const path of nextPaths) {
     if (!previousPaths.has(path)) changedPaths.add(path)
   }
-  for (const path of new Set([...previousStatuses.keys(), ...nextStatuses.keys()])) {
+  for (const path of statusPaths) {
     if (previousStatuses.get(path) !== nextStatuses.get(path)) changedPaths.add(path)
   }
   if (previous.head !== next.head || previous.branch !== next.branch) {
-    for (const path of new Set([...previousStatuses.keys(), ...nextStatuses.keys()])) {
-      changedPaths.add(path)
-    }
+    for (const path of statusPaths) changedPaths.add(path)
   }
 
   return [...changedPaths].sort()
@@ -141,6 +150,7 @@ export class RepositoryWatcher {
   #snapshot: RepositorySnapshot | null = null
   #publishedPaths: string[] | null = null
   #pendingPaths = new Set<string>()
+  #pendingContentCount = 0
   #timer: ReturnType<typeof setTimeout> | null = null
   #refreshing = false
   #suspended = false
@@ -160,7 +170,9 @@ export class RepositoryWatcher {
     const generation = this.#generation
     const accept = (path: string | null): void => {
       if (generation !== this.#generation || path == null) return
+      const alreadyPending = this.#pendingPaths.has(path)
       this.#pendingPaths.add(path)
+      if (!alreadyPending && !path.startsWith('.git/')) this.#pendingContentCount += 1
       this.#schedule(generation)
     }
     try {
@@ -221,6 +233,7 @@ export class RepositoryWatcher {
     this.#snapshot = null
     this.#publishedPaths = null
     this.#pendingPaths.clear()
+    this.#pendingContentCount = 0
     this.#selfWrites.clear()
     this.#deferredSince = 0
     if (this.#timer != null) clearTimeout(this.#timer)
@@ -230,7 +243,7 @@ export class RepositoryWatcher {
   #schedule(generation: number, delay?: number): void {
     if (this.#suspended) return
     if (this.#timer != null) clearTimeout(this.#timer)
-    const metadataOnly = [...this.#pendingPaths].every((path) => path.startsWith('.git/'))
+    const metadataOnly = this.#pendingContentCount === 0
     this.#timer = setTimeout(() => {
       this.#timer = null
       void this.#flush(generation)
@@ -239,10 +252,13 @@ export class RepositoryWatcher {
 
   // Refreshing in the middle of a commit, rebase or merge reads a half-written
   // index and then has to do it all again when the operation lands.
-  #operationInProgress(): boolean {
+  async #operationInProgress(): Promise<boolean> {
     const gitDirectory = this.#gitDirectory ?? (this.#snapshot == null ? null : resolve(this.#snapshot.root, '.git'))
     if (gitDirectory == null) return false
-    return OPERATION_MARKERS.some((marker) => existsSync(resolve(gitDirectory, marker)))
+    const markers = await Promise.all(OPERATION_MARKERS.map((marker) =>
+      access(resolve(gitDirectory, marker)).then(() => true, () => false)
+    ))
+    return markers.some(Boolean)
   }
 
   async #flush(generation: number): Promise<void> {
@@ -252,7 +268,9 @@ export class RepositoryWatcher {
       return
     }
 
-    if (this.#operationInProgress()) {
+    const operationInProgress = await this.#operationInProgress()
+    if (generation !== this.#generation || this.#snapshot == null || this.#suspended) return
+    if (operationInProgress) {
       const now = Date.now()
       if (this.#deferredSince === 0) this.#deferredSince = now
       if (now - this.#deferredSince < MAX_OPERATION_DEFERRAL_MS) {
@@ -264,6 +282,10 @@ export class RepositoryWatcher {
 
     const previous = this.#snapshot
     dropSelfWrites(this.#pendingPaths, this.#selfWrites, Date.now())
+    this.#pendingContentCount = 0
+    for (const path of this.#pendingPaths) {
+      if (!path.startsWith('.git/')) this.#pendingContentCount += 1
+    }
     // Nothing left once the app's own writes are dropped, so the whole point of
     // the hint would be lost by refreshing anyway.
     if (this.#pendingPaths.size === 0) return
@@ -271,6 +293,7 @@ export class RepositoryWatcher {
     const filesystemPaths = new Set(this.#pendingPaths)
     const previousPathSet = new Set(previous.paths)
     this.#pendingPaths.clear()
+    this.#pendingContentCount = 0
     this.#refreshing = true
     try {
       const knownContentPaths = [...filesystemPaths].filter((path) =>

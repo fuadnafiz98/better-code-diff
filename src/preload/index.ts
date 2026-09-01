@@ -19,6 +19,35 @@ type MainPerformanceDetail = Pick<
   'mainStartup' | 'memoryByProcessType' | 'mainPrivateMegabytes'
 >
 
+const MAX_COUNTED_RENDERER_DOM_NODES = 500_000
+
+interface RendererElement {
+  shadowRoot?: RendererQueryRoot | null
+}
+
+interface RendererQueryRoot {
+  querySelectorAll(selector: string): ArrayLike<RendererElement>
+}
+
+function countRendererDomNodes(root: RendererQueryRoot | undefined): number {
+  if (root == null) return 0
+  const roots: RendererQueryRoot[] = [root]
+  let count = 0
+
+  while (roots.length > 0 && count < MAX_COUNTED_RENDERER_DOM_NODES) {
+    const current = roots.pop()
+    if (current == null) continue
+    const elements = current.querySelectorAll('*')
+    count = Math.min(MAX_COUNTED_RENDERER_DOM_NODES, count + elements.length)
+    for (let index = 0; index < elements.length && count < MAX_COUNTED_RENDERER_DOM_NODES; index += 1) {
+      const shadowRoot = elements[index]?.shadowRoot
+      if (shadowRoot != null) roots.push(shadowRoot)
+    }
+  }
+
+  return count
+}
+
 const repositoryApi: RepositoryApi = {
   getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
@@ -38,14 +67,14 @@ const repositoryApi: RepositoryApi = {
   getGitIntegration: () => ipcRenderer.invoke(IPC_CHANNELS.getGitIntegration),
   getPullRequestInbox: () => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestInbox),
   getClosedPullRequests: () => ipcRenderer.invoke(IPC_CHANNELS.getClosedPullRequests),
-  getPullRequestConversation: (selector: number | string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.getPullRequestConversation, selector),
-  replyToPullRequestThread: (threadId: string, body: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.replyToPullRequestThread, threadId, body),
-  setPullRequestThreadResolved: (threadId: string, resolved: boolean) =>
-    ipcRenderer.invoke(IPC_CHANNELS.setPullRequestThreadResolved, threadId, resolved),
-  mergePullRequest: (selector, strategy) => ipcRenderer.invoke(IPC_CHANNELS.mergePullRequest, selector, strategy),
-  markPullRequestReady: (selector) => ipcRenderer.invoke(IPC_CHANNELS.markPullRequestReady, selector),
+  getPullRequestConversation: (root: string, selector: number | string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.getPullRequestConversation, root, selector),
+  replyToPullRequestThread: (root: string, threadId: string, body: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.replyToPullRequestThread, root, threadId, body),
+  setPullRequestThreadResolved: (root: string, threadId: string, resolved: boolean) =>
+    ipcRenderer.invoke(IPC_CHANNELS.setPullRequestThreadResolved, root, threadId, resolved),
+  mergePullRequest: (root, selector, strategy) => ipcRenderer.invoke(IPC_CHANNELS.mergePullRequest, root, selector, strategy),
+  markPullRequestReady: (root, selector) => ipcRenderer.invoke(IPC_CHANNELS.markPullRequestReady, root, selector),
   switchBranch: (name) => ipcRenderer.invoke(IPC_CHANNELS.switchBranch, name),
   getLocalBranchReview: (baseRef, headRef) => ipcRenderer.invoke(IPC_CHANNELS.getLocalBranchReview, baseRef, headRef),
   getCommitReview: (oid) => ipcRenderer.invoke(IPC_CHANNELS.getCommitReview, oid),
@@ -57,7 +86,7 @@ const repositoryApi: RepositoryApi = {
   cancelPullRequestReview: (root, requestId) =>
     ipcRenderer.send(IPC_CHANNELS.cancelPullRequestReview, root, requestId),
   checkoutPullRequest: (number) => ipcRenderer.invoke(IPC_CHANNELS.checkoutPullRequest, number),
-  submitPullRequestReview: (selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, selector, commitId, event, body, comments),
+  submitPullRequestReview: (root, selector, commitId, event, body, comments) => ipcRenderer.invoke(IPC_CHANNELS.submitPullRequestReview, root, selector, commitId, event, body, comments),
   getAgentModels: () => ipcRenderer.invoke(IPC_CHANNELS.getAgentModels),
   getAgentStatuses: (provider) => ipcRenderer.invoke(IPC_CHANNELS.getAgentStatuses, provider),
   loginAgent: (provider) => ipcRenderer.invoke(IPC_CHANNELS.loginAgent, provider),
@@ -113,14 +142,12 @@ const repositoryApi: RepositoryApi = {
     }
     if (!detailed || mainMetrics.detail == null) return metrics
     const heap = process.getHeapStatistics()
-    const rendererDocument = (globalThis as unknown as {
-      document?: { getElementsByTagName(name: string): { length: number } }
-    }).document
+    const rendererDocument = (globalThis as unknown as { document?: RendererQueryRoot }).document
     metrics.detail = {
       ...mainMetrics.detail,
       rendererHeapUsedMegabytes: heap.usedHeapSize / 1_024,
       rendererHeapTotalMegabytes: heap.totalHeapSize / 1_024,
-      rendererDomNodes: rendererDocument?.getElementsByTagName('*').length ?? 0
+      rendererDomNodes: countRendererDomNodes(rendererDocument)
     }
     return metrics
   },

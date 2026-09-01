@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from 'react'
 
 
-import { isTerminalToggleShortcut, type KeybindingMap } from './keybindings'
+import { isTerminalToggleShortcut, keybindingFromEvent, type KeybindingMap } from './keybindings'
 import { clampTerminalHeight, DEFAULT_TERMINAL_HEIGHT } from './terminalPanel'
 import type { TerminalDockHandle } from './TerminalDock'
 
@@ -110,6 +110,8 @@ export function useTerminalVisibility({
     const target = event.target instanceof Element ? event.target : null
     if (target?.closest('.keybinding-recorder .recording') != null) return
     if (!isTerminalToggleShortcut(event, keybindings)) return
+    const binding = keybindingFromEvent(event)
+    if (target?.closest('.terminal-dock') != null && binding === 'Control+KeyJ') return
     event.preventDefault()
     event.stopPropagation()
     toggle()

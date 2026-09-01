@@ -1,6 +1,7 @@
 import {
   memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -18,11 +19,12 @@ import {
   type DiffLineAnnotation,
   type LineAnnotation
 } from '@pierre/diffs'
-import { CodeView, type CodeViewHandle, type CodeViewReactOptions } from '@pierre/diffs/react'
+import { type CodeViewHandle, type CodeViewReactOptions } from '@pierre/diffs/react'
 import { IconCheck, IconChevronSm, IconCodeSearch, IconRefresh, IconWarningOctogonFill } from '@pierre/icons'
 
 import type { PullRequestConversation, RemoteReviewThread, RepositoryReview } from '../../shared/contracts'
 import type { DiffStyle } from './AppView'
+import { LIVE_CODE_FONT_SIZE_PROPERTY, LIVE_CODE_LINE_HEIGHT_PROPERTY } from './codeZoom'
 import { markReviewFileHydrated } from './reviewMetrics'
 import { markRendererStartup } from './startupMetrics'
 import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
@@ -41,6 +43,7 @@ import {
 import type { AgentSelection } from './agentAttachments'
 import { ReviewSummary, type ReviewSummaryEntry } from './ReviewSummary'
 import { RemoteReviewThreadCard } from './RemoteReviewThreads'
+import { ReviewClockProvider } from './reviewClock'
 import {
   deriveAnnotatedReviewItems,
   type AnnotatedReviewItemCache
@@ -56,6 +59,19 @@ import {
   FOLDER_REVIEW_PAGE_SIZE,
   type ReviewLoadState
 } from './useReviewLoadState'
+import {
+  itemsForRetainedWorld,
+  takeCachedAnnotatedDerivation,
+  worldViewCache
+} from './worldViewCache'
+import {
+  observeScrollTakeover,
+  RetainedWorldCodeView,
+  SCROLL_RESTORE_SETTLED_FRAMES,
+  SCROLL_RESTORE_TIMEOUT_MS,
+  useRetainedWorldViewers,
+  type ReviewCodeViewSlots
+} from './retainedWorldCodeView'
 import {
   useReviewThreads,
   type DraftReviewComment,
@@ -118,7 +134,7 @@ export interface MultiFileReviewProps {
   scrollToReviewRevision: number
   navigationPath: string | null
   navigationRevision: number
-  initialScrollTop: number
+  getInitialScrollTop(): number
   onScrollPositionChange(scrollTop: number): void
   onVisiblePathChange(path: string): void
   threadsByPath: Record<string, ReviewThread[]>
@@ -131,6 +147,7 @@ export interface MultiFileReviewProps {
   onResolveRemoteThread(threadId: string, resolved: boolean): void
   onAttachToAgent(selection: AgentSelection): void
   reviewCommand: { command: ReviewCommand; path: string; revision: number } | null
+  worldId: string
 }
 
 function SinceNotice({
@@ -163,22 +180,175 @@ function SinceNotice({
   )
 }
 
-const SCROLL_RESTORE_SETTLED_FRAMES = 3
-const SCROLL_RESTORE_TIMEOUT_MS = 800
-// Any of these means the reader took over; a pending restore must yield to them.
-const SCROLL_TAKEOVER_EVENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
-
-function observeScrollTakeover(container: HTMLElement | null, listener: () => void): () => void {
-  for (const type of SCROLL_TAKEOVER_EVENTS) container?.addEventListener(type, listener, { passive: true })
-  return () => {
-    for (const type of SCROLL_TAKEOVER_EVENTS) container?.removeEventListener(type, listener)
+function ReviewEmptyOverlay({
+  pathCount,
+  itemCount,
+  loading,
+  failedCount,
+  omittedCount,
+  skippedCount,
+  removedPaths,
+  uncertainPaths
+}: {
+  pathCount: number
+  itemCount: number
+  loading: boolean
+  failedCount: number
+  omittedCount: number
+  skippedCount: number
+  removedPaths: readonly string[]
+  uncertainPaths: readonly string[]
+}): React.JSX.Element | null {
+  if (pathCount === 0) {
+    return (
+      <div className="since-empty-state">
+        <SinceNotice removedPaths={removedPaths} uncertainPaths={uncertainPaths} />
+        <div className="diff-state">
+          <IconCodeSearch />
+          <strong>No current diffs to review</strong>
+          <span>The changed paths are no longer part of this pull request.</span>
+        </div>
+      </div>
+    )
   }
+  if (itemCount === 0 && loading) {
+    return (
+      <div className="diff-state">
+        <IconRefresh className="spin" />
+        <span>Loading repository review…</span>
+      </div>
+    )
+  }
+  if (itemCount === 0) {
+    return (
+      <div className="diff-state">
+        <IconWarningOctogonFill />
+        <strong>No diffs to display</strong>
+        <span>{
+          failedCount > 0
+            ? 'The changed files could not be loaded.'
+            : omittedCount + skippedCount > 0
+              ? 'Every changed file is too large or binary to open here.'
+              : 'The review loaded, but its patch could not be parsed.'
+        }</span>
+      </div>
+    )
+  }
+  return null
 }
 
-// The viewer maps its logical scroll offset onto a paged scroll scaffold, so the
-// container's own scrollTop is not the position the viewer reports or accepts.
-function getViewerScrollTop(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): number | null {
-  return viewer?.getInstance()?.getScrollTop() ?? null
+function ReviewProgressBar({
+  loading,
+  loadedPathCount,
+  targetPathCount,
+  remainingPathCount,
+  viewedCount,
+  itemCount,
+  skippedCount,
+  omittedFiles,
+  failedCount,
+  collapsedCount,
+  onLoadMore,
+  collapseAllFiles,
+  expandAllFiles
+}: {
+  loading: boolean
+  loadedPathCount: number
+  targetPathCount: number
+  remainingPathCount: number
+  viewedCount: number
+  itemCount: number
+  skippedCount: number
+  omittedFiles: ReviewLoadState['omittedFiles']
+  failedCount: number
+  collapsedCount: number
+  onLoadMore(): void
+  collapseAllFiles(): void
+  expandAllFiles(): void
+}): React.JSX.Element {
+  return (
+    <div className="multi-file-progress" style={{
+      '--review-progress': itemCount === 0 ? 0 : viewedCount / itemCount
+    } as CSSProperties}>
+      <div role="status">
+        <span>{loading
+          ? `Loading ${loadedPathCount} of ${targetPathCount}`
+          : `${viewedCount} of ${itemCount} reviewed`}</span>
+        {skippedCount > 0 ? <span>{skippedCount} binary or large</span> : null}
+        {omittedFiles.length > 0 ? (
+          <span title={omittedFiles.map((file) => file.path).join('\n')}>
+            {omittedFiles.length} too large to diff
+          </span>
+        ) : null}
+        {failedCount > 0 ? (
+          <span className="multi-file-error">
+            <IconWarningOctogonFill />
+            {failedCount} failed
+          </span>
+        ) : null}
+      </div>
+      {remainingPathCount > 0 ? (
+        <div className="multi-file-page-actions">
+          <button type="button" onClick={onLoadMore} disabled={loading}>
+            Load {Math.min(FOLDER_REVIEW_PAGE_SIZE, remainingPathCount)} more
+          </button>
+        </div>
+      ) : null}
+      <div className="multi-file-fold-actions" role="group" aria-label="Multi-file folding">
+        <button type="button" onClick={collapseAllFiles} disabled={collapsedCount === itemCount}>
+          Collapse all
+        </button>
+        <button type="button" onClick={expandAllFiles} disabled={collapsedCount === 0}>
+          Expand all
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ReviewFileCollapseButton({
+  item,
+  expanded,
+  onToggle
+}: {
+  item: CodeViewItem<ReviewAnnotationMetadata>
+  expanded: boolean
+  onToggle(item: CodeViewItem<ReviewAnnotationMetadata>): void
+}): React.JSX.Element {
+  const path = pathFromItemId(item.id)
+  return (
+    <button type="button" data-review-collapse-button
+      aria-expanded={expanded} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${path}`}
+      title={`${expanded ? 'Collapse' : 'Expand'} file`} onClick={(event) => {
+        event.stopPropagation()
+        onToggle(item)
+      }}>
+      <IconChevronSm data-collapse-chevron aria-hidden="true" />
+    </button>
+  )
+}
+
+function ReviewViewedToggle({
+  path,
+  viewed,
+  onToggle
+}: {
+  path: string
+  viewed: boolean
+  onToggle(path: string): void
+}): React.JSX.Element {
+  return (
+    <span>
+      <label data-review-viewed-toggle data-state={viewed ? 'checked' : 'unchecked'}
+        title={viewed ? 'Mark as not viewed' : 'Mark as viewed'}
+        onClick={(event) => event.stopPropagation()}>
+        <input type="checkbox" checked={viewed} aria-label={`Mark ${path} as viewed`}
+          onChange={() => onToggle(path)} />
+        <span data-review-viewed-checkbox aria-hidden="true"><IconCheck /></span>
+        <span>Viewed</span>
+      </label>
+    </span>
+  )
 }
 
 function scrollToReviewTop(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): void {
@@ -206,16 +376,23 @@ function captureReviewScrollAnchor(
 }
 
 function useBackgroundScrollAnchor(
+  worldId: string | null | undefined,
   conversation: PullRequestConversation | null,
   review: RepositoryReview | null,
   scrollContainerRef: RefObject<HTMLDivElement | null>,
   viewerRef: RefObject<CodeViewHandle<ReviewAnnotationMetadata> | null>
 ): void {
   const anchorRef = useRef<ReviewScrollAnchor | null>(null)
+  const anchoredWorldIdRef = useRef(worldId)
 
   // Conversation polling and streamed pages can update CodeView while the
   // reader is idle. Keep the same file at the same viewport offset.
   useLayoutEffect(() => {
+    if (anchoredWorldIdRef.current !== worldId) {
+      anchoredWorldIdRef.current = worldId
+      anchorRef.current = null
+      return
+    }
     const anchor = anchorRef.current
     anchorRef.current = null
     let frame = 0
@@ -254,9 +431,11 @@ function useBackgroundScrollAnchor(
       cancelled = true
       window.cancelAnimationFrame(frame)
       stopObservingScrollTakeover()
+      // Cleanup must capture the latest imperative viewer, not the handle from effect setup.
+      // oxlint-disable-next-line react/exhaustive-deps
       anchorRef.current = captureReviewScrollAnchor(viewerRef.current?.getInstance())
     }
-  }, [conversation, review, scrollContainerRef, viewerRef])
+  }, [conversation, review, scrollContainerRef, viewerRef, worldId])
 }
 
 function findActiveRenderedItemId(viewer: CodeViewInstance<ReviewAnnotationMetadata>): string | null {
@@ -275,6 +454,7 @@ interface AnnotatedReviewItemsOptions {
   pendingSelection: { id: string; range: CodeViewLineSelection['range'] } | null
   collapsedItemIds: ReadonlySet<string>
   annotationVersions: Readonly<Record<string, number>>
+  worldId?: string | null
 }
 
 function useAnnotatedReviewItems({
@@ -284,31 +464,110 @@ function useAnnotatedReviewItems({
   draftComment,
   pendingSelection,
   collapsedItemIds,
-  annotationVersions
+  annotationVersions,
+  worldId = null
 }: AnnotatedReviewItemsOptions): CodeViewItem<ReviewAnnotationMetadata>[] {
   const committedCacheRef = useRef<AnnotatedReviewItemCache>(new Map())
   const committedItemsRef = useRef<CodeViewItem<ReviewAnnotationMetadata>[] | undefined>(undefined)
-  const derivation = useMemo(() => deriveAnnotatedReviewItems({
-    items: loadState.items,
-    threadsByPath,
-    remoteThreadsByPath,
-    draftComment,
-    pendingSelection,
-    collapsedItemIds,
+  const annotatedWorldIdRef = useRef(worldId)
+  const derivation = useMemo(() => {
+    const seeded = worldId != null && annotatedWorldIdRef.current !== worldId
+      ? worldViewCache.get(worldId)?.annotated
+      : null
+    const cached = takeCachedAnnotatedDerivation(seeded, loadState.items)
+    if (cached != null) return cached
+    return deriveAnnotatedReviewItems({
+      items: loadState.items,
+      threadsByPath,
+      remoteThreadsByPath,
+      draftComment,
+      pendingSelection,
+      collapsedItemIds,
+      annotationVersions,
+      previousCache: committedCacheRef.current,
+      previousItems: committedItemsRef.current
+    })
+  }, [
     annotationVersions,
-    previousCache: committedCacheRef.current,
-    previousItems: committedItemsRef.current
-  }), [annotationVersions, collapsedItemIds, draftComment, loadState.items, pendingSelection, remoteThreadsByPath, threadsByPath])
+    collapsedItemIds,
+    draftComment,
+    loadState.items,
+    pendingSelection,
+    remoteThreadsByPath,
+    threadsByPath,
+    worldId
+  ])
 
   useLayoutEffect(() => {
+    annotatedWorldIdRef.current = worldId
     committedCacheRef.current = derivation.cache
     committedItemsRef.current = derivation.items
-  }, [derivation.cache, derivation.items])
+    if (worldId != null) {
+      worldViewCache.rememberAnnotated(worldId, {
+        baseItems: loadState.items,
+        items: derivation.items,
+        cache: derivation.cache
+      })
+    }
+  }, [derivation.cache, derivation.items, loadState.items, worldId])
 
   return derivation.items
 }
 
+function useReviewCodeViewOptions({
+  diffStyle,
+  preferences,
+  repositoryReview,
+  previousGutterActivationRef,
+  onSelectLines,
+  onBeginComment
+}: {
+  diffStyle: DiffStyle
+  preferences: AppPreferences
+  repositoryReview: RepositoryReview | null
+  previousGutterActivationRef: RefObject<{
+    selection: CodeViewLineSelection
+    timestamp: number
+  } | null>
+  onSelectLines(selection: CodeViewLineSelection | null): void
+  onBeginComment(selection: CodeViewLineSelection): void
+}): CodeViewReactOptions<ReviewAnnotationMetadata> {
+  return useMemo(() => ({
+    // No `theme`: the worker pool resolves it and re-renders every instance on a
+    // switch, so passing it here only forced a second full rebuild of the DOM.
+    themeType: getEditorThemeType(preferences.editorTheme), diffStyle, diffIndicators: 'bars', lineDiffType: 'word-alt',
+    overflow: preferences.wordWrap ? 'wrap' : 'scroll', disableLineNumbers: !preferences.showLineNumbers,
+    tokenizeMaxLineLength: 2_000, enableLineSelection: true, enableGutterUtility: true,
+    onLineSelectionEnd: (range, context) => onSelectLines(range == null ? null : { id: context.item.id, range }),
+    onGutterUtilityClick: (range, context) => {
+      const selection = { id: context.item.id, range }
+      const timestamp = performance.now()
+      const opensComment = isGutterDoubleClick(previousGutterActivationRef.current, selection, timestamp)
+      previousGutterActivationRef.current = opensComment ? null : { selection, timestamp }
+      onSelectLines(selection)
+      // CodeView reports selection-end after this callback. Starting the draft
+      // on the next microtask lets that report finish before the action bar is cleared.
+      if (opensComment) queueMicrotask(() => onBeginComment(selection))
+    },
+    onPostRender: (node, _instance, phase, context) => {
+      syncDragGuideLifecycle(node, phase, (range) => onSelectLines({ id: context.item.id, range }))
+      syncSplitDiffResizeLifecycle(node, phase)
+      syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
+      syncReviewCaretLifecycle(node, phase)
+    },
+    lineHoverHighlight: 'number', hunkSeparators: 'line-info-basic', expandUnchanged: !preferences.foldUnchanged,
+    collapsedContextThreshold: 4, stickyHeaders: true, layout: { paddingTop: 16, paddingBottom: 48, gap: 12 },
+    itemMetrics: { lineHeight: preferences.codeLineHeight }, unsafeCSS: CODE_VIEW_CSS,
+    ...(repositoryReview == null && window.repository != null ? { loadDiffFiles: async (fileDiff) => {
+      const comparison = await window.repository!.getComparison(fileDiff.name)
+      markReviewFileHydrated(fileDiff.name)
+      return { oldFile: comparison.oldFile, newFile: comparison.newFile } as Awaited<ReturnType<NonNullable<CodeViewReactOptions<ReviewAnnotationMetadata>['loadDiffFiles']>>>
+    }} : {})
+  }), [diffStyle, onBeginComment, onSelectLines, preferences, previousGutterActivationRef, repositoryReview])
+}
+
 interface MultiFileViewerProps {
+  worldId?: string | null
   paths: readonly string[]
   diffStyle: DiffStyle
   preferences: AppPreferences
@@ -341,6 +600,7 @@ interface MultiFileViewerProps {
   onScrollPositionChange(scrollTop: number): void
   onVisiblePathChange(path: string): void
   setViewerRef(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): void
+  getInitialScrollTop(): number
   toggleItemCollapsed(item: CodeViewItem<ReviewAnnotationMetadata>): void
   collapseAllFiles(): void
   expandAllFiles(): void
@@ -353,6 +613,7 @@ interface MultiFileViewerProps {
 }
 
 const MultiFileViewer = memo(function MultiFileViewer({
+  worldId = null,
   paths,
   diffStyle,
   preferences,
@@ -383,6 +644,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
   onScrollPositionChange,
   onVisiblePathChange,
   setViewerRef,
+  getInitialScrollTop,
   toggleItemCollapsed,
   collapseAllFiles,
   expandAllFiles,
@@ -402,7 +664,14 @@ const MultiFileViewer = memo(function MultiFileViewer({
     selection: CodeViewLineSelection
     timestamp: number
   } | null>(null)
-  useBackgroundScrollAnchor(pullRequestConversation, repositoryReview, scrollContainerRef, viewerRef)
+  const deferredConversation = useDeferredValue(pullRequestConversation)
+  useBackgroundScrollAnchor(
+    worldId,
+    deferredConversation,
+    repositoryReview,
+    scrollContainerRef,
+    viewerRef
+  )
 
   useEffect(() => () => {
     if (visiblePathTimerRef.current != null) clearTimeout(visiblePathTimerRef.current)
@@ -427,13 +696,13 @@ const MultiFileViewer = memo(function MultiFileViewer({
   const renderReviewSummary = useCallback(
     () => <>
       <SinceNotice removedPaths={sinceRemovedPaths} uncertainPaths={sinceUncertainPaths} />
-      <PullRequestContext conversation={pullRequestConversation} />
+      <PullRequestContext conversation={deferredConversation} />
       <ReviewSummary entries={summaryEntries}
         reattachingThreadId={reattachingThread?.threadId ?? null}
         onBeginReattach={beginSummaryReattach} onCancelReattach={onCancelReattach}
         onDrop={dropSummaryThread} />
     </>,
-    [beginSummaryReattach, dropSummaryThread, onCancelReattach, pullRequestConversation,
+    [beginSummaryReattach, deferredConversation, dropSummaryThread, onCancelReattach,
       reattachingThread, sinceRemovedPaths, sinceUncertainPaths, summaryEntries]
   )
   const handleToggleItemCollapsed = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
@@ -458,37 +727,20 @@ const MultiFileViewer = memo(function MultiFileViewer({
       })
     })
   }, [annotatedItems, collapsedItemIds, toggleItemCollapsed, viewerRef])
-  const renderHeaderPrefix = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
-    const expanded = !collapsedItemIds.has(item.id)
-    const path = pathFromItemId(item.id)
-    return (
-      <button type="button" data-review-collapse-button
-        aria-expanded={expanded} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${path}`}
-        title={`${expanded ? 'Collapse' : 'Expand'} file`} onClick={(event) => {
-          event.stopPropagation()
-          handleToggleItemCollapsed(item)
-        }}>
-        <IconChevronSm data-collapse-chevron aria-hidden="true" />
-      </button>
-    )
-  }, [collapsedItemIds, handleToggleItemCollapsed])
+  const renderHeaderPrefix = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => (
+    <ReviewFileCollapseButton
+      item={item}
+      expanded={!collapsedItemIds.has(item.id)}
+      onToggle={handleToggleItemCollapsed}
+    />
+  ), [collapsedItemIds, handleToggleItemCollapsed])
   // Viewed belongs in the header's metadata slot on the trailing edge. Rendered
   // in the prefix slot it shared a narrow box with the collapse button and
   // wrapped onto a second line under the chevron.
   const renderHeaderMetadata = useCallback((item: CodeViewItem<ReviewAnnotationMetadata>) => {
     const path = pathFromItemId(item.id)
-    const viewed = viewedPaths.has(path)
     return (
-      <span className="review-file-metadata">
-        <label data-review-viewed-toggle data-state={viewed ? 'checked' : 'unchecked'}
-          title={viewed ? 'Mark as not viewed' : 'Mark as viewed'}
-          onClick={(event) => event.stopPropagation()}>
-          <input type="checkbox" checked={viewed} aria-label={`Mark ${path} as viewed`}
-            onChange={() => onToggleViewed(path)} />
-          <span data-review-viewed-checkbox aria-hidden="true"><IconCheck /></span>
-          <span>Viewed</span>
-        </label>
-      </span>
+      <ReviewViewedToggle path={path} viewed={viewedPaths.has(path)} onToggle={onToggleViewed} />
     )
   }, [onToggleViewed, viewedPaths])
   const renderReviewAnnotation = useCallback((
@@ -518,45 +770,27 @@ const MultiFileViewer = memo(function MultiFileViewer({
   }, [cancelComment, onAskAgentAboutSelection, onCommentOnSelection, onReplyToRemoteThread,
     onResolveRemoteThread, onSelectLines, pendingRemoteThreadId, reattachingThread,
     saveComment, updateThread])
+  const codeViewSlots = useMemo<ReviewCodeViewSlots>(() => ({
+    header: renderReviewSummary,
+    headerPrefix: renderHeaderPrefix,
+    headerMetadata: renderHeaderMetadata,
+    annotation: renderReviewAnnotation
+  }), [renderHeaderMetadata, renderHeaderPrefix, renderReviewAnnotation, renderReviewSummary])
   const codeStyle = useMemo(() => ({
     '--diffs-font-family': CODE_FONTS[preferences.codeFont].fontFamily,
     '--diffs-header-font-family': INTERFACE_FONTS[preferences.interfaceFont].fontFamily,
-    '--diffs-font-size': `${preferences.codeFontSize}px`,
-    '--diffs-line-height': `${preferences.codeLineHeight}px`,
+    '--diffs-font-size': `var(${LIVE_CODE_FONT_SIZE_PROPERTY}, ${preferences.codeFontSize}px)`,
+    '--diffs-line-height': `var(${LIVE_CODE_LINE_HEIGHT_PROPERTY}, ${preferences.codeLineHeight}px)`,
     '--diffs-font-features': '"calt" 1, "liga" 1'
   }) as CSSProperties, [preferences])
-  const codeViewOptions = useMemo<CodeViewReactOptions<ReviewAnnotationMetadata>>(() => ({
-    // No `theme`: the worker pool resolves it and re-renders every instance on a
-    // switch, so passing it here only forced a second full rebuild of the DOM.
-    themeType: getEditorThemeType(preferences.editorTheme), diffStyle, diffIndicators: 'bars', lineDiffType: 'word-alt',
-    overflow: preferences.wordWrap ? 'wrap' : 'scroll', disableLineNumbers: !preferences.showLineNumbers,
-    tokenizeMaxLineLength: 2_000, enableLineSelection: true, enableGutterUtility: true,
-    onLineSelectionEnd: (range, context) => onSelectLines(range == null ? null : { id: context.item.id, range }),
-    onGutterUtilityClick: (range, context) => {
-      const selection = { id: context.item.id, range }
-      const timestamp = performance.now()
-      const opensComment = isGutterDoubleClick(previousGutterActivationRef.current, selection, timestamp)
-      previousGutterActivationRef.current = opensComment ? null : { selection, timestamp }
-      onSelectLines(selection)
-      // CodeView reports selection-end after this callback. Starting the draft
-      // on the next microtask lets that report finish before the action bar is cleared.
-      if (opensComment) queueMicrotask(() => onBeginComment(selection))
-    },
-    onPostRender: (node, _instance, phase, context) => {
-      syncDragGuideLifecycle(node, phase, (range) => onSelectLines({ id: context.item.id, range }))
-      syncSplitDiffResizeLifecycle(node, phase)
-      syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
-      syncReviewCaretLifecycle(node, phase)
-    },
-    lineHoverHighlight: 'number', hunkSeparators: 'line-info-basic', expandUnchanged: !preferences.foldUnchanged,
-    collapsedContextThreshold: 4, stickyHeaders: true, layout: { paddingTop: 16, paddingBottom: 48, gap: 12 },
-    itemMetrics: { lineHeight: preferences.codeLineHeight }, unsafeCSS: CODE_VIEW_CSS,
-    ...(repositoryReview == null && window.repository != null ? { loadDiffFiles: async (fileDiff) => {
-      const comparison = await window.repository!.getComparison(fileDiff.name)
-      markReviewFileHydrated(fileDiff.name)
-      return { oldFile: comparison.oldFile, newFile: comparison.newFile } as Awaited<ReturnType<NonNullable<CodeViewReactOptions<ReviewAnnotationMetadata>['loadDiffFiles']>>>
-    }} : {})
-  }), [diffStyle, onBeginComment, onSelectLines, preferences, repositoryReview])
+  const codeViewOptions = useReviewCodeViewOptions({
+    diffStyle,
+    preferences,
+    repositoryReview,
+    previousGutterActivationRef,
+    onSelectLines,
+    onBeginComment
+  })
   const handleScroll = useCallback((scrollTop: number) => {
     onScrollPositionChange(scrollTop)
     const backToTopVisible = scrollTop > BACK_TO_TOP_THRESHOLD
@@ -581,46 +815,75 @@ const MultiFileViewer = memo(function MultiFileViewer({
     }, ACTIVE_PATH_SETTLE_MS)
   }, [onScrollPositionChange, onVisiblePathChange, viewerRef])
 
-  if (paths.length === 0) return <div className="since-empty-state">
-    <SinceNotice removedPaths={sinceRemovedPaths} uncertainPaths={sinceUncertainPaths} />
-    <div className="diff-state"><IconCodeSearch /><strong>No current diffs to review</strong><span>The changed paths are no longer part of this pull request.</span></div>
-  </div>
-  if (loadState.items.length === 0 && loading) return <div className="diff-state"><IconRefresh className="spin" /><span>Loading repository review…</span></div>
-  if (loadState.items.length === 0) {
-    const emptyDetail = loadState.failedCount > 0
-      ? 'The changed files could not be loaded.'
-      : loadState.omittedFiles.length + loadState.skippedCount > 0
-        ? 'Every changed file is too large or binary to open here.'
-        : 'The review loaded, but its patch could not be parsed.'
-    return <div className="diff-state"><IconWarningOctogonFill /><strong>No diffs to display</strong><span>{emptyDetail}</span></div>
-  }
+  const retainedWorldIds = useRetainedWorldViewers(worldId)
+  const viewerSlots = retainedWorldIds.flatMap((id) => {
+    const items = itemsForRetainedWorld(
+      id,
+      worldId,
+      annotatedItems,
+      worldViewCache.get(id)?.annotated?.items
+    )
+    return items == null ? [] : [{ id, items }]
+  })
+  worldViewCache.retainMountedViewers(viewerSlots.map((slot) => slot.id))
+
+  const activeHasItems = paths.length > 0 && loadState.items.length > 0
+  const emptyOverlay = (
+    <ReviewEmptyOverlay
+      pathCount={paths.length}
+      itemCount={loadState.items.length}
+      loading={loading}
+      failedCount={loadState.failedCount}
+      omittedCount={loadState.omittedFiles.length}
+      skippedCount={loadState.skippedCount}
+      removedPaths={sinceRemovedPaths}
+      uncertainPaths={sinceUncertainPaths}
+    />
+  )
+  if (emptyOverlay != null && viewerSlots.length === 0) return emptyOverlay
+
   const remainingPathCount = paths.length - targetPathCount
   // The pill keeps showing the reviewed count once loading settles: it is the
   // progress through the review, and fading it left an empty floating box behind.
   return <div className="multi-file-review">
-    <div className="multi-file-progress" style={{
-      '--review-progress': loadState.items.length === 0 ? 0 : viewedCount / loadState.items.length
-    } as CSSProperties}><div role="status">
-      <span>{loading
-        ? `Loading ${loadState.loadedPaths.size} of ${targetPathCount}`
-        : `${viewedCount} of ${loadState.items.length} reviewed`}</span>
-      {loadState.skippedCount > 0 ? <span>{loadState.skippedCount} binary or large</span> : null}
-      {loadState.omittedFiles.length > 0 ? <span title={loadState.omittedFiles.map((file) => file.path).join('\n')}>{loadState.omittedFiles.length} too large to diff</span> : null}
-      {loadState.failedCount > 0 ? <span className="multi-file-error"><IconWarningOctogonFill />{loadState.failedCount} failed</span> : null}
-    </div>{remainingPathCount > 0 ? <div className="multi-file-page-actions">
-      <button type="button" onClick={onLoadMore} disabled={loading}>
-        Load {Math.min(FOLDER_REVIEW_PAGE_SIZE, remainingPathCount)} more
-      </button>
-    </div> : null}<div className="multi-file-fold-actions" role="group" aria-label="Multi-file folding">
-      <button type="button" onClick={collapseAllFiles} disabled={collapsedItemIds.size === loadState.items.length}>Collapse all</button>
-      <button type="button" onClick={expandAllFiles} disabled={collapsedItemIds.size === 0}>Expand all</button>
-    </div></div>
-    <CodeView<ReviewAnnotationMetadata> ref={setViewerRef} containerRef={scrollContainerRef}
-      items={annotatedItems} onScroll={handleScroll}
-      options={codeViewOptions} selectedLines={selectedLines} onSelectedLinesChange={onSelectLines}
-      renderCodeViewHeader={renderReviewSummary} renderHeaderPrefix={renderHeaderPrefix}
-      renderHeaderMetadata={renderHeaderMetadata}
-      renderAnnotation={renderReviewAnnotation} className="multi-file-code-view" style={codeStyle} />
+    {emptyOverlay}
+    {activeHasItems ? (
+      <ReviewProgressBar
+        loading={loading}
+        loadedPathCount={loadState.loadedPaths.size}
+        targetPathCount={targetPathCount}
+        remainingPathCount={remainingPathCount}
+        viewedCount={viewedCount}
+        itemCount={loadState.items.length}
+        skippedCount={loadState.skippedCount}
+        omittedFiles={loadState.omittedFiles}
+        failedCount={loadState.failedCount}
+        collapsedCount={collapsedItemIds.size}
+        onLoadMore={onLoadMore}
+        collapseAllFiles={collapseAllFiles}
+        expandAllFiles={expandAllFiles}
+      />
+    ) : null}
+    <div className="multi-file-code-view-host">
+      {viewerSlots.map((slot) => (
+        <RetainedWorldCodeView
+          key={slot.id}
+          worldId={slot.id}
+          active={slot.id === worldId && activeHasItems}
+          items={slot.items}
+          selectedLines={selectedLines}
+          codeViewOptions={codeViewOptions}
+          codeStyle={codeStyle}
+          slots={codeViewSlots}
+          onSelectLines={onSelectLines}
+          onScroll={handleScroll}
+          scrollContainerRef={scrollContainerRef}
+          setViewerRef={setViewerRef}
+          getInitialScrollTop={getInitialScrollTop}
+          loading={loading}
+        />
+      ))}
+    </div>
     <BackToTopButton visible={showBackToTop} onClick={() => scrollToReviewTop(viewerRef.current)} />
   </div>
 })
@@ -638,6 +901,7 @@ interface ReviewSelectionOptions {
 
 function useReviewSelectionActions({
   items,
+  worldId,
   reattachingThread,
   beginComment,
   beginReattach,
@@ -645,13 +909,18 @@ function useReviewSelectionActions({
   handleSelectedLinesChange,
   reattachToSelection,
   onAttachToAgent
-}: ReviewSelectionOptions) {
+}: ReviewSelectionOptions & { worldId: string }) {
   // A finished selection offers actions first; commenting is one possible
   // outcome rather than the selection's automatic next state.
   const [pendingSelection, setPendingSelection] = useState<{
     id: string
     range: CodeViewLineSelection['range']
   } | null>(null)
+  const [selectionWorldId, setSelectionWorldId] = useState(worldId)
+  if (selectionWorldId !== worldId) {
+    setSelectionWorldId(worldId)
+    setPendingSelection(null)
+  }
   const handleSelectLines = useCallback((selection: CodeViewLineSelection | null) => {
     setPendingSelection(selection)
     handleSelectedLinesChange(selection)
@@ -738,7 +1007,7 @@ const MultiFileReview = memo(function MultiFileReview({
   scrollToReviewRevision,
   navigationPath,
   navigationRevision,
-  initialScrollTop,
+  getInitialScrollTop,
   onScrollPositionChange,
   onVisiblePathChange,
   threadsByPath,
@@ -750,16 +1019,15 @@ const MultiFileReview = memo(function MultiFileReview({
   onReplyToRemoteThread,
   onResolveRemoteThread,
   onAttachToAgent,
-  reviewCommand
+  reviewCommand,
+  worldId
 }: MultiFileReviewProps): React.JSX.Element {
   useLayoutEffect(() => markRendererStartup('viewerCommitted'), [])
   const viewerRef = useRef<CodeViewHandle<ReviewAnnotationMetadata> | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
   const viewedAdvanceFrameRef = useRef(0)
   const handledNavigationRevisionRef = useRef(navigationRevision)
-  const restoredScrollPositionRef = useRef(false)
-  const pathsKey = paths.join('\0')
-  const stablePaths = useMemo(() => pathsKey === '' ? [] : pathsKey.split('\0'), [pathsKey])
+  const stablePaths = paths
   const {
     selectedLines,
     draftComment,
@@ -782,7 +1050,8 @@ const MultiFileReview = memo(function MultiFileReview({
   } = useReviewThreads({
     items: loadState.items,
     threadsByPath,
-    setThreadsByPath
+    setThreadsByPath,
+    worldId
   })
   const {
     pendingSelection,
@@ -794,6 +1063,7 @@ const MultiFileReview = memo(function MultiFileReview({
     askAgentAboutSelection
   } = useReviewSelectionActions({
     items: loadState.items,
+    worldId,
     reattachingThread,
     beginComment,
     beginReattach,
@@ -828,52 +1098,6 @@ const MultiFileReview = memo(function MultiFileReview({
       behavior: 'smooth-auto'
     })
   }, [loadState.loadedPaths, navigationPath, navigationRevision, paths])
-
-  // Only the position this view carried in at mount is ever restored. Reading the
-  // live prop instead let a later parent render (a conversation poll, a saved
-  // review session) start a restore mid-scroll and pin the reader in place.
-  const restoreTargetRef = useRef(initialScrollTop)
-  useEffect(() => {
-    if (restoredScrollPositionRef.current || loading || loadState.items.length === 0) return
-    restoredScrollPositionRef.current = true
-    const restoreTarget = restoreTargetRef.current
-    if (restoreTarget <= 0) return
-    // Virtualized content settles asynchronously (highlighting, measurement),
-    // so a single scrollTo clamps early; retry until the target holds or the
-    // user takes over scrolling.
-    let frame = 0
-    let settledFrames = 0
-    let cancelled = false
-    const startedAt = performance.now()
-    const cancel = (): void => {
-      cancelled = true
-    }
-    const stopObservingScrollTakeover = observeScrollTakeover(scrollContainerRef.current, cancel)
-    const step = (): void => {
-      if (cancelled) return
-      const viewer = viewerRef.current
-      if (viewer == null) return
-      const current = getViewerScrollTop(viewer)
-      if (current != null && Math.abs(current - restoreTarget) <= 1) {
-        settledFrames += 1
-        // Late measurement can still move the target out from under a position that
-        // looked right, so hold it for a few frames before letting go.
-        if (settledFrames >= SCROLL_RESTORE_SETTLED_FRAMES) return
-      } else {
-        settledFrames = 0
-        viewer.scrollTo({ type: 'position', position: restoreTarget, behavior: 'instant' })
-      }
-      // Bounded by elapsed time rather than a frame count, so a 120 Hz display does
-      // not give up in half the time.
-      if (performance.now() - startedAt < SCROLL_RESTORE_TIMEOUT_MS) frame = window.requestAnimationFrame(step)
-    }
-    step()
-    return () => {
-      cancelled = true
-      window.cancelAnimationFrame(frame)
-      stopObservingScrollTakeover()
-    }
-  }, [loadState.items.length, loading])
 
   useEffect(() => {
     if (scrollToReviewRevision === 0) return
@@ -950,30 +1174,35 @@ const MultiFileReview = memo(function MultiFileReview({
     draftComment,
     pendingSelection,
     collapsedItemIds,
-    annotationVersions
+    annotationVersions,
+    worldId
   })
 
-  return <MultiFileViewer
-    paths={stablePaths} diffStyle={diffStyle} preferences={preferences}
-    repositoryReview={repositoryReview} pullRequestConversation={pullRequestConversation}
-    sinceRemovedPaths={sinceRemovedPaths} sinceUncertainPaths={sinceUncertainPaths}
-    loadState={loadState} loading={loading}
-    targetPathCount={targetPathCount} onLoadMore={onLoadMore}
-    selectedLines={selectedLines} annotatedItems={annotatedItems} threadsByPath={threadsByPath}
-    collapsedItemIds={collapsedItemIds} viewedPaths={viewedPaths}
-    viewedCount={viewedPaths.size} onToggleViewed={toggleViewed} scrollContainerRef={scrollContainerRef}
-    viewerRef={viewerRef}
-    remoteThreadsByPath={remoteThreadsByPath} pendingRemoteThreadId={pendingRemoteThreadId}
-    onReplyToRemoteThread={onReplyToRemoteThread} onResolveRemoteThread={onResolveRemoteThread}
-    pendingSelection={pendingSelection} onSelectLines={handleSelectLines}
-    onCommentOnSelection={commentOnSelection} onBeginComment={beginCommentAtSelection}
-    onAskAgentAboutSelection={askAgentAboutSelection}
-    onScrollPositionChange={onScrollPositionChange} onVisiblePathChange={onVisiblePathChange} setViewerRef={setViewerRef}
-    toggleItemCollapsed={toggleItemCollapsed} collapseAllFiles={collapseAllFiles}
-    expandAllFiles={expandAllFiles} cancelComment={cancelComment} saveComment={saveComment}
-    updateThread={updateThread} reattachingThread={reattachingThread}
-    onBeginReattach={startReattach} onCancelReattach={stopReattach}
-  />
+  return <ReviewClockProvider>
+    <MultiFileViewer
+      worldId={worldId}
+      paths={stablePaths} diffStyle={diffStyle} preferences={preferences}
+      repositoryReview={repositoryReview} pullRequestConversation={pullRequestConversation}
+      sinceRemovedPaths={sinceRemovedPaths} sinceUncertainPaths={sinceUncertainPaths}
+      loadState={loadState} loading={loading}
+      targetPathCount={targetPathCount} onLoadMore={onLoadMore}
+      selectedLines={selectedLines} annotatedItems={annotatedItems} threadsByPath={threadsByPath}
+      collapsedItemIds={collapsedItemIds} viewedPaths={viewedPaths}
+      viewedCount={viewedPaths.size} onToggleViewed={toggleViewed} scrollContainerRef={scrollContainerRef}
+      viewerRef={viewerRef}
+      remoteThreadsByPath={remoteThreadsByPath} pendingRemoteThreadId={pendingRemoteThreadId}
+      onReplyToRemoteThread={onReplyToRemoteThread} onResolveRemoteThread={onResolveRemoteThread}
+      pendingSelection={pendingSelection} onSelectLines={handleSelectLines}
+      onCommentOnSelection={commentOnSelection} onBeginComment={beginCommentAtSelection}
+      onAskAgentAboutSelection={askAgentAboutSelection}
+      onScrollPositionChange={onScrollPositionChange} onVisiblePathChange={onVisiblePathChange} setViewerRef={setViewerRef}
+      getInitialScrollTop={getInitialScrollTop}
+      toggleItemCollapsed={toggleItemCollapsed} collapseAllFiles={collapseAllFiles}
+      expandAllFiles={expandAllFiles} cancelComment={cancelComment} saveComment={saveComment}
+      updateThread={updateThread} reattachingThread={reattachingThread}
+      onBeginReattach={startReattach} onCancelReattach={stopReattach}
+    />
+  </ReviewClockProvider>
 })
 
 export default MultiFileReview

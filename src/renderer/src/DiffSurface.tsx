@@ -13,6 +13,7 @@ import {
 import type { ContentSearchResult, FileComparison } from '../../shared/contracts'
 import type { AgentSelection } from './agentAttachments'
 import type { DiffStyle } from './AppView'
+import { LIVE_CODE_FONT_SIZE_PROPERTY, LIVE_CODE_LINE_HEIGHT_PROPERTY } from './codeZoom'
 import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
 import { syncDragGuideLifecycle } from './dragSelection'
 import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
@@ -265,8 +266,8 @@ function DiffContents({
   const codeStyle = useMemo(() => ({
     '--diffs-font-family': CODE_FONTS[preferences.codeFont].fontFamily,
     '--diffs-header-font-family': INTERFACE_FONTS[preferences.interfaceFont].fontFamily,
-    '--diffs-font-size': `${preferences.codeFontSize}px`,
-    '--diffs-line-height': `${preferences.codeLineHeight}px`,
+    '--diffs-font-size': `var(${LIVE_CODE_FONT_SIZE_PROPERTY}, ${preferences.codeFontSize}px)`,
+    '--diffs-line-height': `var(${LIVE_CODE_LINE_HEIGHT_PROPERTY}, ${preferences.codeLineHeight}px)`,
     '--diffs-font-features': '"calt" 1, "liga" 1'
   }) as CSSProperties, [preferences])
 

@@ -1,25 +1,27 @@
-import { memo, useEffect, useState } from 'react'
+import { lazy, memo, Suspense, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { IconCiWarningFill } from '@pierre/icons'
 
 import type { PerformanceMetrics } from '../../shared/contracts'
-import { PerformanceChart } from './PerformanceChart'
 import {
   formatPerformanceMemory,
   formatPerformancePercent,
   getMemorySamples,
-  recordMemorySample,
-  type MemorySample
+  recordMemorySample
 } from './performanceHistory'
 import { getReviewMetrics, type ReviewMetrics } from './reviewMetrics'
 import { isHighMemory } from './performanceHealth'
 import { getRendererStartupMetrics } from './startupMetrics'
 
+const PerformanceChart = lazy(async () => ({
+  default: (await import('./PerformanceChart')).PerformanceChart
+}))
+
 // The lightweight sample uses Electron's in-process app metrics. Keep it fast
 // enough to catch a short memory spike; expensive process detail remains gated
 // behind the open Diagnostics disclosure.
 const SAMPLE_INTERVAL_OPEN_MS = 2_000
-const SAMPLE_INTERVAL_COLLAPSED_MS = 3_000
+const SAMPLE_INTERVAL_COLLAPSED_MS = 15_000
 const SAMPLE_TIMEOUT_MS = 5_000
 const sampledTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: 'numeric',
@@ -33,6 +35,13 @@ type ProcessStyle = CSSProperties & {
   '--performance-process-share': number
 }
 
+function sameReviewMetrics(left: ReviewMetrics, right: ReviewMetrics): boolean {
+  return left.loadedItems === right.loadedItems &&
+    left.hydratedFiles === right.hydratedFiles &&
+    left.workspaceRenders === right.workspaceRenders &&
+    left.agentStreamEvents === right.agentStreamEvents
+}
+
 function formatStartupTiming(milliseconds: number | null | undefined): string {
   return milliseconds == null ? '—' : `${Math.round(milliseconds)} ms`
 }
@@ -40,7 +49,8 @@ function formatStartupTiming(milliseconds: number | null | undefined): string {
 export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element {
   const [metrics, setMetrics] = useState<PerformanceMetrics | null>(null)
   const [reviewMetrics, setReviewMetrics] = useState<ReviewMetrics>(getReviewMetrics)
-  const [history, setHistory] = useState<readonly MemorySample[]>(getMemorySamples)
+  const reviewMetricsRef = useRef(reviewMetrics)
+  const history = getMemorySamples()
   const [popoverOpen, setPopoverOpen] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const [samplingStatus, setSamplingStatus] = useState<SamplingStatus>('sampling')
@@ -73,19 +83,25 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
         if (!disposed) {
           setMetrics(nextMetrics)
           setSamplingStatus('live')
-          setHistory([...recordMemorySample({
+          recordMemorySample({
             atMs: nextMetrics.sampledAt,
             workingSetMegabytes: nextMetrics.workingSetMegabytes,
             rendererPrivateMegabytes: nextMetrics.rendererPrivateMegabytes,
             cpuPercent: nextMetrics.cpuPercent,
             gpuProcessCpuPercent: nextMetrics.gpuProcessCpuPercent
-          })])
+          })
         }
       } catch {
         if (!disposed) setSamplingStatus('unavailable')
       } finally {
         if (sampleTimeout != null) window.clearTimeout(sampleTimeout)
-        if (!disposed) setReviewMetrics(getReviewMetrics())
+        if (!disposed) {
+          const nextReviewMetrics = getReviewMetrics()
+          if (!sameReviewMetrics(reviewMetricsRef.current, nextReviewMetrics)) {
+            reviewMetricsRef.current = nextReviewMetrics
+            setReviewMetrics(nextReviewMetrics)
+          }
+        }
         scheduleSample()
       }
     }
@@ -150,7 +166,9 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
             <div className={highMemory ? 'high-memory' : undefined}><dt>Working set</dt><dd>{metrics == null ? '—' : formatPerformanceMemory(metrics.workingSetMegabytes)}</dd><small>{metrics == null ? 'Sampling…' : highMemory ? `High · ${metrics.processCount} processes` : `${metrics.processCount} processes`}</small></div>
           </dl>
 
-          {popoverOpen ? <PerformanceChart history={history} /> : null}
+          {popoverOpen ? <Suspense fallback={null}>
+            <PerformanceChart history={history} historyVersion={metrics?.sampledAt} />
+          </Suspense> : null}
 
           <details className="performance-diagnostics" onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}>
             <summary>

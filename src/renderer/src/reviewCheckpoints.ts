@@ -1,10 +1,14 @@
 import type { PullRequestFile, PullRequestReview } from '../../shared/contracts'
 import { parseDiffGitHeaderPaths } from '../../shared/patchHeaders'
+import {
+  browserBudgetStorage,
+  persistManagedValue
+} from './storageBudget'
 
 const STORAGE_PREFIX = 'better-code-diff:review-checkpoint:'
 const CHECKPOINT_VERSION = 1
 const MAX_MANIFEST_FILES = 10_000
-const MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+const MAX_SERIALIZED_UTF16_UNITS = 2 * 1024 * 1024
 const DIFF_SECTION_PREFIX = 'diff --git '
 
 export interface ReviewCheckpointFile {
@@ -30,6 +34,7 @@ export interface CheckpointComparison {
 
 export interface SinceReview {
   review: PullRequestReview
+  patchPages?: readonly string[]
   removedPaths: string[]
   uncertainPaths: string[]
 }
@@ -112,9 +117,16 @@ export function loadReviewCheckpoint(root: string, pullRequestUrl: string): Revi
 export function saveReviewCheckpoint(root: string, checkpoint: ReviewCheckpoint): boolean {
   try {
     const serialized = JSON.stringify(checkpoint)
-    if (serialized.length > MAX_SERIALIZED_BYTES || parseStoredReviewCheckpoint(serialized) == null) return false
-    localStorage.setItem(reviewCheckpointStorageKey(root, checkpoint.pullRequestUrl), serialized)
-    return true
+    if (serialized.length > MAX_SERIALIZED_UTF16_UNITS || parseStoredReviewCheckpoint(serialized) == null) {
+      return false
+    }
+    const storage = browserBudgetStorage()
+    if (storage == null) return false
+    return persistManagedValue(
+      storage,
+      reviewCheckpointStorageKey(root, checkpoint.pullRequestUrl),
+      serialized
+    )
   } catch {
     return false
   }
@@ -158,21 +170,30 @@ function patchSectionStarts(patch: string): number[] {
   return starts
 }
 
-function patchSectionPath(section: string): string | null {
-  const header = section.slice(0, section.indexOf('\n') === -1 ? section.length : section.indexOf('\n'))
-  return parseDiffGitHeaderPaths(header)?.path ?? null
-}
-
 export function filterReviewPatch(patch: string, paths: ReadonlySet<string>): string {
   if (patch === '' || paths.size === 0) return ''
   const starts = patchSectionStarts(patch)
-  const sections: string[] = []
+  const kept: string[] = []
   for (let index = 0; index < starts.length; index += 1) {
-    const section = patch.slice(starts[index], starts[index + 1] ?? patch.length)
-    const path = patchSectionPath(section)
-    if (path != null && paths.has(path)) sections.push(section)
+    const start = starts[index]!
+    const end = starts[index + 1] ?? patch.length
+    const headerEnd = patch.indexOf('\n', start)
+    const header = patch.slice(start, headerEnd === -1 || headerEnd > end ? end : headerEnd)
+    const path = parseDiffGitHeaderPaths(header)?.path ?? null
+    if (path != null && paths.has(path)) kept.push(patch.slice(start, end))
   }
-  return sections.join('')
+  return kept.join('')
+}
+
+export function filterReviewPatchPages(
+  pages: readonly string[],
+  paths: ReadonlySet<string>
+): string[] {
+  if (pages.length === 0 || paths.size === 0) return []
+  return pages.flatMap((page) => {
+    const filtered = filterReviewPatch(page, paths)
+    return filtered === '' ? [] : [filtered]
+  })
 }
 
 export function createSinceReview(review: PullRequestReview, checkpoint: ReviewCheckpoint): SinceReview {
@@ -186,6 +207,27 @@ export function createSinceReview(review: PullRequestReview, checkpoint: ReviewC
       omittedFiles: review.omittedFiles.filter((file) => changedPaths.has(file.path)),
       expectedFileCount: comparison.changedFiles.length
     },
+    removedPaths: comparison.removedPaths,
+    uncertainPaths: comparison.uncertainPaths
+  }
+}
+
+export function createSinceReviewFromPages(
+  review: PullRequestReview,
+  patchPages: readonly string[],
+  checkpoint: ReviewCheckpoint
+): SinceReview {
+  const comparison = compareReviewCheckpoint(checkpoint, review.files)
+  const changedPaths = new Set(comparison.changedFiles.map((file) => file.path))
+  return {
+    review: {
+      ...review,
+      files: comparison.changedFiles,
+      patch: '',
+      omittedFiles: review.omittedFiles.filter((file) => changedPaths.has(file.path)),
+      expectedFileCount: comparison.changedFiles.length
+    },
+    patchPages: filterReviewPatchPages(patchPages, changedPaths),
     removedPaths: comparison.removedPaths,
     uncertainPaths: comparison.uncertainPaths
   }

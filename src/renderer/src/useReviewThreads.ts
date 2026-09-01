@@ -1,4 +1,4 @@
-import { useCallback, useState, type Dispatch, type SetStateAction } from 'react'
+import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from 'react'
 import type { CodeViewItem, CodeViewLineSelection, SelectedLineRange } from '@pierre/diffs'
 
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
@@ -7,6 +7,7 @@ import {
   attachReviewThreadToRange,
   createReviewCommentAnchor
 } from './reviewThreadAnchors'
+import { worldViewCache } from './worldViewCache'
 
 export interface DraftReviewComment {
   path: string
@@ -35,6 +36,7 @@ interface ReviewThreadsOptions {
   items: readonly CodeViewItem<ReviewAnnotationMetadata>[]
   threadsByPath: Readonly<Record<string, ReviewThread[]>>
   setThreadsByPath: Dispatch<SetStateAction<Record<string, ReviewThread[]>>>
+  worldId?: string | null
 }
 
 export interface ReattachingReviewThread {
@@ -67,13 +69,27 @@ interface ReviewThreadsApi {
 export function useReviewThreads({
   items,
   threadsByPath,
-  setThreadsByPath
+  setThreadsByPath,
+  worldId = null
 }: ReviewThreadsOptions): ReviewThreadsApi {
   const [selectedLines, setSelectedLines] = useState<CodeViewLineSelection | null>(null)
   const [draftComment, setDraftComment] = useState<DraftReviewComment | null>(null)
   const [annotationVersions, setAnnotationVersions] = useState<Record<string, number>>({})
   const [collapsedItemIds, setCollapsedItemIds] = useState<Set<string>>(() => new Set())
   const [reattachingThread, setReattachingThread] = useState<ReattachingReviewThread | null>(null)
+  const [activeWorldId, setActiveWorldId] = useState(worldId)
+  if (activeWorldId !== worldId) {
+    if (activeWorldId != null) worldViewCache.rememberCollapsed(activeWorldId, collapsedItemIds)
+    setActiveWorldId(worldId)
+    const cachedCollapsed = worldId == null ? null : worldViewCache.get(worldId)?.collapsedItemIds
+    setCollapsedItemIds(cachedCollapsed instanceof Set ? cachedCollapsed : new Set(cachedCollapsed))
+    setSelectedLines(null)
+    setDraftComment(null)
+    setReattachingThread(null)
+    setAnnotationVersions((current) =>
+      Object.keys(current).length === 0 ? current : {}
+    )
+  }
 
   const bumpAnnotationVersion = useCallback((path: string) => {
     setAnnotationVersions((current) => ({
@@ -214,6 +230,11 @@ export function useReviewThreads({
     }))
     bumpAnnotationVersion(path)
   }, [bumpAnnotationVersion, setThreadsByPath])
+
+  useEffect(() => {
+    if (worldId == null) return
+    worldViewCache.rememberCollapsed(worldId, collapsedItemIds)
+  }, [collapsedItemIds, worldId])
 
   return {
     selectedLines,

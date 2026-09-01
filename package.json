@@ -16,15 +16,18 @@
     "dist:linux": "bun run icon && bun run build && electron-builder --linux AppImage deb",
     "install:mac": "bash scripts/install-macos-app.sh",
     "update:mac": "bun run dist:mac && bun run install:mac",
-    "open:mac": "open -a \"Horus\"",
+    "open:mac": "env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ASAR open -a \"Horus\"",
     "update:mac:open": "bun run update:mac && bun run open:mac",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "tsc -b tsconfig.json",
     "lint": "oxlint src",
+    "lint:css": "stylelint \"src/renderer/src/**/*.css\"",
     "test": "bun test",
-    "verify": "bun run lint && bun run typecheck && bun test && bun run build",
+    "verify": "bun run lint && bun run lint:css && bun run typecheck && bun test && bun run build && bun run check:entry",
+    "check:entry": "bun scripts/check-entry-chunk.mjs",
     "perf:snapshot": "bash scripts/benchmark-memory.sh",
-    "perf:startup": "bun scripts/benchmark-startup.mjs"
+    "perf:startup": "bun scripts/benchmark-startup.mjs",
+    "perf:patch-stream": "bun scripts/benchmark-patch-stream.mjs"
   },
   "comment:dependencies": "electron-builder packs `dependencies` into the app verbatim. Only packages the main process resolves at runtime belong here: the Claude Agent SDK, @vscode/ripgrep, and the native node-pty bridge. Everything the renderer uses is bundled by Vite into out/renderer, so shipping it again would be dead weight.",
   "dependencies": {
@@ -37,7 +40,7 @@
     "@fontsource-variable/inter": "^5.3.0",
     "@pierre/diffs": "1.3.6",
     "@pierre/icons": "0.7.1",
-    "@pierre/theme": "1.1.0",
+    "@pierre/theme": "2.0.0",
     "@pierre/trees": "1.0.0-beta.6",
     "@testing-library/react": "^16.3.2",
     "@types/bun": "^1.3.14",
@@ -48,6 +51,7 @@
     "@xterm/addon-fit": "0.11.0",
     "@xterm/addon-webgl": "0.19.0",
     "@xterm/xterm": "6.0.0",
+    "babel-plugin-react-compiler": "^1.0.0",
     "electron": "43.3.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "5.0.0",
@@ -59,8 +63,13 @@
     "rehype-raw": "^7.0.0",
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
+    "stylelint": "16.23.1",
+    "stylelint-config-standard": "39.0.0",
     "typescript": "^5.9.3",
     "vite": "7.3.6"
+  },
+  "overrides": {
+    "@pierre/theme": "2.0.0"
   },
   "packageManager": "bun@1.3.9",
   "trustedDependencies": [
@@ -82,6 +91,7 @@
     },
     "files": [
       "out/**/*",
+      "!out/renderer/assets/*.map",
       "package.json",
       "!node_modules/@anthropic-ai/claude-agent-sdk-*/**"
     ],

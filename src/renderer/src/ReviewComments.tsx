@@ -126,7 +126,10 @@ export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): Re
         value={body}
         onChange={(event) => setBody(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === 'Escape') onCancel()
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            onCancel()
+          }
           if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) save()
         }}
         placeholder="Leave a review comment…"
@@ -211,7 +214,10 @@ export function ReviewThreadCard({
             value={replyBody}
             onChange={(event) => setReplyBody(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') setReplying(false)
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                setReplying(false)
+              }
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) saveReply()
             }}
             placeholder="Reply…"

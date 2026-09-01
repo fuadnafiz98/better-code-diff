@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 
 import {
   anchoredScrollOffset,
+  codeLineHeightAtZoom,
   MAX_CODE_ZOOM_FONT_SIZE,
   MIN_CODE_ZOOM_FONT_SIZE,
   nextCodeZoomFontSize
@@ -21,5 +22,10 @@ describe('code zoom', () => {
   it('keeps the content below the gesture focal point stationary', () => {
     expect(anchoredScrollOffset(400, 200, 1.5)).toBe(700)
     expect(anchoredScrollOffset(0, 100, 0.5)).toBe(0)
+  })
+
+  it('scales and rounds line height with the live font size', () => {
+    expect(codeLineHeightAtZoom(13, 20, 15)).toBe(23.08)
+    expect(codeLineHeightAtZoom(0, 20, 15)).toBe(20)
   })
 })

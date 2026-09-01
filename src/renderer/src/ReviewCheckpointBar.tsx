@@ -29,16 +29,18 @@ export function ReviewCheckpointBar({
       : `${changedFileCount} since checkpoint${removedFileCount === 0 ? '' : ` · ${removedFileCount} removed`}`
 
   return (
-    <div className="review-checkpoint-bar" role="status">
+    <div className="review-bar review-checkpoint-bar" role="status">
       <span title={checkpointLabel}><IconClockArrow />{checkpointLabel}</span>
       <div>
         <button
+          className="bar-button"
           type="button"
           disabled={!reviewReady}
           title={reviewReady ? 'Save this complete patch as the review baseline' : 'Wait for the complete patch'}
           onClick={onSetCheckpoint}
         ><IconCheck />{checkpoint == null ? 'Set checkpoint' : 'Update checkpoint'}</button>
         <button
+          className="bar-button"
           type="button"
           disabled={checkpoint == null || changedFileCount === 0}
           title={checkpoint == null ? 'Set a checkpoint first' : sinceLabel}

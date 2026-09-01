@@ -34,7 +34,7 @@ interface SettingsPageProps {
 
 type SettingsSection = 'appearance' | 'editor' | 'keyboard'
 
-const SETTINGS_EXIT_MS = 140
+const SETTINGS_EXIT_MS = 160
 
 export function SettingsPage({ preferences, onChange, onClose }: SettingsPageProps): React.JSX.Element {
   const [activeSection, setActiveSection] = useState<SettingsSection>('appearance')
@@ -118,7 +118,7 @@ export function SettingsPage({ preferences, onChange, onClose }: SettingsPagePro
 
       <div className="settings-content">
         <header className="settings-header">
-          <div className="settings-heading">
+          <div>
             <h1>{activeSection === 'appearance' ? 'Appearance' : activeSection === 'editor' ? 'Editor' : 'Keyboard'}</h1>
             <p>{activeSection === 'appearance'
               ? 'Choose how Horus looks.'

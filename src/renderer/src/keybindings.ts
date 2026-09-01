@@ -90,9 +90,16 @@ export function keybindingFromEvent(event: KeyboardEvent): string | null {
   ].filter(Boolean).join('+')
 }
 
-export function commandFromEvent(event: KeyboardEvent, keybindings: KeybindingMap): AppCommand | null {
+export function commandFromEvent(
+  event: KeyboardEvent,
+  keybindings: KeybindingMap,
+  activeElement: Element | null = typeof document === 'undefined' ? null : deepActiveElement(document)
+): AppCommand | null {
   const binding = keybindingFromEvent(event)
   if (binding == null) return null
+  // Keep Meta combos (⌘O, ⌘,) while typing; Alt/Ctrl-only bindings would steal
+  // characters such as Ω from comment fields.
+  if (isTypingElement(activeElement) && !event.metaKey) return null
   for (const { command } of KEYBINDING_COMMANDS) {
     if (keybindings[command] === binding) return command
   }
@@ -126,16 +133,23 @@ export function formatKeybinding(keybinding: string): string {
   return `${parts.includes('Control') ? '⌃' : ''}${parts.includes('Alt') ? '⌥' : ''}${parts.includes('Shift') ? '⇧' : ''}${parts.includes('Meta') ? '⌘' : ''}${key}`
 }
 
+const RESERVED_TERMINAL_BINDINGS = new Set(['Meta+KeyJ', 'Control+KeyJ'])
+
 export function findKeybindingConflicts(keybindings: KeybindingMap): Set<AppCommand> {
   const commandsByBinding = new Map<string, AppCommand[]>()
+  const conflicts = new Set<AppCommand>()
   for (const { command } of KEYBINDING_COMMANDS) {
     const commands = commandsByBinding.get(keybindings[command]) ?? []
     commands.push(command)
     commandsByBinding.set(keybindings[command], commands)
+    if (command !== 'toggleTerminal' && RESERVED_TERMINAL_BINDINGS.has(keybindings[command])) {
+      conflicts.add(command)
+    }
   }
-  return new Set(
-    [...commandsByBinding.values()]
-      .filter((commands) => commands.length > 1)
-      .flat()
-  )
+  for (const commands of commandsByBinding.values()) {
+    if (commands.length > 1) {
+      for (const command of commands) conflicts.add(command)
+    }
+  }
+  return conflicts
 }

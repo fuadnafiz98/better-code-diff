@@ -1,4 +1,4 @@
-import { memo, useState } from 'react'
+import { memo, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import {
   IconBrandGithub,
   IconBraces,
@@ -94,6 +94,7 @@ function WorldTab({
       <button
         className="world-close"
         type="button"
+        tabIndex={active ? 0 : -1}
         aria-label={`Close ${world.label} tab`}
         title={`Close ${world.label}`}
         onClick={() => onClose(world.worldId)}
@@ -111,12 +112,44 @@ function OverflowMenu({
   worlds: readonly ReviewWorld[]
   onFocus(worldId: string): void | Promise<boolean>
 }): React.JSX.Element {
+  const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const rootRef = useRef<HTMLDetailsElement>(null)
   const normalizedQuery = query.trim().toLowerCase()
   const visibleWorlds = normalizedQuery === ''
     ? worlds
     : worlds.filter((world) => world.label.toLowerCase().includes(normalizedQuery))
-  return <details className="world-overflow">
+
+  const close = (): void => {
+    setOpen(false)
+    setQuery('')
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (event: PointerEvent): void => {
+      if (rootRef.current?.contains(event.target as Node) === true) return
+      close()
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [open])
+
+  return <details
+    ref={rootRef}
+    className="world-overflow"
+    open={open}
+    onToggle={(event) => {
+      const next = event.currentTarget.open
+      setOpen(next)
+      if (!next) setQuery('')
+    }}
+    onKeyDown={(event) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      close()
+    }}
+  >
     <summary aria-label={`${worlds.length} more tabs`} title="More tabs">
       <IconEllipsis />
       <span>{worlds.length}</span>
@@ -128,7 +161,15 @@ function OverflowMenu({
       </label>
       <div role="menu">
         {visibleWorlds.map((world) => (
-          <button key={world.worldId} type="button" role="menuitem" onClick={() => void onFocus(world.worldId)}>
+          <button
+            key={world.worldId}
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              void onFocus(world.worldId)
+              close()
+            }}
+          >
             <span>{world.label}</span>
             <small>{world.source === 'new' ? 'New' : world.source === 'desk'
               ? 'Working tree'
@@ -150,10 +191,32 @@ export const WorldStrip = memo(function WorldStrip({
   onNew
 }: WorldStripProps): React.JSX.Element {
   const partition = partitionWorlds(worlds, activeWorldId)
+
+  const handleTablistKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') {
+      return
+    }
+    const tabs = partition.visible
+    if (tabs.length === 0) return
+    const current = tabs.findIndex((world) => world.worldId === activeWorldId)
+    const nextIndex = event.key === 'Home' ? 0
+      : event.key === 'End' ? tabs.length - 1
+        : event.key === 'ArrowRight' ? Math.min(tabs.length - 1, Math.max(0, current) + 1)
+          : Math.max(0, (current < 0 ? 0 : current) - 1)
+    const next = tabs[nextIndex]
+    if (next == null || next.worldId === activeWorldId) return
+    event.preventDefault()
+    void onFocus(next.worldId)
+    window.requestAnimationFrame(() => {
+      const tab = event.currentTarget.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      tab?.focus()
+    })
+  }
+
   return (
     <nav className="world-strip" aria-label="Review tabs">
       <span className="world-strip-brand" aria-label="Horus Review"><IconBraces /><span>Review</span></span>
-      <div className="world-tabs" role="tablist" aria-label="Review tabs">
+      <div className="world-tabs" role="tablist" aria-label="Review tabs" onKeyDown={handleTablistKeyDown}>
         {partition.visible.map((world) => (
           <WorldTab
             key={world.worldId}

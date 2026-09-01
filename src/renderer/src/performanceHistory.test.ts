@@ -132,4 +132,25 @@ describe('recordMemorySample', () => {
     expect(getMemorySamples()).toHaveLength(1)
     expect(getMemorySamples()[0]?.workingSetMegabytes).toBe(510)
   })
+
+  it('ignores duplicate and out-of-order samples without replacing the history', () => {
+    const history = recordMemorySample({
+      atMs: 10,
+      workingSetMegabytes: 500,
+      rendererPrivateMegabytes: 250
+    })
+
+    expect(recordMemorySample({
+      atMs: 10,
+      workingSetMegabytes: 900,
+      rendererPrivateMegabytes: 450
+    })).toBe(history)
+    expect(recordMemorySample({
+      atMs: 9,
+      workingSetMegabytes: 800,
+      rendererPrivateMegabytes: 400
+    })).toBe(history)
+    expect(getMemorySamples()).toHaveLength(1)
+    expect(getMemorySamples()[0]?.workingSetMegabytes).toBe(500)
+  })
 })

@@ -1,9 +1,14 @@
 import type { CodeViewItem } from '@pierre/diffs'
 
 import { pathFromReviewItemId as pathFromItemId } from './reviewItems'
+import {
+  browserBudgetStorage,
+  forgetStorageKey,
+  persistManagedValue
+} from './storageBudget'
 
 const STORAGE_PREFIX = 'better-code-diff:viewed-files:'
-const MAX_SERIALIZED_BYTES = 256 * 1024
+const MAX_SERIALIZED_UTF16_UNITS = 256 * 1024
 
 export type ViewedFileSignatures = Record<string, string>
 
@@ -35,17 +40,20 @@ export function loadStoredViewedFiles(key: string): ViewedFileSignatures {
   }
 }
 
-export function saveStoredViewedFiles(key: string, signatures: Readonly<ViewedFileSignatures>): void {
+export function saveStoredViewedFiles(key: string, signatures: Readonly<ViewedFileSignatures>): boolean {
+  const storage = browserBudgetStorage()
+  if (storage == null) return false
   try {
     if (Object.keys(signatures).length === 0) {
-      localStorage.removeItem(key)
-      return
+      storage.removeItem(key)
+      forgetStorageKey(storage, key)
+      return true
     }
     const serialized = JSON.stringify(signatures)
-    if (serialized.length > MAX_SERIALIZED_BYTES) return
-    localStorage.setItem(key, serialized)
+    if (serialized.length > MAX_SERIALIZED_UTF16_UNITS) return false
+    return persistManagedValue(storage, key, serialized)
   } catch {
-    // Persistence is best effort; viewed state still holds for the session.
+    return false
   }
 }
 

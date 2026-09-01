@@ -55,4 +55,72 @@ describe('split diff resizing', () => {
     expect(surface.style.getPropertyValue('--horus-split-before-width')).toBe('48cqi')
     syncSplitDiffResizeLifecycle(viewer, 'unmount')
   })
+
+  it('coalesces pointer moves and commits the final position on pointer-up', () => {
+    const surface = document.createElement('div')
+    surface.className = 'diff-panel'
+    const viewer = document.createElement('div')
+    surface.append(viewer)
+    const root = viewer.attachShadow({ mode: 'open' })
+    const splitDiff = document.createElement('pre')
+    splitDiff.dataset.diffType = 'split'
+    root.append(splitDiff)
+    viewer.getBoundingClientRect = () => ({
+      bottom: 400,
+      height: 400,
+      left: 0,
+      right: 800,
+      top: 0,
+      width: 800,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    })
+
+    const originalRequestAnimationFrame = window.requestAnimationFrame
+    const originalCancelAnimationFrame = window.cancelAnimationFrame
+    let frame: FrameRequestCallback | null = null
+    let nextFrame = 0
+    const cancelled: number[] = []
+    window.requestAnimationFrame = (callback) => {
+      frame = callback
+      nextFrame += 1
+      return nextFrame
+    }
+    window.cancelAnimationFrame = (id) => { cancelled.push(id) }
+
+    try {
+      syncSplitDiffResizeLifecycle(viewer, 'mount')
+      const handle = root.querySelector<HTMLElement>('[data-split-resize-handle]')!
+      handle.setPointerCapture = () => undefined
+      handle.hasPointerCapture = () => true
+      handle.releasePointerCapture = () => undefined
+      const pointer = (type: string, clientX: number) => new PointerEvent(type, {
+        bubbles: true,
+        composed: true,
+        pointerId: 7,
+        button: 0,
+        clientX
+      })
+
+      handle.dispatchEvent(pointer('pointerdown', 400))
+      handle.dispatchEvent(pointer('pointermove', 480))
+      handle.dispatchEvent(pointer('pointermove', 560))
+      expect(surface.style.getPropertyValue('--horus-split-before')).toBe('')
+
+      const queuedFrame = frame as FrameRequestCallback | null
+      expect(queuedFrame).not.toBeNull()
+      queuedFrame?.(0)
+      expect(surface.style.getPropertyValue('--horus-split-before')).toBe('70fr')
+
+      handle.dispatchEvent(pointer('pointermove', 600))
+      handle.dispatchEvent(pointer('pointerup', 600))
+      expect(cancelled).toEqual([2])
+      expect(surface.style.getPropertyValue('--horus-split-before')).toBe('75fr')
+    } finally {
+      syncSplitDiffResizeLifecycle(viewer, 'unmount')
+      window.requestAnimationFrame = originalRequestAnimationFrame
+      window.cancelAnimationFrame = originalCancelAnimationFrame
+    }
+  })
 })

@@ -19,7 +19,9 @@ function createStorage(initial: Record<string, string> = {}): DraftStorage & { d
     data,
     getItem: (key) => data[key] ?? null,
     setItem: (key, value) => { data[key] = value },
-    removeItem: (key) => { delete data[key] }
+    removeItem: (key) => { delete data[key] },
+    get length() { return Object.keys(data).length },
+    key: (index) => Object.keys(data)[index] ?? null
   }
 }
 
@@ -97,7 +99,9 @@ describe('draftStore', () => {
     const storage: DraftStorage = {
       getItem: () => { throw new Error('blocked') },
       setItem: () => { throw new Error('blocked') },
-      removeItem: () => { throw new Error('blocked') }
+      removeItem: () => { throw new Error('blocked') },
+      length: 0,
+      key: () => null
     }
     expect(readDrafts('/repo', storage)).toEqual({})
     expect(() => writeDrafts('/repo', putDraft({}, draft), storage)).not.toThrow()
@@ -108,5 +112,21 @@ describe('draftStore', () => {
     const storage = createStorage()
     writeDrafts('/repo', putDraft({}, draft), storage)
     expect(readDrafts('/repo', storage)[draft.path]?.contents).toBe('hello')
+  })
+
+  test('caps the persisted draft payload at 2 MB', () => {
+    let drafts: DraftMap = {}
+    for (let index = 0; index < 10; index += 1) {
+      drafts = putDraft(drafts, {
+        ...draft,
+        path: `file-${index}.ts`,
+        contents: 'x'.repeat(400_000),
+        savedAt: index
+      })
+    }
+    const serialized = serializeDrafts(drafts)
+    expect(serialized.length).toBeLessThanOrEqual(2 * 1024 * 1024)
+    expect(Object.keys(parseDrafts(serialized)).length).toBeLessThan(10)
+    expect(parseDrafts(serialized)['file-9.ts']).toBeDefined()
   })
 })

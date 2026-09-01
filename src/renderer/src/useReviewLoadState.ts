@@ -14,6 +14,7 @@ import {
   reviewItemId as itemId
 } from './reviewItems'
 import { resetReviewFileMetrics, setLoadedReviewItemCount } from './reviewMetrics'
+import { worldViewCache } from './worldViewCache'
 
 export interface ReviewLoadState {
   items: CodeViewItem<ReviewAnnotationMetadata>[]
@@ -92,6 +93,12 @@ interface ParsedPatchCache {
   items: CodeViewItem<ReviewAnnotationMetadata>[]
 }
 
+export interface ParsedPatchPageCache {
+  key: string
+  pageRefs: readonly string[]
+  items: CodeViewItem<ReviewAnnotationMetadata>[]
+}
+
 const PATCH_SEAM_SAMPLE = 4_096
 
 function patchSeam(patch: string): string {
@@ -114,8 +121,73 @@ export function canAppendPatch(
     && patch.startsWith(parsed.tail, parsed.length - parsed.tail.length)
 }
 
-interface ExternalReviewItems {
+export function canAppendPatchPages(
+  parsed: Pick<ParsedPatchPageCache, 'key' | 'pageRefs'>,
+  key: string,
+  pages: readonly string[]
+): boolean {
+  return parsed.key === key
+    && pages.length >= parsed.pageRefs.length
+    && parsed.pageRefs.every((page, index) => pages[index] === page)
+}
+
+function emptyParsedPatch(): ParsedPatchCache {
+  return { key: '', length: 0, tail: '', items: [] }
+}
+
+function emptyParsedPages(): ParsedPatchPageCache {
+  return { key: '', pageRefs: [], items: [] }
+}
+
+function seedParsedCache(worldId: string | null): {
+  string: ParsedPatchCache
+  pages: ParsedPatchPageCache
+} {
+  const cached = worldId == null ? undefined : worldViewCache.get(worldId)?.parsed
+  if (cached?.kind === 'pages') {
+    return {
+      pages: { key: cached.parseKey, pageRefs: cached.pageRefs, items: cached.items },
+      string: emptyParsedPatch()
+    }
+  }
+  if (cached?.kind === 'string') {
+    return {
+      string: {
+        key: cached.parseKey,
+        length: cached.patchLength,
+        tail: cached.tail,
+        items: cached.items
+      },
+      pages: emptyParsedPages()
+    }
+  }
+  return { string: emptyParsedPatch(), pages: emptyParsedPages() }
+}
+
+export function parsePatchPageBatch(
+  parsed: ParsedPatchPageCache,
+  key: string,
+  pages: readonly string[]
+): ParsedPatchPageCache {
+  const appended = canAppendPatchPages(parsed, key, pages)
+  const firstPendingPage = appended ? parsed.pageRefs.length : 0
+  const pendingItems = pages.slice(firstPendingPage).flatMap((page, offset) => page === ''
+    ? []
+    : createPatchReviewItems<ReviewAnnotationMetadata>(page, `${key}:page:${firstPendingPage + offset}`))
+  return {
+    key,
+    pageRefs: [...pages],
+    items: appended ? mergeReviewItems(parsed.items, pendingItems) : pendingItems
+  }
+}
+
+type ExternalReviewItems = {
+  kind: 'string'
   cache: ParsedPatchCache
+  items: CodeViewItem<ReviewAnnotationMetadata>[]
+} | {
+  kind: 'pages'
+  cache: ParsedPatchPageCache
   items: CodeViewItem<ReviewAnnotationMetadata>[]
 }
 
@@ -124,6 +196,7 @@ interface ReviewLoadStateOptions {
   stablePaths: string[]
   repositoryReview: RepositoryReview | null
   repositoryChange: RepositoryChangeEvent | null
+  worldId?: string | null
 }
 
 interface ReviewLoadStateApi {
@@ -152,7 +225,8 @@ export function useReviewLoadState({
   pathsKey,
   stablePaths,
   repositoryReview,
-  repositoryChange
+  repositoryChange,
+  worldId = null
 }: ReviewLoadStateOptions): ReviewLoadStateApi {
   const loadedPathsKeyRef = useRef<string | null>(null)
   const loadedPageCountRef = useRef(0)
@@ -178,12 +252,38 @@ export function useReviewLoadState({
   // Streaming appends to the patch, so only the new tail is parsed. Re-parsing the
   // whole document on every page turned a 13 MB review into quadratic work.
   const parsedPatchRef = useRef<ParsedPatchCache>({ key: '', length: 0, tail: '', items: [] })
+  const parsedPatchPagesRef = useRef<ParsedPatchPageCache>({ key: '', pageRefs: [], items: [] })
+  const parsedWorldIdRef = useRef(worldId)
   const externalReview = useMemo<ExternalReviewItems | null>(() => {
     if (repositoryReview == null) return null
     const key = repositoryReview.kind === 'github'
       ? `pr-${repositoryReview.pullRequest.number}-${repositoryReview.pullRequest.updatedAt}`
       : repositoryReview.id
-    const parsed = parsedPatchRef.current
+    const seeded = parsedWorldIdRef.current !== worldId ? seedParsedCache(worldId) : null
+    if (repositoryReview.kind === 'github' && repositoryReview.patchPages != null) {
+      const pagesBase = seeded?.pages ?? parsedPatchPagesRef.current
+      if (
+        pagesBase.key === key
+        && pagesBase.pageRefs.length === repositoryReview.patchPages.length
+        && pagesBase.pageRefs.every((page, index) => page === repositoryReview.patchPages?.[index])
+      ) {
+        return { kind: 'pages', cache: pagesBase, items: pagesBase.items }
+      }
+      const cache = parsePatchPageBatch(pagesBase, key, repositoryReview.patchPages)
+      return {
+        kind: 'pages',
+        cache,
+        items: orderReviewItems(cache.items, stablePaths)
+      }
+    }
+    const parsed = seeded?.string ?? parsedPatchRef.current
+    if (parsed.key === key && parsed.length === repositoryReview.patch.length && parsed.items.length > 0) {
+      return {
+        kind: 'string',
+        cache: parsed,
+        items: parsed.items
+      }
+    }
     const appended = canAppendPatch(parsed, key, repositoryReview.patch)
     const pending = appended ? repositoryReview.patch.slice(parsed.length) : repositoryReview.patch
     const pendingItems = pending === ''
@@ -193,6 +293,7 @@ export function useReviewLoadState({
     // file or lose one.
     const items = appended ? mergeReviewItems(parsed.items, pendingItems) : pendingItems
     return {
+      kind: 'string',
       cache: {
         key,
         length: repositoryReview.patch.length,
@@ -201,10 +302,34 @@ export function useReviewLoadState({
       },
       items: orderReviewItems(items, stablePaths)
     }
-  }, [repositoryReview, stablePaths])
+  }, [repositoryReview, stablePaths, worldId])
   useEffect(() => {
-    if (externalReview != null) parsedPatchRef.current = externalReview.cache
-  }, [externalReview])
+    parsedWorldIdRef.current = worldId
+    if (externalReview?.kind === 'pages') {
+      const cache = { ...externalReview.cache, items: externalReview.items }
+      parsedPatchPagesRef.current = cache
+      if (worldId != null) {
+        worldViewCache.rememberParsed(worldId, {
+          kind: 'pages',
+          parseKey: cache.key,
+          pageRefs: cache.pageRefs,
+          items: cache.items
+        })
+      }
+    } else if (externalReview?.kind === 'string') {
+      const cache = { ...externalReview.cache, items: externalReview.items }
+      parsedPatchRef.current = cache
+      if (worldId != null) {
+        worldViewCache.rememberParsed(worldId, {
+          kind: 'string',
+          parseKey: cache.key,
+          patchLength: cache.length,
+          tail: cache.tail,
+          items: cache.items
+        })
+      }
+    }
+  }, [externalReview, worldId])
   const externalReviewItems = externalReview?.items ?? null
   const externalLoadState = useMemo(() => {
     if (externalReviewItems == null) return null

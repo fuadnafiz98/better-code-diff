@@ -45,6 +45,20 @@ describe('keybindings', () => {
     })
     expect(conflicts).toEqual(new Set(['openFolder', 'toggleSidebar']))
   })
+
+  test('skips non-Meta bindings while typing', () => {
+    const textarea = { tagName: 'TEXTAREA', isContentEditable: false } as unknown as Element
+    expect(commandFromEvent(keyboardEvent('KeyZ', { altKey: true }), DEFAULT_KEYBINDINGS, textarea)).toBeNull()
+    expect(commandFromEvent(keyboardEvent('KeyO', { metaKey: true }), DEFAULT_KEYBINDINGS, textarea)).toBe('openFolder')
+  })
+
+  test('warns when a command is rebound onto the reserved terminal shortcuts', () => {
+    const conflicts = findKeybindingConflicts({
+      ...DEFAULT_KEYBINDINGS,
+      toggleWordWrap: 'Meta+KeyJ'
+    })
+    expect(conflicts.has('toggleWordWrap')).toBe(true)
+  })
 })
 
 describe('reviewCommandFromEvent', () => {

@@ -268,6 +268,20 @@ function findPatchSectionStarts(patch: string): number[] {
   return starts
 }
 
+export function chunkPatchByFileCount(patch: string, maxFiles = 25): string[] {
+  if (patch === '') return []
+  const sectionStarts = findPatchSectionStarts(patch)
+  const chunkSize = Math.max(1, Math.floor(maxFiles))
+  if (sectionStarts.length === 0 || sectionStarts.length <= chunkSize) return [patch]
+  const chunks: string[] = []
+  for (let sectionIndex = 0; sectionIndex < sectionStarts.length; sectionIndex += chunkSize) {
+    const start = sectionIndex === 0 ? 0 : sectionStarts[sectionIndex]!
+    const end = sectionStarts[sectionIndex + chunkSize] ?? patch.length
+    chunks.push(patch.slice(start, end))
+  }
+  return chunks
+}
+
 function patchSectionPaths(patch: string, start: number, end: number): {
   path: string
   previousPath?: string

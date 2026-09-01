@@ -9,6 +9,8 @@ interface RepositorySession {
   watcher: RepositoryWatcher
 }
 
+const INACTIVE_CACHE_FLOOR_BYTES = 8 * 1024 * 1024
+
 export class RepositorySessionRegistry {
   #activeRoot: string | null = null
   #cacheDirectory: string | null = null
@@ -57,11 +59,16 @@ export class RepositorySessionRegistry {
     return session.repository
   }
 
+  tryGet(root: string | null): RepositoryService | null {
+    if (root == null) return null
+    return this.#sessions.get(root)?.repository ?? null
+  }
+
   activate(root: string): RepositorySnapshot {
     const repository = this.require(root)
     const snapshot = repository.getSessionSnapshot()
     if (snapshot == null) throw new Error('Repository data is not ready.')
-    this.#activeRoot = root
+    this.#setActiveRoot(root)
     return snapshot
   }
 
@@ -69,7 +76,7 @@ export class RepositorySessionRegistry {
     const selectedRoot = await realpath(folderPath)
     const known = this.#sessions.get(selectedRoot)
     if (known != null) {
-      if (activate) this.#activeRoot = selectedRoot
+      if (activate) this.#setActiveRoot(selectedRoot)
       return known.repository.getSessionSnapshot() ?? known.repository.refresh()
     }
 
@@ -78,7 +85,8 @@ export class RepositorySessionRegistry {
     const snapshot = await repository.open(selectedRoot)
     const existing = this.#sessions.get(snapshot.root)
     if (existing != null) {
-      if (activate) this.#activeRoot = snapshot.root
+      repository.dispose()
+      if (activate) this.#setActiveRoot(snapshot.root)
       return existing.repository.getSessionSnapshot() ?? existing.repository.refresh()
     }
 
@@ -91,7 +99,7 @@ export class RepositorySessionRegistry {
     watcher.setSuspended(this.#suspended)
     watcher.start(snapshot)
     this.#sessions.set(snapshot.root, { repository, watcher })
-    if (activate) this.#activeRoot = snapshot.root
+    if (activate) this.#setActiveRoot(snapshot.root)
     return snapshot
   }
 
@@ -124,5 +132,13 @@ export class RepositorySessionRegistry {
     repository.cancelContentSearch()
     repository.cancelPullRequestReview()
     repository.setSelfWriteObserver(null)
+    repository.dispose()
+  }
+
+  #setActiveRoot(root: string): void {
+    this.#activeRoot = root
+    for (const [sessionRoot, { repository }] of this.#sessions) {
+      if (sessionRoot !== root) repository.trimCaches(INACTIVE_CACHE_FLOOR_BYTES)
+    }
   }
 }

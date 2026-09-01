@@ -5,7 +5,9 @@ import {
   compareReviewCheckpoint,
   createReviewCheckpoint,
   createSinceReview,
+  createSinceReviewFromPages,
   filterReviewPatch,
+  filterReviewPatchPages,
   parseStoredReviewCheckpoint,
   reviewFileCheckpointSignature
 } from './reviewCheckpoints'
@@ -69,6 +71,12 @@ describe('review checkpoints', () => {
     expect(since.review.patch).toContain('b/b.ts')
     expect(since.review.patch).not.toContain('b/a.ts')
     expect(since.removedPaths).toEqual(['gone.ts'])
+
+    const pages = [patch.slice(0, patch.indexOf('diff --git a/b.ts')), patch.slice(patch.indexOf('diff --git a/b.ts'))]
+    const pagedSince = createSinceReviewFromPages(current, pages, checkpoint)
+    expect(pagedSince.review.patch).toBe('')
+    expect(pagedSince.patchPages).toEqual([filterReviewPatch(patch, new Set(['b.ts']))])
+    expect(filterReviewPatchPages(pages, new Set(['b.ts']))).toEqual([...(pagedSince.patchPages ?? [])])
   })
 
   test('filters a changed Git-quoted UTF-8 path exactly', () => {

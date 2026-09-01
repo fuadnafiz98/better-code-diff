@@ -9,6 +9,7 @@ release/
 coverage/
 .cache/
 .vite/
+react-doctor-baseline.json
 
 # Logs and local environment files
 *.log
@@ -30,3 +31,4 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+*-this-session-is-being-continued-*.txt

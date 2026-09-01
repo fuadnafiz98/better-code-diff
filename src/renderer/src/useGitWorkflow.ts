@@ -17,7 +17,8 @@ import { useReviewWorlds, type ReviewWorld } from './useReviewWorlds'
 import {
   compareReviewCheckpoint,
   createReviewCheckpoint,
-  createSinceReview,
+  createSinceReviewFromPages,
+  filterReviewPatchPages,
   loadReviewCheckpoint,
   saveReviewCheckpoint
 } from './reviewCheckpoints'
@@ -91,32 +92,78 @@ export function useGitWorkflow({
   const [submittingReview, setSubmittingReview] = useState(false)
   const [submissionMessage, setSubmissionMessage] = useState<string | null>(null)
   const [checkpointRevision, setCheckpointRevision] = useState(0)
+  const activateRepository = useCallback(
+    (root: string) => requireRepositoryApi().activateRepository(root),
+    []
+  )
+  const releaseRepository = useCallback(
+    (root: string) => requireRepositoryApi().releaseRepository(root),
+    []
+  )
+  const handleActivationError = useCallback(
+    (error: unknown) => onError(getErrorMessage(error)),
+    [onError]
+  )
   const reviewWorlds = useReviewWorlds({
     snapshot,
     selectedPath,
     workspaceView,
     onActivateSnapshot: activateSnapshot,
-    onActivateRepository: (root) => requireRepositoryApi().activateRepository(root),
-    onReleaseRepository: (root) => requireRepositoryApi().releaseRepository(root),
-    onActivationError: (error) => onError(getErrorMessage(error)),
+    onActivateRepository: activateRepository,
+    onReleaseRepository: releaseRepository,
+    onActivationError: handleActivationError,
     onSelectPath,
     onWorkspaceViewChange
   })
-  const repositoryReview = reviewWorlds.activeReview
-  const activePatchReview = reviewWorlds.activeWorld?.source === 'patch'
-    && reviewWorlds.activeWorld.review.kind === 'github'
-    ? reviewWorlds.activeWorld.review
+  const {
+    activeReview: repositoryReview,
+    activeWorld: activeReviewWorld,
+    appendPatchPage,
+    closeWorld,
+    focusDesk,
+    focusWorld: focusRegistryWorld,
+    hasRepositoryRoot,
+    hasWorld,
+    initialReviewScrollTop,
+    isWorldActive,
+    openDeskWorld,
+    openNewWorld,
+    openPatchWorld,
+    openSinceWorld,
+    rememberReviewScroll,
+    replacePatchReview,
+    reset: resetReviewWorlds,
+    restoreSincePatch,
+    selectInitialPath,
+    setNewWorldPending,
+    setPatchExpectedFileCount,
+    setPatchLoadStatus,
+    syncRepositorySnapshot,
+    updateNewWorldLocator,
+    worlds: reviewWorldList
+  } = reviewWorlds
+  const activeWorldIdRef = useRef(activeReviewWorld?.worldId ?? null)
+  useEffect(() => {
+    activeWorldIdRef.current = activeReviewWorld?.worldId ?? null
+  })
+  const activePatchReview = activeReviewWorld?.source === 'patch'
+    && activeReviewWorld.review.kind === 'github'
+    ? activeReviewWorld.review
     : null
   const activePullRequestUrl = activePatchReview?.pullRequest.url ?? null
   const root = snapshot?.root ?? null
-  const reviewCheckpoint = useMemo(() => root == null || activePullRequestUrl == null
-    ? null
-    : loadReviewCheckpoint(root, activePullRequestUrl), [activePullRequestUrl, checkpointRevision, root])
+  const reviewCheckpoint = useMemo(() => {
+    // This value deliberately invalidates the external-storage read after a checkpoint write.
+    void checkpointRevision
+    return root == null || activePullRequestUrl == null
+      ? null
+      : loadReviewCheckpoint(root, activePullRequestUrl)
+  }, [activePullRequestUrl, checkpointRevision, root])
   const checkpointComparison = useMemo(() => reviewCheckpoint == null || activePatchReview == null
     ? null
     : compareReviewCheckpoint(reviewCheckpoint, activePatchReview.files), [activePatchReview, reviewCheckpoint])
-  const reviewReady = reviewWorlds.activeWorld?.source === 'patch'
-    && reviewWorlds.activeWorld.loadStatus === 'ready'
+  const reviewReady = activeReviewWorld?.source === 'patch'
+    && activeReviewWorld.loadStatus === 'ready'
 
   const head = snapshot?.head ?? null
   const branch = snapshot?.branch ?? null
@@ -144,12 +191,12 @@ export function useGitWorkflow({
       requireRepositoryApi().cancelPullRequestReview(request.root, requestId)
     }
     reviewRequestsRef.current.clear()
-    reviewWorlds.reset()
+    resetReviewWorlds()
     setSubmissionMessage(null)
     writeIntegrationEntry(emptyEntry())
     writeInboxEntry(emptyEntry())
     setPanelOpen(false)
-  }, [reviewWorlds.reset, writeInboxEntry, writeIntegrationEntry])
+  }, [resetReviewWorlds, writeInboxEntry, writeIntegrationEntry])
 
   const loadIntegration = useCallback(async (force = false) => {
     if (!force && !isPanelDataStale(integrationEntryRef.current, { root, head, branch }, Date.now())) return
@@ -205,7 +252,8 @@ export function useGitWorkflow({
     setActionKey(`merge:${pullRequest.number}`)
     onError(null)
     try {
-      await requireRepositoryApi().mergePullRequest(pullRequest.number, strategy)
+      if (root == null) throw new Error('The repository tab is no longer open.')
+      await requireRepositoryApi().mergePullRequest(root, pullRequest.number, strategy)
       // The panel prefers the inbox whenever it has entries, so refreshing only
       // the integration snapshot left the merged row on screen, still labelled
       // open, with its merge button live.
@@ -215,7 +263,7 @@ export function useGitWorkflow({
     } finally {
       setActionKey(null)
     }
-  }, [confirm, loadInbox, loadIntegration, onError])
+  }, [confirm, loadInbox, loadIntegration, onError, root])
 
   const markPullRequestReady = useCallback(async (pullRequest: PullRequestSummary) => {
     if (!(await confirm({
@@ -226,14 +274,15 @@ export function useGitWorkflow({
     setActionKey(`ready:${pullRequest.number}`)
     onError(null)
     try {
-      await requireRepositoryApi().markPullRequestReady(pullRequest.number)
+      if (root == null) throw new Error('The repository tab is no longer open.')
+      await requireRepositoryApi().markPullRequestReady(root, pullRequest.number)
       await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [confirm, loadInbox, loadIntegration, onError])
+  }, [confirm, loadInbox, loadIntegration, onError, root])
 
   const openPanel = useCallback(() => {
     setPanelTab('pull-requests')
@@ -266,19 +315,19 @@ export function useGitWorkflow({
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      reviewWorlds.focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, onError, reviewWorlds.focusDesk])
+  }, [applySnapshot, confirmWorkingTreeChange, focusDesk, onError])
 
   const openPullRequestReview = useCallback(async (
     selector: number | string,
     repositorySnapshot: RepositorySnapshot | null = snapshot,
-    originWorldId = reviewWorlds.activeWorld?.worldId ?? null
+    originWorldId = activeReviewWorld?.worldId ?? null
   ) => {
     if (repositorySnapshot == null || repositorySnapshot.kind !== 'git') {
       onError('Open a Git repository before opening a pull request.')
@@ -293,13 +342,18 @@ export function useGitWorkflow({
     // files is appended. Waiting for the whole fetch left the app on a spinner for
     // minutes on pull requests with thousands of files.
     let streamed = false
+    let streamDone = false
+    let resolveStreamDone: (() => void) | null = null
+    const streamDonePromise = new Promise<void>((resolve) => {
+      resolveStreamDone = resolve
+    })
     let worldId: string | null = null
     const stopListening = requireRepositoryApi().onPullRequestReviewProgress((progress) => {
       if (progress.requestId !== requestId || progress.root !== repositorySnapshot.root) return
       if (!reviewRequestsRef.current.has(requestId)) return
       if (progress.kind === 'metadata') {
         streamed = true
-        worldId = reviewWorlds.openPatchWorld(
+        worldId = openPatchWorld(
           repositorySnapshot,
           progress.review,
           generation,
@@ -313,9 +367,15 @@ export function useGitWorkflow({
         return
       }
       if (worldId == null) return
-      reviewWorlds.appendPatchPage(worldId, generation, progress)
+      if (progress.kind === 'done') {
+        streamDone = true
+        resolveStreamDone?.()
+        setPatchExpectedFileCount(worldId, generation, progress.fileCount)
+        return
+      }
+      appendPatchPage(worldId, generation, progress)
       const firstPath = progress.files[0]?.path
-      if (firstPath != null) reviewWorlds.selectInitialPath(worldId, firstPath)
+      if (firstPath != null) selectInitialPath(worldId, firstPath)
     })
     try {
       const review = await requireRepositoryApi().getPullRequestReview(
@@ -332,15 +392,25 @@ export function useGitWorkflow({
         // what actually arrived — GitHub's own number can exceed what its files API
         // will serve, and nothing is still loading once the fetch has finished.
         if (worldId != null) {
-          reviewWorlds.replacePatchReview(worldId, generation, {
-            ...review,
-            expectedFileCount: review.files.length
-          })
-          reviewWorlds.setPatchLoadStatus(worldId, generation, 'ready')
+          if (review.patch === '' && review.files.length === 0) {
+            if (!streamDone) {
+              await Promise.race([
+                streamDonePromise,
+                new Promise<void>((resolve) => setTimeout(resolve, 5_000))
+              ])
+            }
+            setPatchExpectedFileCount(worldId, generation, review.expectedFileCount)
+          } else {
+            replacePatchReview(worldId, generation, {
+              ...review,
+              expectedFileCount: review.files.length
+            })
+          }
+          setPatchLoadStatus(worldId, generation, 'ready')
         }
         return
       }
-      worldId = reviewWorlds.openPatchWorld(
+      worldId = openPatchWorld(
         repositorySnapshot,
         review,
         generation,
@@ -351,37 +421,48 @@ export function useGitWorkflow({
       setSubmissionMessage(null)
       setPanelOpen(false)
     } catch (error) {
-      if (reviewRequestsRef.current.has(requestId)) onError(getErrorMessage(error))
+      if (!reviewRequestsRef.current.has(requestId)) return
+      const message = getErrorMessage(error)
+      // Compare the world being loaded (not the origin tab) with the active
+      // world so a failure on tab A cannot paint the banner over tab B.
+      const loadingWorldId = worldId ?? originWorldId
+      const isForeground = loadingWorldId == null
+        || loadingWorldId === activeWorldIdRef.current
+      if (isForeground) {
+        onError(message)
+        setSubmissionMessage(null)
+      } else if (worldId != null) {
+        setPatchLoadStatus(worldId, generation, 'error', message)
+      }
       // The stream is dead either way, so collapse the target onto what actually
       // arrived — otherwise the review sits there looking like it is still loading
       // until the 25 s stall backstop fires.
-      if (streamed && reviewRequestsRef.current.has(requestId) && worldId != null) {
-        reviewWorlds.setPatchLoadStatus(worldId, generation, 'error')
+      if (streamed && worldId != null) {
+        setPatchLoadStatus(worldId, generation, 'error', message)
       }
     } finally {
       stopListening()
       reviewRequestsRef.current.delete(requestId)
       setActionKey((current) => current === `review:${selector}` ? null : current)
     }
-  }, [onError, reviewWorlds.activeWorld, reviewWorlds.appendPatchPage, reviewWorlds.openPatchWorld,
-    reviewWorlds.replacePatchReview, reviewWorlds.selectInitialPath, reviewWorlds.setPatchLoadStatus,
-    snapshot])
+  }, [activeReviewWorld, appendPatchPage, onError, openPatchWorld, replacePatchReview,
+    selectInitialPath, setPatchExpectedFileCount, setPatchLoadStatus, snapshot])
 
   const openPullRequestFromLocator = useCallback(async (pullRequestUrl: string): Promise<boolean> => {
-    const originWorldId = reviewWorlds.activeWorld?.worldId
-    reviewWorlds.setNewWorldPending(true, pullRequestUrl, originWorldId)
+    const originWorldId = activeReviewWorld?.worldId
+    setNewWorldPending(true, pullRequestUrl, originWorldId)
     setActionKey('resolve:pull-request')
     onError(null)
     try {
       const repositorySnapshot = await requireRepositoryApi().resolvePullRequestRepository(pullRequestUrl)
       if (repositorySnapshot == null) return false
-      if (!reviewWorlds.hasWorld(originWorldId)) {
-        if (!reviewWorlds.hasRepositoryRoot(repositorySnapshot.root)) {
+      if (!hasWorld(originWorldId)) {
+        if (!hasRepositoryRoot(repositorySnapshot.root)) {
           await requireRepositoryApi().releaseRepository(repositorySnapshot.root)
         }
         return false
       }
-      if (reviewWorlds.isWorldActive(originWorldId)) {
+      if (isWorldActive(originWorldId)) {
         await requireRepositoryApi().activateRepository(repositorySnapshot.root)
       }
       await openPullRequestReview(pullRequestUrl, repositorySnapshot, originWorldId ?? null)
@@ -390,35 +471,80 @@ export function useGitWorkflow({
       onError(getErrorMessage(error))
       return false
     } finally {
-      reviewWorlds.setNewWorldPending(false, '', originWorldId)
+      setNewWorldPending(false, '', originWorldId)
       setActionKey((current) => current === 'resolve:pull-request' ? null : current)
     }
-  }, [onError, openPullRequestReview, reviewWorlds.activeWorld, reviewWorlds.hasRepositoryRoot,
-    reviewWorlds.hasWorld, reviewWorlds.isWorldActive, reviewWorlds.setNewWorldPending])
+  }, [activeReviewWorld, hasRepositoryRoot, hasWorld, isWorldActive, onError,
+    openPullRequestReview, setNewWorldPending])
 
   const restoreReleasedWorld = useCallback((world: ReviewWorld | null | undefined): void => {
-    if (world?.source !== 'patch' || world.loadStatus !== 'released'
-      || world.review.kind !== 'github' || restoringWorldsRef.current.has(world.worldId)) return
+    if (world == null || world.source === 'new' || world.source === 'desk'
+      || world.loadStatus !== 'released' || restoringWorldsRef.current.has(world.worldId)) return
+    if (world.source === 'patch') {
+      if (world.review.kind !== 'github') return
+      restoringWorldsRef.current.add(world.worldId)
+      void openPullRequestReview(world.review.pullRequest.url, world.snapshot, world.worldId)
+        .finally(() => restoringWorldsRef.current.delete(world.worldId))
+      return
+    }
+
+    const parent = reviewWorldList.find((candidate) => candidate.worldId === world.parentWorldId)
+    if (parent?.source !== 'patch' || parent.review.kind !== 'github') return
+    const parentReview = parent.review
     restoringWorldsRef.current.add(world.worldId)
-    void openPullRequestReview(world.review.pullRequest.url, world.snapshot, world.worldId)
-      .finally(() => restoringWorldsRef.current.delete(world.worldId))
-  }, [openPullRequestReview])
+    void (async () => {
+      try {
+        let pages = parent.patchPages
+        let files = parentReview.files
+        let omittedFiles = parentReview.omittedFiles
+        if (pages.length === 0) {
+          let review = await requireRepositoryApi().getPullRequestReview(
+            parent.root,
+            parentReview.pullRequest.url,
+            crypto.randomUUID()
+          )
+          if (review.patch === '' && review.files.length === 0) {
+            await openPullRequestReview(parentReview.pullRequest.url, parent.snapshot, parent.worldId)
+            review = await requireRepositoryApi().getPullRequestReview(
+              parent.root,
+              parentReview.pullRequest.url,
+              crypto.randomUUID()
+            )
+          }
+          pages = review.patch === '' ? [] : [review.patch]
+          files = review.files
+          omittedFiles = review.omittedFiles
+        }
+        const changedPaths = new Set(world.changedPaths)
+        restoreSincePatch(
+          world.worldId,
+          filterReviewPatchPages(pages, changedPaths),
+          files.filter((file) => changedPaths.has(file.path)),
+          omittedFiles.filter((file) => changedPaths.has(file.path))
+        )
+      } catch (error) {
+        onError(getErrorMessage(error))
+      } finally {
+        restoringWorldsRef.current.delete(world.worldId)
+      }
+    })()
+  }, [onError, openPullRequestReview, restoreSincePatch, reviewWorldList])
 
   const focusWorld = useCallback(async (worldId: string): Promise<boolean> => {
-    const world = reviewWorlds.worlds.find((candidate) => candidate.worldId === worldId)
-    const focused = await reviewWorlds.focusWorld(worldId)
+    const world = reviewWorldList.find((candidate) => candidate.worldId === worldId)
+    const focused = await focusRegistryWorld(worldId)
     if (focused) restoreReleasedWorld(world)
     return focused
-  }, [restoreReleasedWorld, reviewWorlds.focusWorld, reviewWorlds.worlds])
+  }, [focusRegistryWorld, restoreReleasedWorld, reviewWorldList])
 
   const cycleWorld = useCallback((direction: -1 | 1): void => {
-    const activeWorldId = reviewWorlds.activeWorld?.worldId
-    if (activeWorldId == null || reviewWorlds.worlds.length < 2) return
-    const index = reviewWorlds.worlds.findIndex((world) => world.worldId === activeWorldId)
-    const nextIndex = (index + direction + reviewWorlds.worlds.length) % reviewWorlds.worlds.length
-    const nextWorld = reviewWorlds.worlds[nextIndex]
+    const activeWorldId = activeReviewWorld?.worldId
+    if (activeWorldId == null || reviewWorldList.length < 2) return
+    const index = reviewWorldList.findIndex((world) => world.worldId === activeWorldId)
+    const nextIndex = (index + direction + reviewWorldList.length) % reviewWorldList.length
+    const nextWorld = reviewWorldList[nextIndex]
     if (nextWorld != null) void focusWorld(nextWorld.worldId)
-  }, [focusWorld, reviewWorlds.activeWorld, reviewWorlds.worlds])
+  }, [activeReviewWorld, focusWorld, reviewWorldList])
 
   const reviewPullRequest = useCallback((pullRequest: PullRequestSummary) => {
     return openPullRequestReview(pullRequest.number)
@@ -427,13 +553,13 @@ export function useGitWorkflow({
   const reviewLocalBranch = useCallback(async (baseRef: string, headRef: string) => {
     if (snapshot == null) return
     const repositorySnapshot = snapshot
-    const originWorldId = reviewWorlds.activeWorld?.worldId ?? null
+    const originWorldId = activeReviewWorld?.worldId ?? null
     const generation = ++reviewGenerationRef.current
     setActionKey(`compare:${headRef}`)
     onError(null)
     try {
       const review = await requireRepositoryApi().getLocalBranchReview(baseRef, headRef)
-      reviewWorlds.openPatchWorld(repositorySnapshot, review, generation, false, null, originWorldId)
+      openPatchWorld(repositorySnapshot, review, generation, false, null, originWorldId)
       setSubmissionMessage(null)
       setPanelOpen(false)
     } catch (error) {
@@ -441,18 +567,18 @@ export function useGitWorkflow({
     } finally {
       setActionKey((current) => current === `compare:${headRef}` ? null : current)
     }
-  }, [onError, reviewWorlds.activeWorld, reviewWorlds.openPatchWorld, snapshot])
+  }, [activeReviewWorld, onError, openPatchWorld, snapshot])
 
   const reviewCommit = useCallback(async (oid: string) => {
     if (snapshot == null) return
     const repositorySnapshot = snapshot
-    const originWorldId = reviewWorlds.activeWorld?.worldId ?? null
+    const originWorldId = activeReviewWorld?.worldId ?? null
     const generation = ++reviewGenerationRef.current
     setActionKey(`commit:${oid}`)
     onError(null)
     try {
       const review = await requireRepositoryApi().getCommitReview(oid)
-      reviewWorlds.openPatchWorld(repositorySnapshot, review, generation, false, null, originWorldId)
+      openPatchWorld(repositorySnapshot, review, generation, false, null, originWorldId)
       setSubmissionMessage(null)
       setPanelOpen(false)
     } catch (error) {
@@ -460,7 +586,7 @@ export function useGitWorkflow({
     } finally {
       setActionKey((current) => current === `commit:${oid}` ? null : current)
     }
-  }, [onError, reviewWorlds.activeWorld, reviewWorlds.openPatchWorld, snapshot])
+  }, [activeReviewWorld, onError, openPatchWorld, snapshot])
 
   const checkoutPullRequest = useCallback(async (pullRequest: PullRequestSummary) => {
     if (!(await confirmWorkingTreeChange('pull request checkout'))) return
@@ -471,14 +597,14 @@ export function useGitWorkflow({
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      reviewWorlds.focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, onError, reviewWorlds.focusDesk])
+  }, [applySnapshot, confirmWorkingTreeChange, focusDesk, onError])
 
   const fetchRemote = useCallback(async () => {
     setActionKey('sync:fetch')
@@ -507,14 +633,14 @@ export function useGitWorkflow({
       const nextSnapshot = await requireRepositoryApi().pullCurrentBranch()
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      reviewWorlds.focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
       await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))
     } finally {
       setActionKey(null)
     }
-  }, [applySnapshot, confirmWorkingTreeChange, loadInbox, loadIntegration, onError, reviewWorlds.focusDesk])
+  }, [applySnapshot, confirmWorkingTreeChange, focusDesk, loadInbox, loadIntegration, onError])
 
   const pushCurrentBranch = useCallback(async () => {
     setActionKey('sync:push')
@@ -553,27 +679,31 @@ export function useGitWorkflow({
   }, [activePatchReview, persistCheckpoint, reviewReady])
 
   const openSinceReview = useCallback(() => {
-    const activeWorld = reviewWorlds.activeWorld
+    const activeWorld = activeReviewWorld
     if (activeWorld?.source !== 'patch' || activeWorld.review.kind !== 'github') return
     if (reviewCheckpoint == null) {
       setSubmissionMessage('Set a checkpoint before opening Since.')
       return
     }
-    const since = createSinceReview(activeWorld.review, reviewCheckpoint)
+    const since = createSinceReviewFromPages(
+      activeWorld.review,
+      activeWorld.patchPages,
+      reviewCheckpoint
+    )
     if (since.review.files.length === 0 && since.removedPaths.length === 0) {
       setSubmissionMessage('No files changed since this checkpoint.')
       return
     }
-    reviewWorlds.openSinceWorld(activeWorld.worldId, since, reviewCheckpoint)
-  }, [reviewCheckpoint, reviewWorlds.activeWorld, reviewWorlds.openSinceWorld])
+    openSinceWorld(activeWorld.worldId, since, reviewCheckpoint)
+  }, [activeReviewWorld, openSinceWorld, reviewCheckpoint])
 
   const submitReview = useCallback(async (
     reviewEvent: PullRequestReviewEvent,
     body: string,
     comments: PullRequestReviewComment[]
   ): Promise<boolean> => {
-    if (repositoryReview?.kind !== 'github' || reviewWorlds.activeWorld?.source !== 'patch') return false
-    if (reviewWorlds.activeWorld.loadStatus !== 'ready') {
+    if (repositoryReview?.kind !== 'github' || activeReviewWorld?.source !== 'patch') return false
+    if (activeReviewWorld.loadStatus !== 'ready') {
       setSubmissionMessage('Wait for the complete patch before submitting a review.')
       return false
     }
@@ -595,7 +725,14 @@ export function useGitWorkflow({
     setSubmissionMessage(null)
     onError(null)
     try {
-      await requireRepositoryApi().submitPullRequestReview(selector, repositoryReview.commitId, reviewEvent, body, comments)
+      await requireRepositoryApi().submitPullRequestReview(
+        activeReviewWorld.root,
+        selector,
+        repositoryReview.commitId,
+        reviewEvent,
+        body,
+        comments
+      )
       // Marked stale rather than cleared: blanking the cache put the panel back
       // on its blocking spinner the next time it opened.
       writeIntegrationEntry({ ...integrationEntryRef.current, fetchedAt: 0 })
@@ -610,13 +747,13 @@ export function useGitWorkflow({
     } finally {
       setSubmittingReview(false)
     }
-  }, [confirm, onError, persistCheckpoint, repositoryReview, reviewWorlds.activeWorld,
+  }, [activeReviewWorld, confirm, onError, persistCheckpoint, repositoryReview,
     writeInboxEntry, writeIntegrationEntry])
 
   const closeReview = useCallback((worldId?: string) => {
     const target = worldId == null
-      ? reviewWorlds.activeWorld
-      : reviewWorlds.worlds.find((world) => world.worldId === worldId)
+      ? activeReviewWorld
+      : reviewWorldList.find((world) => world.worldId === worldId)
     if (target == null) return
     if (target.source === 'patch' && target.loadStatus === 'loading' && target.requestId != null) {
       // Otherwise up to eight `gh api` children per wave keep paging a patch that
@@ -634,23 +771,22 @@ export function useGitWorkflow({
       }
       for (const root of roots) {
         const rootStillLoading = [...reviewRequestsRef.current.values()].some((request) => request.root === root)
-        if (!rootStillLoading && !reviewWorlds.hasRepositoryRoot(root)) {
+        if (!rootStillLoading && !hasRepositoryRoot(root)) {
           void requireRepositoryApi().releaseRepository(root)
         }
       }
     }
-    const closingActive = reviewWorlds.activeWorld?.worldId === target.worldId
-    const targetIndex = reviewWorlds.worlds.findIndex((world) => world.worldId === target.worldId)
-    const remainingWorlds = reviewWorlds.worlds.filter((world) => world.worldId !== target.worldId)
+    const closingActive = activeReviewWorld?.worldId === target.worldId
+    const targetIndex = reviewWorldList.findIndex((world) => world.worldId === target.worldId)
+    const remainingWorlds = reviewWorldList.filter((world) => world.worldId !== target.worldId)
     const nextWorld = closingActive
       ? remainingWorlds[targetIndex - 1] ?? remainingWorlds[targetIndex]
       : null
     if (closingActive) setSubmissionMessage(null)
-    void reviewWorlds.closeWorld(target.worldId).then((closed) => {
+    void closeWorld(target.worldId).then((closed) => {
       if (closed) restoreReleasedWorld(nextWorld)
     })
-  }, [reviewWorlds.activeWorld, reviewWorlds.closeWorld, reviewWorlds.hasRepositoryRoot,
-    restoreReleasedWorld, reviewWorlds.worlds])
+  }, [activeReviewWorld, closeWorld, hasRepositoryRoot, restoreReleasedWorld, reviewWorldList])
 
   // While the panel is open a commit or a branch switch made in the terminal
   // invalidates the entry, so ahead/behind and the branch list stop being a
@@ -672,9 +808,9 @@ export function useGitWorkflow({
     loadingInbox,
     refreshPanelData,
     actionKey,
-    worlds: reviewWorlds.worlds,
-    activeWorld: reviewWorlds.activeWorld,
-    initialReviewScrollTop: reviewWorlds.initialReviewScrollTop,
+    worlds: reviewWorldList,
+    activeWorld: activeReviewWorld,
+    initialReviewScrollTop,
     repositoryReview,
     reviewCheckpoint,
     checkpointChangedFileCount: checkpointComparison == null
@@ -692,10 +828,10 @@ export function useGitWorkflow({
     reviewPullRequest,
     openPullRequestReview,
     openPullRequestFromLocator,
-    openNewWorld: reviewWorlds.openNewWorld,
-    updateNewWorldLocator: reviewWorlds.updateNewWorldLocator,
-    openWorkingTree: reviewWorlds.openDeskWorld,
-    syncRepositorySnapshot: reviewWorlds.syncRepositorySnapshot,
+    openNewWorld,
+    updateNewWorldLocator,
+    openWorkingTree: openDeskWorld,
+    syncRepositorySnapshot,
     reviewLocalBranch,
     reviewCommit,
     checkoutPullRequest,
@@ -708,21 +844,21 @@ export function useGitWorkflow({
     closeReview,
     focusWorld,
     cycleWorld,
-    rememberReviewScroll: reviewWorlds.rememberReviewScroll,
+    rememberReviewScroll,
     mergePullRequest,
     markPullRequestReady
   }), [
     actionKey,
-    reviewWorlds.activeWorld,
+    activeReviewWorld,
     cycleWorld,
     focusWorld,
-    reviewWorlds.initialReviewScrollTop,
-    reviewWorlds.openDeskWorld,
-    reviewWorlds.openNewWorld,
-    reviewWorlds.rememberReviewScroll,
-    reviewWorlds.syncRepositorySnapshot,
-    reviewWorlds.updateNewWorldLocator,
-    reviewWorlds.worlds,
+    initialReviewScrollTop,
+    openDeskWorld,
+    openNewWorld,
+    rememberReviewScroll,
+    syncRepositorySnapshot,
+    updateNewWorldLocator,
+    reviewWorldList,
     integrationEntry.fetchedAt,
     refreshPanelData,
     checkoutPullRequest,

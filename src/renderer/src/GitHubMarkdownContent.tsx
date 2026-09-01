@@ -20,13 +20,20 @@ export function resolveGitHubHref(href: string | undefined): string | undefined 
 
 export const GitHubMarkdownContent = memo(function GitHubMarkdownContent({
   source,
-  className
+  className,
+  variant = 'document'
 }: {
   source: string
-  className: string
+  className?: string
+  variant?: 'document' | 'comment'
 }): React.JSX.Element {
+  const classes = [
+    className,
+    'gh-markdown',
+    variant === 'comment' ? 'comment' : null
+  ].filter((value): value is string => value != null && value !== '').join(' ')
   return (
-    <div className={className}>
+    <div className={classes}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, GITHUB_MARKDOWN_SCHEMA]]}

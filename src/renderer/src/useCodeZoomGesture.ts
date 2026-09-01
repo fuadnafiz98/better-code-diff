@@ -1,6 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 
-import { anchoredScrollOffset, nextCodeZoomFontSize } from './codeZoom'
+import {
+  anchoredScrollOffset,
+  codeLineHeightAtZoom,
+  LIVE_CODE_FONT_SIZE_PROPERTY,
+  LIVE_CODE_LINE_HEIGHT_PROPERTY,
+  nextCodeZoomFontSize
+} from './codeZoom'
 
 interface ScrollTarget {
   element: HTMLElement
@@ -24,6 +30,7 @@ interface CodeZoomState {
 }
 
 const ZOOM_LAYOUT_SETTLE_MS = 1_200
+const ZOOM_COMMIT_SETTLE_MS = 120
 
 function overflowAllowsScrolling(element: HTMLElement, axis: 'horizontal' | 'vertical'): boolean {
   const style = window.getComputedStyle(element)
@@ -60,13 +67,44 @@ export function useCodeZoomGesture(baseFontSize: number, baseLineHeight: number)
   const codeFontSize = zoom.baseFontSize === baseFontSize ? zoom.fontSize : baseFontSize
   const currentFontSizeRef = useRef(codeFontSize)
   const baseFontSizeRef = useRef(baseFontSize)
+  const baseLineHeightRef = useRef(baseLineHeight)
   const activeAnchorRef = useRef<PendingZoomAnchor | null>(null)
   const anchorFrameRef = useRef<number | null>(null)
+  const commitTimerRef = useRef<number | null>(null)
+  const pendingCommitRef = useRef<number | null>(null)
 
   useLayoutEffect(() => {
     currentFontSizeRef.current = codeFontSize
     baseFontSizeRef.current = baseFontSize
-  }, [baseFontSize, codeFontSize])
+    baseLineHeightRef.current = baseLineHeight
+    if (pendingCommitRef.current !== codeFontSize) return
+    pendingCommitRef.current = null
+    surfaceRef.current?.style.removeProperty(LIVE_CODE_FONT_SIZE_PROPERTY)
+    surfaceRef.current?.style.removeProperty(LIVE_CODE_LINE_HEIGHT_PROPERTY)
+  }, [baseFontSize, baseLineHeight, codeFontSize])
+
+  const holdZoomAnchor = useCallback(() => {
+    const anchor = activeAnchorRef.current
+    if (anchor == null) return
+    if (anchorFrameRef.current != null) window.cancelAnimationFrame(anchorFrameRef.current)
+    const startedAt = performance.now()
+    const holdAnchor = (): void => {
+      if (activeAnchorRef.current !== anchor) return
+      if (anchor.horizontal != null && Math.abs(anchor.horizontal.element.scrollLeft - anchor.horizontal.offset) > 0.5) {
+        anchor.horizontal.element.scrollLeft = anchor.horizontal.offset
+      }
+      if (anchor.vertical != null && Math.abs(anchor.vertical.element.scrollTop - anchor.vertical.offset) > 0.5) {
+        anchor.vertical.element.scrollTop = anchor.vertical.offset
+      }
+      if (performance.now() - startedAt < ZOOM_LAYOUT_SETTLE_MS) {
+        anchorFrameRef.current = window.requestAnimationFrame(holdAnchor)
+      } else {
+        activeAnchorRef.current = null
+        anchorFrameRef.current = null
+      }
+    }
+    anchorFrameRef.current = window.requestAnimationFrame(holdAnchor)
+  }, [])
 
   useEffect(() => {
     const surface = surfaceRef.current
@@ -136,50 +174,46 @@ export function useCodeZoomGesture(baseFontSize: number, baseLineHeight: number)
           : { element: verticalElement, offset: verticalOffset }
       }
       currentFontSizeRef.current = nextFontSize
-      setZoom({ baseFontSize: baseFontSizeRef.current, fontSize: nextFontSize })
+      const nextLineHeight = codeLineHeightAtZoom(
+        baseFontSizeRef.current,
+        baseLineHeightRef.current,
+        nextFontSize
+      )
+      surface.style.setProperty(LIVE_CODE_FONT_SIZE_PROPERTY, `${nextFontSize}px`)
+      surface.style.setProperty(LIVE_CODE_LINE_HEIGHT_PROPERTY, `${nextLineHeight}px`)
+      holdZoomAnchor()
+      if (commitTimerRef.current != null) window.clearTimeout(commitTimerRef.current)
+      commitTimerRef.current = window.setTimeout(() => {
+        commitTimerRef.current = null
+        pendingCommitRef.current = currentFontSizeRef.current
+        setZoom({
+          baseFontSize: baseFontSizeRef.current,
+          fontSize: currentFontSizeRef.current
+        })
+      }, ZOOM_COMMIT_SETTLE_MS)
     }
     surface.addEventListener('wheel', handleWheel, { capture: true, passive: false })
     surface.addEventListener('pointerdown', cancelAnchor, { capture: true })
     surface.addEventListener('scroll', restoreActiveAnchor, { capture: true })
     return () => {
       cancelAnchor()
+      if (commitTimerRef.current != null) window.clearTimeout(commitTimerRef.current)
+      commitTimerRef.current = null
+      pendingCommitRef.current = null
+      surface.style.removeProperty(LIVE_CODE_FONT_SIZE_PROPERTY)
+      surface.style.removeProperty(LIVE_CODE_LINE_HEIGHT_PROPERTY)
       surface.removeEventListener('wheel', handleWheel, { capture: true })
       surface.removeEventListener('pointerdown', cancelAnchor, { capture: true })
       surface.removeEventListener('scroll', restoreActiveAnchor, { capture: true })
     }
-  }, [])
+  }, [holdZoomAnchor])
 
   useLayoutEffect(() => {
-    const anchor = activeAnchorRef.current
-    if (anchor == null) return
-    if (anchorFrameRef.current != null) window.cancelAnimationFrame(anchorFrameRef.current)
-    const startedAt = performance.now()
-    let frameId: number | null = null
-    const holdAnchor = (): void => {
-      if (activeAnchorRef.current !== anchor) return
-      if (anchor.horizontal != null && Math.abs(anchor.horizontal.element.scrollLeft - anchor.horizontal.offset) > 0.5) {
-        anchor.horizontal.element.scrollLeft = anchor.horizontal.offset
-      }
-      if (anchor.vertical != null && Math.abs(anchor.vertical.element.scrollTop - anchor.vertical.offset) > 0.5) {
-        anchor.vertical.element.scrollTop = anchor.vertical.offset
-      }
-      if (performance.now() - startedAt < ZOOM_LAYOUT_SETTLE_MS) {
-        frameId = window.requestAnimationFrame(holdAnchor)
-        anchorFrameRef.current = frameId
-      } else {
-        activeAnchorRef.current = null
-        anchorFrameRef.current = null
-      }
-    }
-    holdAnchor()
-    return () => {
-      if (frameId != null) window.cancelAnimationFrame(frameId)
-      if (anchorFrameRef.current === frameId) anchorFrameRef.current = null
-    }
-  }, [codeFontSize])
+    holdZoomAnchor()
+  }, [codeFontSize, holdZoomAnchor])
 
   const codeLineHeight = useMemo(
-    () => Math.round(baseLineHeight * (codeFontSize / baseFontSize) * 100) / 100,
+    () => codeLineHeightAtZoom(baseFontSize, baseLineHeight, codeFontSize),
     [baseFontSize, baseLineHeight, codeFontSize]
   )
 
