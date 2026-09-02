@@ -17,6 +17,7 @@
     "install:mac": "bash scripts/install-macos-app.sh",
     "update:mac": "bun run dist:mac && bun run install:mac",
     "open:mac": "env -u ELECTRON_RUN_AS_NODE -u ELECTRON_NO_ASAR open -a \"Horus\"",
+    "raycast:dev": "npm --prefix extensions/horus run dev",
     "update:mac:open": "bun run update:mac && bun run open:mac",
     "preview": "electron-vite preview",
     "typecheck": "tsc -b tsconfig.json",
@@ -122,6 +123,14 @@
         "deb"
       ]
     },
+    "protocols": [
+      {
+        "name": "Horus",
+        "schemes": [
+          "horus"
+        ]
+      }
+    ],
     "dmg": {
       "title": "Horus ${version}",
       "artifactName": "Horus-${version}-${arch}.${ext}"

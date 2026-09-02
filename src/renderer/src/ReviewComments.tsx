@@ -1,18 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SelectedLineRange } from '@pierre/diffs'
 
-import type { RemoteReviewThread } from '../../shared/contracts'
+import type { FileImagePreview, RemoteReviewThread } from '../../shared/contracts'
 import type { ReviewCommentAnchor } from './reviewThreadAnchors'
 import {
   IconApproved,
-  IconCheck,
-  IconComment,
+  IconArrow,
   IconCommentAdd,
   IconPencil,
   IconReply,
   IconSparkles,
-  IconTrash,
-  IconX
+  IconTrash
 } from '@pierre/icons'
 
 export interface ReviewReply {
@@ -37,13 +35,46 @@ export type ReviewAnnotationMetadata =
   | { kind: 'draft'; range: SelectedLineRange }
   | { kind: 'thread'; thread: ReviewThread }
   | { kind: 'remote'; thread: RemoteReviewThread }
+  | { kind: 'image'; image: FileImagePreview }
 
 interface SelectionActionsProps {
   range: SelectedLineRange
   commentLabel?: string
   onComment(): void
   onAskAgent(): void
-  onDismiss(): void
+}
+
+export type SelectionGesture = 'start' | 'change' | 'end'
+
+// The Comment/Chat bar is a commit affordance. Pierre reports the live range
+// on start and every change; only pointer-up should mount the annotation.
+export function nextPendingSelection<T>(
+  gesture: SelectionGesture,
+  liveSelection: T | null,
+  pending: T | null
+): T | null {
+  if (gesture === 'start') return null
+  if (gesture === 'change') return pending
+  return liveSelection
+}
+
+export function consumeSelectionChromeKey(
+  event: KeyboardEvent,
+  handlers: { onDismiss(): void; onAskAgent(): void }
+): boolean {
+  if (event.defaultPrevented || event.repeat) return false
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    handlers.onDismiss()
+    return true
+  }
+  if (event.key.toLowerCase() === 'i' && (event.metaKey || event.ctrlKey) && !event.altKey) {
+    event.preventDefault()
+    handlers.onAskAgent()
+    return true
+  }
+  return false
 }
 
 // Selecting lines offers both destinations rather than assuming a comment, so the
@@ -52,22 +83,27 @@ export function SelectionActions({
   range,
   commentLabel = 'Comment',
   onComment,
-  onAskAgent,
-  onDismiss
+  onAskAgent
 }: SelectionActionsProps): React.JSX.Element {
   return (
-    <div className="selection-actions" role="group" aria-label={`Actions for ${formatSelectedRange(range)}`}>
-      <span className="selection-actions-range" title={formatSelectedRange(range)}>
-        {formatCompactSelectedRange(range)}
-      </span>
-      <button type="button" onClick={onComment} aria-label={commentLabel} title={commentLabel}>
+    <div
+      className="selection-actions"
+      role="toolbar"
+      aria-label={`Actions for ${formatSelectedRange(range)}`}
+      aria-keyshortcuts="Escape"
+    >
+      <button
+        className="selection-actions-comment"
+        type="button"
+        onClick={onComment}
+        aria-label={commentLabel}
+        title={commentLabel}
+      >
         <IconCommentAdd />{commentLabel}
       </button>
       <button type="button" onClick={onAskAgent} aria-label="Add selection to Chat" title="Add selection to Chat (⌘I)">
-        <IconSparkles />Chat<kbd aria-hidden="true">⌘I</kbd>
+        <IconSparkles />Chat
       </button>
-      <button className="selection-actions-dismiss" type="button" onClick={onDismiss}
-        aria-label="Clear selection" title="Clear selection"><IconX /></button>
     </div>
   )
 }
@@ -102,13 +138,114 @@ export function formatCompactSelectedRange(range: SelectedLineRange): string {
   return side == null ? lines : `${lines} · ${side}`
 }
 
-export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): React.JSX.Element {
-  const [body, setBody] = useState('')
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+interface ReviewComposerProps {
+  value: string
+  placeholder: string
+  ariaLabel: string
+  submitLabel: string
+  autoFocus?: boolean
+  onChange(value: string): void
+  onSubmit(): void
+  onCancel(): void
+}
+
+function handleComposerKeyDown(
+  event: React.KeyboardEvent<HTMLTextAreaElement>,
+  handlers: { onCancel(): void; onSubmit(): void }
+): void {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    handlers.onCancel()
+    return
+  }
+  if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+  event.preventDefault()
+  event.stopPropagation()
+  handlers.onSubmit()
+}
+
+export function consumeComposerEscape(
+  event: KeyboardEvent,
+  options: { field: HTMLElement | null; onCancel(): void }
+): boolean {
+  if (event.defaultPrevented || event.repeat || event.key !== 'Escape') return false
+  if (document.querySelector('dialog[open]') != null) return false
+  const target = event.target
+  if (target instanceof HTMLElement) {
+    const otherField = target.closest('textarea, input, [contenteditable="true"]')
+    if (otherField != null && otherField !== options.field) return false
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  options.onCancel()
+  return true
+}
+
+function ReviewComposer({
+  value,
+  placeholder,
+  ariaLabel,
+  submitLabel,
+  autoFocus = false,
+  onChange,
+  onSubmit,
+  onCancel
+}: ReviewComposerProps): React.JSX.Element {
+  const fieldRef = useRef<HTMLTextAreaElement>(null)
+  const onCancelRef = useRef(onCancel)
+  const canSubmit = value.trim() !== ''
+
+  useLayoutEffect(() => {
+    if (!autoFocus) return
+    fieldRef.current?.focus()
+  }, [autoFocus])
 
   useEffect(() => {
-    textareaRef.current?.focus()
+    onCancelRef.current = onCancel
+  }, [onCancel])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      consumeComposerEscape(event, {
+        field: fieldRef.current,
+        onCancel: () => onCancelRef.current()
+      })
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [])
+
+  return (
+    <div className="review-composer">
+      <span className="review-composer-avatar" aria-hidden="true">Y</span>
+      <textarea
+        ref={fieldRef}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => handleComposerKeyDown(event, { onCancel, onSubmit })}
+        placeholder={placeholder}
+        aria-label={ariaLabel}
+        aria-keyshortcuts="Escape"
+        rows={1}
+        autoFocus={autoFocus}
+      />
+      <button
+        className="review-composer-send"
+        type="button"
+        onClick={onSubmit}
+        disabled={!canSubmit}
+        aria-label={submitLabel}
+        title={`${submitLabel} (Enter)`}
+      >
+        <IconArrow />
+      </button>
+    </div>
+  )
+}
+
+export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): React.JSX.Element {
+  const [body, setBody] = useState('')
 
   const save = (): void => {
     const nextBody = body.trim()
@@ -116,32 +253,16 @@ export function DraftComment({ range, onCancel, onSave }: DraftCommentProps): Re
   }
 
   return (
-    <div className="review-card review-draft">
-      <div className="review-card-heading">
-        <strong><IconCommentAdd />New comment</strong>
-        <span>{formatSelectedRange(range)}</span>
-      </div>
-      <textarea
-        ref={textareaRef}
-        value={body}
-        onChange={(event) => setBody(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') {
-            event.preventDefault()
-            onCancel()
-          }
-          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) save()
-        }}
-        placeholder="Leave a review comment…"
-        aria-label="Review comment"
-        rows={2}
-      />
-      <div className="review-card-actions">
-        <span>⌘ Enter to save</span>
-        <button type="button" onClick={onCancel}><IconX />Cancel</button>
-        <button className="primary" type="button" onClick={save} disabled={body.trim() === ''}><IconComment />Comment</button>
-      </div>
-    </div>
+    <ReviewComposer
+      value={body}
+      placeholder="Add a comment..."
+      ariaLabel="Review comment"
+      submitLabel={`Send comment on ${formatSelectedRange(range)}`}
+      autoFocus
+      onChange={setBody}
+      onSubmit={save}
+      onCancel={onCancel}
+    />
   )
 }
 
@@ -190,13 +311,16 @@ export function ReviewThreadCard({
       </header>
 
       {editing ? (
-        <div className="review-edit-area">
-          <textarea aria-label="Edit review comment" value={editBody} onChange={(event) => setEditBody(event.target.value)} rows={2} />
-          <div className="review-card-actions">
-            <button type="button" onClick={() => { setEditBody(thread.body); setEditing(false) }}><IconX />Cancel</button>
-            <button className="primary" type="button" onClick={saveEdit}><IconCheck />Save</button>
-          </div>
-        </div>
+        <ReviewComposer
+          value={editBody}
+          placeholder="Edit comment..."
+          ariaLabel="Edit review comment"
+          submitLabel="Save comment"
+          autoFocus
+          onChange={setEditBody}
+          onSubmit={saveEdit}
+          onCancel={() => { setEditBody(thread.body); setEditing(false) }}
+        />
       ) : (
         <p>{thread.body}</p>
       )}
@@ -209,35 +333,26 @@ export function ReviewThreadCard({
       ))}
 
       {replying ? (
-        <div className="review-reply-composer">
-          <textarea
-            value={replyBody}
-            onChange={(event) => setReplyBody(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.preventDefault()
-                setReplying(false)
-              }
-              if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) saveReply()
-            }}
-            placeholder="Reply…"
-            aria-label="Reply to review comment"
-            rows={2}
-            autoFocus
-          />
-          <div className="review-card-actions">
-            <button type="button" onClick={() => setReplying(false)}><IconX />Cancel</button>
-            <button className="primary" type="button" onClick={saveReply} disabled={replyBody.trim() === ''}><IconReply />Reply</button>
-          </div>
-        </div>
+        <ReviewComposer
+          value={replyBody}
+          placeholder="Add a reply..."
+          ariaLabel="Reply to review comment"
+          submitLabel="Send reply"
+          autoFocus
+          onChange={setReplyBody}
+          onSubmit={saveReply}
+          onCancel={() => setReplying(false)}
+        />
       ) : null}
 
-      <footer className="review-thread-actions">
-        <button type="button" onClick={() => setReplying(true)}><IconReply />Reply</button>
-        <button type="button" onClick={() => setEditing(true)}><IconPencil />Edit</button>
-        <button type="button" onClick={onToggleResolved}><IconApproved />{thread.resolved ? 'Reopen' : 'Resolve'}</button>
-        <button className="danger" type="button" onClick={onDelete}><IconTrash />Delete</button>
-      </footer>
+      {editing || replying ? null : (
+        <footer className="review-thread-actions">
+          <button type="button" onClick={() => setReplying(true)}><IconReply />Reply</button>
+          <button type="button" onClick={() => setEditing(true)}><IconPencil />Edit</button>
+          <button type="button" onClick={onToggleResolved}><IconApproved />{thread.resolved ? 'Reopen' : 'Resolve'}</button>
+          <button className="danger" type="button" onClick={onDelete}><IconTrash />Delete</button>
+        </footer>
+      )}
     </article>
   )
 }

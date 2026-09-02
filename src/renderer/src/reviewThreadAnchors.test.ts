@@ -31,7 +31,24 @@ describe('review comment anchors', () => {
     const moved = reanchorReviewThread(threadFor(before, 2), after)
     expect(moved.orphaned).toBe(false)
     expect(moved.range).toMatchObject({ start: 3, end: 3, side: 'additions' })
+    expect(moved.lineNumber).toBe(3)
     expect(moved.anchor?.blobOid).toBe('3333333')
+  })
+
+  test('reanchors a multi-line comment after the last selected line', () => {
+    const before = item('first\ntarget\nkept\nlast', '1111111', '2222222')
+    const after = item('inserted\nfirst\ntarget\nkept\nlast', '1111111', '3333333')
+    const range = { start: 2, end: 3, side: 'additions' as const }
+    const original = {
+      ...threadFor(before, 2),
+      range,
+      lineNumber: 2,
+      anchor: createReviewCommentAnchor(before, range) ?? undefined
+    }
+    const moved = reanchorReviewThread(original, after)
+    expect(moved.orphaned).toBe(false)
+    expect(moved.range).toMatchObject({ start: 3, end: 4, side: 'additions' })
+    expect(moved.lineNumber).toBe(4)
   })
 
   test('uses surrounding context to disambiguate repeated selected text', () => {
@@ -75,5 +92,18 @@ describe('review comment anchors', () => {
 
     expect(attached).toMatchObject({ orphaned: false, lineNumber: 1 })
     expect(attached?.anchor?.selectedText).toBe('replacement')
+  })
+
+  test('attaches a multi-line range after the last selected line', () => {
+    const before = item('one\ntwo\nthree', '1111111', '2222222')
+    const orphan = { ...threadFor(before, 1), orphaned: true }
+    const attached = attachReviewThreadToRange(
+      orphan,
+      before,
+      { start: 1, end: 3, side: 'additions' }
+    )
+
+    expect(attached).toMatchObject({ orphaned: false, lineNumber: 3 })
+    expect(attached?.range).toMatchObject({ start: 1, end: 3 })
   })
 })

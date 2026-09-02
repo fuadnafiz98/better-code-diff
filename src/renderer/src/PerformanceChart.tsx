@@ -8,6 +8,7 @@ import {
   formatPerformancePercent,
   formatSpan,
   formatTrendPerHour,
+  interpolateChartY,
   memoryTrendPerHour,
   type MemorySample,
   type PerformanceChartMetric
@@ -49,6 +50,7 @@ export const PerformanceChart = memo(function PerformanceChart({
   const [metric, setMetric] = useState<PerformanceChartMetric>('memory')
   const [metricInput, setMetricInput] = useState<'keyboard' | 'pointer'>('pointer')
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  const [inspectX, setInspectX] = useState<number | null>(null)
   const [keyboardExploring, setKeyboardExploring] = useState(false)
   const gradientId = useId().replaceAll(':', '')
   const historySnapshot = useMemo(
@@ -74,18 +76,25 @@ export const PerformanceChart = memo(function PerformanceChart({
   const secondaryValue = displayedSample == null ? null : sampleValue(displayedSample, metric, true)
   const leaking = trendPerHour != null && trendPerHour >= LEAK_WARNING_MEGABYTES_PER_HOUR
 
+  const clearInspector = (): void => {
+    setInspectX(null)
+    setActiveIndex(null)
+  }
+
   const setPointFromPointer = (event: PointerEvent<HTMLDivElement>): void => {
     if (chart == null || firstSample == null || latestSample == null) return
     const bounds = event.currentTarget.getBoundingClientRect()
     const svgX = ((event.clientX - bounds.left) / bounds.width) * CHART_WIDTH
-    const ratio = Math.max(0, Math.min(1, (svgX - chart.plotLeft) / (chart.plotRight - chart.plotLeft)))
+    const plotX = Math.max(chart.plotLeft, Math.min(chart.plotRight, svgX))
+    const ratio = (plotX - chart.plotLeft) / (chart.plotRight - chart.plotLeft)
     const atMs = firstSample.atMs + ratio * (latestSample.atMs - firstSample.atMs)
     setKeyboardExploring(false)
+    setInspectX(plotX)
     setActiveIndex(findNearestSampleIndex(history, atMs))
   }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
-    if (history.length === 0) return
+    if (history.length === 0 || chart == null) return
     let nextIndex = activeIndex ?? history.length - 1
     if (event.key === 'ArrowLeft') nextIndex = Math.max(0, nextIndex - 1)
     else if (event.key === 'ArrowRight') nextIndex = Math.min(history.length - 1, nextIndex + 1)
@@ -95,13 +104,14 @@ export const PerformanceChart = memo(function PerformanceChart({
     event.preventDefault()
     setKeyboardExploring(true)
     setActiveIndex(nextIndex)
+    setInspectX(chart.primary.points[nextIndex]?.x ?? null)
   }
 
-  const primaryPoint = activeIndex == null ? null : chart?.primary.points[activeIndex] ?? null
-  const secondaryPoint = activeIndex == null ? null : chart?.secondary.points[activeIndex] ?? null
-  const tooltipStyle = primaryPoint == null
+  const primaryY = inspectX == null || chart == null ? null : interpolateChartY(chart.primary.points, inspectX)
+  const secondaryY = inspectX == null || chart == null ? null : interpolateChartY(chart.secondary.points, inspectX)
+  const tooltipStyle = inspectX == null
     ? undefined
-    : { '--performance-tooltip-x': `${(primaryPoint.x / CHART_WIDTH) * 100}%` } as TooltipStyle
+    : { '--performance-tooltip-x': `${(inspectX / CHART_WIDTH) * 100}%` } as TooltipStyle
 
   return (
     <section className="performance-chart-panel" aria-labelledby="performance-chart-title">
@@ -123,7 +133,7 @@ export const PerformanceChart = memo(function PerformanceChart({
               onKeyDown={() => setMetricInput('keyboard')}
               onClick={() => {
                 setMetric(chartMetric)
-                setActiveIndex(null)
+                clearInspector()
               }}
             >
               {chartMetric === 'memory' ? 'Memory' : 'CPU'}
@@ -155,15 +165,17 @@ export const PerformanceChart = memo(function PerformanceChart({
           aria-label={`Interactive ${metric} chart over ${formatSpan(sessionSpanMs)}. Use the left and right arrow keys to inspect samples.`}
           onPointerMove={setPointFromPointer}
           onPointerLeave={() => {
-            if (!keyboardExploring) setActiveIndex(null)
+            if (!keyboardExploring) clearInspector()
           }}
           onFocus={() => {
+            const next = activeIndex ?? history.length - 1
             setKeyboardExploring(true)
-            setActiveIndex((current) => current ?? history.length - 1)
+            setActiveIndex(next)
+            setInspectX(chart?.primary.points[next]?.x ?? null)
           }}
           onBlur={() => {
             setKeyboardExploring(false)
-            setActiveIndex(null)
+            clearInspector()
           }}
           onKeyDown={handleKeyDown}
         >
@@ -200,17 +212,17 @@ export const PerformanceChart = memo(function PerformanceChart({
               <text x={chart.plotRight} y={CHART_HEIGHT - 4} textAnchor="end">Now</text>
             </g>
 
-            {primaryPoint != null && secondaryPoint != null ? (
+            {inspectX != null && primaryY != null && secondaryY != null ? (
               <g className="performance-chart-inspector">
-                <line x1={primaryPoint.x} x2={primaryPoint.x} y1={chart.plotTop} y2={chart.plotBottom} />
-                <circle className="secondary" cx={secondaryPoint.x} cy={secondaryPoint.y} r="3" />
-                <circle className="primary" cx={primaryPoint.x} cy={primaryPoint.y} r="3.5" />
+                <line x1={inspectX} x2={inspectX} y1={chart.plotTop} y2={chart.plotBottom} />
+                <circle className="secondary" cx={inspectX} cy={secondaryY} r="3" />
+                <circle className="primary" cx={inspectX} cy={primaryY} r="3.5" />
               </g>
             ) : null}
           </svg>
 
-          {inspectedSample != null && primaryPoint != null ? (
-            <div className={`performance-chart-tooltip ${primaryPoint.x > CHART_WIDTH * 0.67 ? 'align-right' : ''}`} style={tooltipStyle} aria-hidden="true">
+          {inspectedSample != null && inspectX != null ? (
+            <div className={`performance-chart-tooltip ${inspectX > CHART_WIDTH * 0.67 ? 'align-right' : ''}`} style={tooltipStyle} aria-hidden="true">
               <time dateTime={new Date(inspectedSample.atMs).toISOString()}>{timeFormatter.format(inspectedSample.atMs)}</time>
               <dl>
                 <div className="primary"><dt>{primaryLabel}</dt><dd>{primaryValue == null ? '—' : formatChartValue(primaryValue, metric)}</dd></div>

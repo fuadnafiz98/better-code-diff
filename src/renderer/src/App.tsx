@@ -22,14 +22,14 @@ import type {
 } from '../../shared/contracts'
 import {
   ErrorBanner,
-  SearchResults,
   Titlebar,
   Welcome,
   type DiffStyle,
   type WorkspaceView
 } from './AppView'
 import type { CommandPaletteHandle } from './CommandPalette'
-import { commandFromEvent, formatTerminalToggleShortcut, type AppCommand } from './keybindings'
+import { commandFromEvent, formatKeybinding, formatTerminalToggleShortcut, type AppCommand } from './keybindings'
+import { FolderChromeButton } from './FolderPicker'
 import {
   CODE_FONTS,
   getEditorThemeType,
@@ -39,6 +39,7 @@ import {
   type AppPreferences
 } from './preferences'
 import { PullRequestLoadingIndicator } from './PullRequestLoadingIndicator'
+import { isPullRequestWorkspacePending } from './pullRequestOpen'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import {
   loadRecentFolders,
@@ -49,7 +50,6 @@ import {
 import { useGitWorkflow } from './useGitWorkflow'
 import { useAgentSession } from './useAgentSession'
 import {
-  isInsideSearchSurface,
   useRepositorySearch,
   type RepositorySearchController
 } from './useRepositorySearch'
@@ -63,7 +63,7 @@ import { usePresence, useRetainedPresence } from './usePresence'
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog'
 import { useConfirm } from './useConfirm'
 import { agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
-import { automaticWorkspaceView } from './workspaceMode'
+import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
 import { WorldStrip } from './WorldStrip'
 import { findCollisionPaths } from './useReviewWorlds'
 import {
@@ -96,6 +96,7 @@ function useCommandPaletteLoader(onError: (message: string) => void): {
   mounted: boolean
   attach(handle: CommandPaletteHandle | null): void
   close(): void
+  open(): void
   toggle(): void
 } {
   const controllerRef = useRef<CommandPaletteHandle>(null)
@@ -105,18 +106,13 @@ function useCommandPaletteLoader(onError: (message: string) => void): {
     controllerRef.current = handle
     if (handle == null || !openOnMountRef.current) return
     openOnMountRef.current = false
-    handle.toggle()
+    handle.open()
   }, [])
   const close = useCallback(() => {
     openOnMountRef.current = false
     controllerRef.current?.close()
   }, [])
-  const toggle = useCallback(() => {
-    const controller = controllerRef.current
-    if (controller != null) {
-      controller.toggle()
-      return
-    }
+  const mountAndOpen = useCallback(() => {
     openOnMountRef.current = true
     setMounted(true)
     void preloadCommandPalette().catch((error: unknown) => {
@@ -124,9 +120,25 @@ function useCommandPaletteLoader(onError: (message: string) => void): {
       onError(getErrorMessage(error))
     })
   }, [onError])
+  const open = useCallback(() => {
+    const controller = controllerRef.current
+    if (controller != null) {
+      controller.open()
+      return
+    }
+    mountAndOpen()
+  }, [mountAndOpen])
+  const toggle = useCallback(() => {
+    const controller = controllerRef.current
+    if (controller != null) {
+      controller.toggle()
+      return
+    }
+    mountAndOpen()
+  }, [mountAndOpen])
   return useMemo(
-    () => ({ controllerRef, mounted, attach, close, toggle }),
-    [attach, close, mounted, toggle]
+    () => ({ controllerRef, mounted, attach, close, open, toggle }),
+    [attach, close, mounted, open, toggle]
   )
 }
 
@@ -170,19 +182,19 @@ function useWindowVisibilitySync(): void {
 
 interface AppShortcutOptions {
   commandPaletteRef: RefObject<CommandPaletteHandle | null>
+  closeFolderPicker(): boolean
   gitWorkflow: ReturnType<typeof useGitWorkflow>
   keybindings: AppPreferences['keybindings']
   runCommand(command: AppCommand): void
-  search: RepositorySearchController
   settingsOpen: boolean
 }
 
 function useAppShortcuts({
   commandPaletteRef,
+  closeFolderPicker,
   gitWorkflow,
   keybindings,
   runCommand,
-  search,
   settingsOpen
 }: AppShortcutOptions): void {
   const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
@@ -192,6 +204,10 @@ function useAppShortcuts({
     // own 160ms exit. Closing it from here would skip that.
     if (event.defaultPrevented || event.repeat) return
     if (event.key === 'Escape' && document.querySelector('dialog[open]') != null) return
+    if (event.key === 'Escape' && closeFolderPicker()) {
+      event.preventDefault()
+      return
+    }
     if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
       event.preventDefault()
       return
@@ -200,11 +216,6 @@ function useAppShortcuts({
     if (event.key === 'Escape' && gitWorkflow.panelOpen) {
       event.preventDefault()
       gitWorkflow.setPanelOpen(false)
-      return
-    }
-    if (event.key === 'Escape' && search.isOpen) {
-      event.preventDefault()
-      search.dismiss()
       return
     }
     if (!settingsOpen && event.metaKey && !event.ctrlKey && !event.altKey) {
@@ -233,16 +244,6 @@ function useAppShortcuts({
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-
-  const dismissSearchOnOutsidePointer = useEffectEvent((event: PointerEvent): void => {
-    if (!search.isOpen || isInsideSearchSurface(event.target)) return
-    search.dismiss()
-  })
-
-  useEffect(() => {
-    window.addEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
-    return () => window.removeEventListener('pointerdown', dismissSearchOnOutsidePointer, true)
   }, [])
 }
 
@@ -287,8 +288,14 @@ interface AppLayoutProps {
   closeTerminal(): void
   commitTerminalHeight(height: number): void
   openFolder(): Promise<void>
+  openFolderFromPicker(path: string): Promise<void>
   openRecentFolder(folder: RecentFolder): Promise<void>
+  folderPickerOpen: boolean
+  openFolderPicker(): void
+  closeFolderPicker(): boolean
+  toggleFolderPicker(): void
   openPullRequestFromPalette(selector: number | string): void
+  openCommandPalette(): void
   openSettings(): void
   runCommand(command: AppCommand): void
   recentFiles: readonly string[]
@@ -337,26 +344,46 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
     [gitWorkflow.repositoryReview, view.snapshot?.statuses]
   )
   const activeNewWorld = gitWorkflow.activeWorld?.source === 'new' ? gitWorkflow.activeWorld : null
+  const pullRequestWorkspacePending = isPullRequestWorkspacePending(
+    gitWorkflow.actionKey,
+    gitWorkflow.activeWorld ?? null
+  )
   return <>
+    <header className="app-chrome">
     <WorldStrip
       worlds={gitWorkflow.worlds}
       activeWorldId={gitWorkflow.activeWorld?.worldId ?? null}
       collisionCount={collisionPaths.size}
+      leadingAction={(
+        <FolderChromeButton
+          opening={view.opening}
+          open={view.folderPickerOpen}
+          shortcut={formatKeybinding(view.preferences.keybindings.openFolder)}
+          recentFolders={view.recentFolders}
+          openingPath={view.openingRecentPath}
+          onToggle={view.toggleFolderPicker}
+          onClose={() => { view.closeFolderPicker() }}
+          onSelect={(path) => {
+            view.closeFolderPicker()
+            void view.openFolderFromPicker(path)
+          }}
+          onUseExisting={() => {
+            view.closeFolderPicker()
+            void view.openFolder()
+          }}
+        />
+      )}
       onFocus={gitWorkflow.focusWorld}
       onClose={gitWorkflow.closeReview}
       onNew={gitWorkflow.openNewWorld}
     />
 
-    <Titlebar snapshot={activeNewWorld == null ? view.snapshot : null} sidebarVisible={view.sidebarVisible}
-      searchQuery={search.query} searchInputRef={search.inputRef} searchingContent={search.searchingContent}
-      activeSearchResultId={search.activeResultIndex >= 0
-        ? `repository-search-result-${search.activeResultIndex}` : undefined}
+    <Titlebar snapshot={activeNewWorld == null ? view.snapshot : null}
       newTab={activeNewWorld != null}
       locator={activeNewWorld?.locator ?? ''}
       locatorBusy={gitWorkflow.actionKey === 'resolve:pull-request'}
-      opening={view.opening} keybindings={view.preferences.keybindings}
-      onSidebarToggle={view.toggleSidebar}
-      onSearchQueryChange={search.changeQuery} onSearchKeyDown={search.handleKeyDown} onOpen={view.openFolder}
+      keybindings={view.preferences.keybindings}
+      onSearchOpen={view.openCommandPalette}
       onLocatorChange={gitWorkflow.updateNewWorldLocator}
       onLocatorSubmit={() => {
         const locator = activeNewWorld?.locator.trim() ?? ''
@@ -364,9 +391,9 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
         void gitWorkflow.openPullRequestFromLocator(locator)
       }}
       onSettingsOpen={view.openSettings} onGitOpen={gitWorkflow.openPanel}
-      onBranchesOpen={gitWorkflow.openBranches}
       agentOpen={agent.open} onAgentToggle={agent.toggle}
       terminalOpen={view.terminalOpen} onTerminalToggle={view.toggleTerminal} />
+    </header>
 
     {reviewLoadingPresence.mounted ? <PullRequestLoadingIndicator closing={reviewLoadingPresence.closing} /> : null}
     {repositoryPanelPresence.mounted && view.snapshot?.kind === 'git' ? <Suspense fallback={null}>
@@ -394,25 +421,27 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
         onToggleTerminal={view.toggleTerminal}
         onRunCommand={view.runCommand}
         recentFiles={view.recentFiles} onOpenFile={view.setSelectedPath}
+        fileResults={search.fileResults} contentResults={search.contentResults}
+        searchingContent={search.searchingContent} onQueryChange={search.changeQuery}
         branches={paletteBranches} onSwitchBranch={(branch) => void gitWorkflow.switchBranch(branch)} />
     </Suspense> : null}
     {view.settingsOpen ? <Suspense fallback={null}>
       <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
         onClose={() => view.setSettingsOpen(false)} />
     </Suspense> : null}
-    {!view.settingsOpen && search.isOpen ? <SearchResults query={search.query}
-      fileResults={search.fileResults} contentResults={search.contentResults} searchingContent={search.searchingContent}
-      activeIndex={search.activeResultIndex} onActiveIndexChange={search.setActiveResultIndex}
-      onSelect={search.selectResult} /> : null}
     {!view.settingsOpen && errorPresence.mounted && errorPresence.retained != null
       ? <ErrorBanner key={errorPresence.retained} message={errorPresence.retained} closing={errorPresence.closing}
           onDismiss={() => view.setError(null)} />
       : null}
 
-    {activeNewWorld != null || view.snapshot == null ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} opening={view.opening}
+    {activeNewWorld != null || view.snapshot == null ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} onOpenPickedFolder={(path) => void view.openFolderFromPicker(path)} opening={view.opening}
       recentFolders={view.recentFolders} openingRecentPath={view.openingRecentPath} onRecentOpen={view.openRecentFolder}
       onRecentRemove={(path) => view.setRecentFolders((current) => current.filter((folder) => folder.path !== path))}
-      keybindings={view.preferences.keybindings} />) : (
+      keybindings={view.preferences.keybindings} />) : pullRequestWorkspacePending ? (
+      <div className="workspace-host workspace-opening" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
+        <div className="workspace-opening-canvas" />
+      </div>
+    ) : (
       <div className="workspace-host" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
         <div className={`workspace ${view.sidebarVisible ? '' : 'sidebar-hidden'} ${agent.open ? 'agent-open' : ''}`}>
           {WorkspaceRoot == null ? <WorkspaceSkeleton /> : (
@@ -448,7 +477,10 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
                 patchLoadError={gitWorkflow.activeWorld?.source === 'patch'
                   ? gitWorkflow.activeWorld.errorMessage
                   : null}
-                reviewWorldId={gitWorkflow.activeWorld?.worldId ?? `desk:${view.snapshot.root}`} />
+                reviewWorldId={gitWorkflow.activeWorld?.worldId ?? `desk:${view.snapshot.root}`}
+                sidebarVisible={view.sidebarVisible}
+                onSidebarToggle={view.toggleSidebar}
+                onBranchesOpen={gitWorkflow.openBranches} />
           )}
           <AgentDock session={agent}
             confirm={view.confirm}
@@ -526,6 +558,8 @@ export function App({
   const [preferences, setPreferences] = useState<AppPreferences>(initialPreferences)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [recentFolders, setRecentFolders] = useState<RecentFolder[]>(loadRecentFolders)
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false)
+  const folderPickerOpenRef = useRef(false)
   const [repositoryChange, setRepositoryChange] = useState<RepositoryChangeEvent | null>(null)
   const [startupSessionSnapshot] = useState(() => sessionSnapshot
     ?? window.repository?.getSessionSnapshot()
@@ -538,7 +572,7 @@ export function App({
   const commandPalette = useCommandPaletteLoader(setError)
   const [recentFiles, setRecentFiles] = useState<readonly string[]>([])
   const confirmation = useConfirm()
-  const search = useRepositorySearch(snapshot, setSelectedPath, setError)
+  const search = useRepositorySearch(snapshot, setError)
   const closeOverlays = useCallback(() => {
     commandPalette.close()
     setSettingsOpen(false)
@@ -574,8 +608,7 @@ export function App({
       setSelectedPath((currentPath) =>
         currentPath != null && includesPath(snapshotToApply.paths, currentPath)
           ? currentPath
-          : snapshotToApply.statuses[0]?.path
-            ?? (snapshotToApply.kind === 'folder' ? snapshotToApply.paths[0] ?? null : null)
+          : firstOpenPathForSnapshot(snapshotToApply)
       )
     },
     []
@@ -620,6 +653,28 @@ export function App({
     void openPullRequestReview(selector)
   }, [openPullRequestReview])
 
+  const openExternalPullRequest = useEffectEvent((url: string) => {
+    void gitWorkflow.openPullRequestFromLocator(url)
+  })
+
+  useEffect(() => {
+    const api = window.repository
+    if (api == null) return undefined
+    let lastUrl: string | null = null
+    let lastAt = 0
+    const open = (url: string): void => {
+      if (url === lastUrl && Date.now() - lastAt < 2_000) return
+      lastUrl = url
+      lastAt = Date.now()
+      openExternalPullRequest(url)
+    }
+    const stop = api.onOpenExternalPullRequest(open)
+    void api.getPendingExternalPullRequest().then((url) => {
+      if (url != null) open(url)
+    })
+    return stop
+  }, [])
+
   const openSettings = useCallback(() => {
     commandPalette.close()
     setSettingsOpen(true)
@@ -648,6 +703,45 @@ export function App({
     }
   }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
 
+  const closeFolderPicker = useCallback((): boolean => {
+    if (!folderPickerOpenRef.current) return false
+    folderPickerOpenRef.current = false
+    setFolderPickerOpen(false)
+    return true
+  }, [])
+
+  const openFolderPicker = useCallback(() => {
+    commandPalette.close()
+    folderPickerOpenRef.current = true
+    setFolderPickerOpen(true)
+  }, [commandPalette])
+
+  const toggleFolderPicker = useCallback(() => {
+    if (folderPickerOpenRef.current) {
+      folderPickerOpenRef.current = false
+      setFolderPickerOpen(false)
+      return
+    }
+    openFolderPicker()
+  }, [openFolderPicker])
+
+  const openPickedFolder = useCallback(async (path: string) => {
+    ensureWorkspaceRoot()
+    setOpeningRecentPath(path)
+    setError(null)
+    try {
+      const nextSnapshot = await requireRepositoryApi().openPickedFolder(path)
+      setSelectedPath(null)
+      openWorkingTree(nextSnapshot)
+      changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
+      setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
+    } catch (openError) {
+      setError(`Cannot open that folder. ${getErrorMessage(openError)}`)
+    } finally {
+      setOpeningRecentPath(null)
+    }
+  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
+
   const openRecentFolder = useCallback(async (folder: RecentFolder) => {
     ensureWorkspaceRoot()
     setOpeningRecentPath(folder.path)
@@ -664,6 +758,15 @@ export function App({
       setOpeningRecentPath(null)
     }
   }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
+
+  const openFolderFromPicker = useCallback(async (path: string) => {
+    const recent = recentFolders.find((folder) => folder.path === path)
+    if (recent != null) {
+      await openRecentFolder(recent)
+      return
+    }
+    await openPickedFolder(path)
+  }, [openPickedFolder, openRecentFolder, recentFolders])
 
   const handleRepositoryChange = useEffectEvent((change: RepositoryChangeEvent): void => {
     const previousWorld = reviewWorlds.find((world) => world.source !== 'new'
@@ -753,13 +856,16 @@ export function App({
     if (settingsOpen && command !== 'openSettings' && command !== 'openCommandPalette') return
     if (command === 'openSettings') {
       commandPalette.close()
+      closeFolderPicker()
       setSettingsOpen(true)
     } else if (command === 'openCommandPalette') {
+      closeFolderPicker()
       commandPalette.toggle()
     } else if (command === 'goToFile' || command === 'searchContent') {
-      search.inputRef.current?.focus()
+      closeFolderPicker()
+      commandPalette.open()
     } else if (command === 'openFolder') {
-      void openFolder()
+      toggleFolderPicker()
     } else if (command === 'toggleSidebar' && hasSnapshot) {
       toggleSidebar()
     } else if (command === 'toggleWordWrap') {
@@ -769,14 +875,14 @@ export function App({
     } else if (command === 'toggleTerminal' && hasSnapshot) {
       toggleTerminal()
     }
-  }, [commandPalette, hasSnapshot, openFolder, search.inputRef, settingsOpen, toggleSidebar, toggleTerminal])
+  }, [closeFolderPicker, commandPalette, hasSnapshot, settingsOpen, toggleFolderPicker, toggleSidebar, toggleTerminal])
 
   useAppShortcuts({
     commandPaletteRef: commandPalette.controllerRef,
+    closeFolderPicker,
     gitWorkflow,
     keybindings: preferences.keybindings,
     runCommand,
-    search,
     settingsOpen
   })
 
@@ -794,8 +900,10 @@ export function App({
     setDiffStyle, setWorkspaceView: changeWorkspaceView,
     setTerminalHeight: terminal.setHeight, setTerminalResizing: terminal.setResizing,
     toggleSidebar, toggleTerminal: terminal.toggle, closeTerminal: terminal.close,
-    commitTerminalHeight: terminal.commitHeight, openFolder,
-    openRecentFolder, openPullRequestFromPalette, openSettings, runCommand, recentFiles,
+    commitTerminalHeight: terminal.commitHeight, openFolder, openFolderFromPicker,
+    openRecentFolder, folderPickerOpen, openFolderPicker, closeFolderPicker, toggleFolderPicker,
+    openPullRequestFromPalette, openCommandPalette: commandPalette.open,
+    openSettings, runCommand, recentFiles,
     confirmRequest: confirmation.request, confirm: confirmation.confirm, resolveConfirm: confirmation.resolve
   }
   return <AppLayout {...view} />

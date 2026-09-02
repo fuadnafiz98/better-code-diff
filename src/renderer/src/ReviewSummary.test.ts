@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { formatReviewCommentsForAgent } from './ReviewSummary'
+import { fileNameFromReviewPath, formatReviewCommentsForAgent } from './ReviewSummary'
 
 describe('formatReviewCommentsForAgent', () => {
   it('includes file, selected range, body, and replies', () => {
@@ -33,5 +33,10 @@ describe('formatReviewCommentsForAgent', () => {
     }])
 
     expect(prompt).toContain('[Orphaned — verify location]')
+  })
+
+  it('shows the file name, not the whole path, in the list', () => {
+    expect(fileNameFromReviewPath('apps/web/src/route.ts')).toBe('route.ts')
+    expect(fileNameFromReviewPath('LICENSE')).toBe('LICENSE')
   })
 })

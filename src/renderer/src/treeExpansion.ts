@@ -15,6 +15,12 @@ export function orderPathsForTree(filePaths: readonly string[]): string[] {
   return [...prepareFileTreeInput(filePaths).paths]
 }
 
+export function firstTreePath(filePaths: readonly string[]): string | null {
+  if (filePaths.length === 0) return null
+  if (filePaths.length === 1) return filePaths[0] ?? null
+  return orderPathsForTree(filePaths)[0] ?? null
+}
+
 // The workspace and the explorer ask for the directories of the same path array,
 // so the answer is kept per input identity rather than computed twice.
 const directoryPathsByInput = new WeakMap<readonly string[], string[]>()

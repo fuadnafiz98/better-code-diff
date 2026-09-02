@@ -8,6 +8,7 @@ import type {
 } from '../../shared/contracts'
 import type { WorkspaceView } from './AppView'
 import type { ReviewCheckpoint, SinceReview } from './reviewCheckpoints'
+import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
 import { worldViewCache } from './worldViewCache'
 
 export interface WorldNavigation {
@@ -142,7 +143,7 @@ function workingTreeWorld(snapshot: RepositorySnapshot, previous?: DeskWorld): D
   return {
     source: 'desk',
     worldId: `desk:${snapshot.root}`,
-    label: `Working tree · ${snapshot.name}`,
+    label: snapshot.name,
     root: snapshot.root,
     snapshot,
     baselineOid: snapshot.head,
@@ -636,12 +637,12 @@ export function useReviewWorlds({
   const openDeskWorld = useCallback((nextSnapshot: RepositorySnapshot) => {
     saveActiveNavigation()
     const worldId = `desk:${nextSnapshot.root}`
-    if (!navigationRef.current.has(worldId)) {
+    const existing = navigationRef.current.get(worldId)
+    if (existing == null || existing.selectedPath == null) {
       navigationRef.current.set(worldId, {
-        selectedPath: nextSnapshot.statuses[0]?.path
-          ?? (nextSnapshot.kind === 'folder' ? nextSnapshot.paths[0] ?? null : null),
-        workspaceView: 'multi',
-        reviewScrollTop: 0
+        selectedPath: firstOpenPathForSnapshot(nextSnapshot),
+        workspaceView: automaticWorkspaceView(nextSnapshot, null),
+        reviewScrollTop: existing?.reviewScrollTop ?? 0
       })
     }
     dispatch({ type: 'open-desk', snapshot: nextSnapshot })

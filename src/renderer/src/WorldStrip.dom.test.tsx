@@ -20,7 +20,7 @@ const snapshot: RepositorySnapshot = {
 const desk: DeskWorld = {
   source: 'desk',
   worldId: 'desk:/projects/alpha',
-  label: 'Working tree · alpha',
+  label: 'alpha',
   root: snapshot.root,
   snapshot,
   baselineOid: snapshot.head,
@@ -69,11 +69,13 @@ test('renders browser-style tab controls and routes focus, close, and new action
     onNew={() => { created += 1 }} />)
 
   expect(screen.getByRole('navigation', { name: 'Review tabs' })).toBeTruthy()
-  expect(screen.getByRole('tab', { name: 'Working tree · alpha' }).getAttribute('aria-selected')).toBe('false')
+  expect(screen.queryByText('Review')).toBeNull()
+  expect(screen.queryByText('⌘⇧[ ]')).toBeNull()
+  expect(screen.getByRole('tab', { name: 'alpha' }).getAttribute('aria-selected')).toBe('false')
   expect(screen.getByRole('tab', { name: /#221 · acme\/alpha/ }).getAttribute('aria-selected')).toBe('true')
 
-  fireEvent.click(screen.getByRole('tab', { name: 'Working tree · alpha' }))
-  fireEvent.click(screen.getByRole('button', { name: 'Close Working tree · alpha tab' }))
+  fireEvent.click(screen.getByRole('tab', { name: 'alpha' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Close alpha tab' }))
   fireEvent.click(screen.getByRole('button', { name: 'New tab' }))
 
   expect(focused).toEqual([desk.worldId])

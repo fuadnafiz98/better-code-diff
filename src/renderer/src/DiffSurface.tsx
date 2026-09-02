@@ -11,6 +11,11 @@ import {
 } from '@pierre/icons'
 
 import type { ContentSearchResult, FileComparison } from '../../shared/contracts'
+import { hasImagePreview } from '../../shared/imagePreview'
+import { ImageDiffPreview } from './ImageDiffPreview'
+import { MarkdownFilePreview } from './MarkdownFilePreview'
+import { markdownPreviewSource, markdownSurface, type DocumentView } from './documentView'
+import { MarkdownSplitResizer } from './MarkdownSplitResizer'
 import type { AgentSelection } from './agentAttachments'
 import type { DiffStyle } from './AppView'
 import { LIVE_CODE_FONT_SIZE_PROPERTY, LIVE_CODE_LINE_HEIGHT_PROPERTY } from './codeZoom'
@@ -26,7 +31,7 @@ import {
   type SelectionActionContext
 } from './editor/selectionAction'
 import { useViewerContext, type EditorAnnotations } from './editor/ViewerProviders'
-import { createDiffAnnotation, createFileAnnotation } from './reviewAnnotations'
+import { createDiffAnnotation, createFileAnnotation, selectedRangeLastLine } from './reviewAnnotations'
 import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
 import {
   DraftComment,
@@ -81,6 +86,7 @@ export interface DiffSurfaceProps {
   diffStyle: DiffStyle
   preferences: AppPreferences
   editMode: 'read' | 'edit' | 'preview'
+  documentView: DocumentView
   contentSearch?: ContentSearchState
   getEditor(): Editor<ReviewAnnotationMetadata> | null
   onDraftFileChange(file: FileContents): void
@@ -160,7 +166,7 @@ function useReviewComments(
     const thread: ReviewThread = {
       id: crypto.randomUUID(),
       body,
-      lineNumber: draftRange.start,
+      lineNumber: selectedRangeLastLine(draftRange),
       side: draftRange.side,
       range: draftRange,
       replies: [],
@@ -190,14 +196,16 @@ function useReviewComments(
       return (
         <DraftComment
           range={metadata.range}
-          onCancel={() => setReviewCursor({ path: comparisonPath, selectedLines, draftRange: null })}
+          onCancel={() => setReviewCursor({ path: comparisonPath, selectedLines: null, draftRange: null })}
           onSave={saveComment}
         />
       )
     }
     // The single-file view keeps its direct comment flow, so no selection action
     // bar is produced here; remote threads belong to the multi-file review.
-    if (metadata.kind === 'remote' || metadata.kind === 'selection') return <></>
+    if (metadata.kind === 'remote' || metadata.kind === 'selection' || metadata.kind === 'image') {
+      return <></>
+    }
     const { thread } = metadata
     return (
       <ReviewThreadCard
@@ -211,7 +219,7 @@ function useReviewComments(
         onToggleResolved={() => updateThread(thread.id, (current) => ({ ...current, resolved: !current.resolved }))}
       />
     )
-  }, [comparisonPath, saveComment, selectedLines, updateThread])
+  }, [comparisonPath, saveComment, updateThread])
 
   const reviewMetadata = useMemo<ReviewAnnotationMetadata[]>(() => [
     ...threads.map((thread) => ({ kind: 'thread' as const, thread })),
@@ -244,6 +252,7 @@ function DiffContents({
   diffStyle,
   preferences,
   editMode,
+  documentView,
   contentSearch,
   getEditor,
   onDraftFileChange,
@@ -335,8 +344,8 @@ function DiffContents({
 
   const renderSelectionAction = useCallback((context: SelectionActionContext) => (
     createSelectionActionElement([
-      { label: 'Add to chat', run: askAgentAboutSelection },
       { label: 'Comment', run: commentOnSelection },
+      { label: 'Add to chat', run: askAgentAboutSelection },
       { label: 'Copy', run: (selection) => void navigator.clipboard.writeText(selection.getSelectionText()) }
     ], context)
   ), [askAgentAboutSelection, commentOnSelection])
@@ -441,6 +450,13 @@ function DiffContents({
 
   if (loading) return <div className="diff-state"><IconRefresh className="spin" /><span>Loading comparison…</span></div>
   if (comparison == null) return <div className="diff-state"><IconCodeSearch /><span>Select a file in the explorer</span></div>
+  if (hasImagePreview(comparison.image)) {
+    return (
+      <div className="diff-scroll image-diff-scroll">
+        <ImageDiffPreview image={comparison.image} status={comparison.status} />
+      </div>
+    )
+  }
   if (comparison.binary || comparison.oversized) {
     return (
       <div className="diff-state">
@@ -454,44 +470,60 @@ function DiffContents({
     return <div className="diff-state"><IconFileCode /><span>No renderable file contents</span></div>
   }
 
+  const surface = markdownSurface(comparison, editMode, documentView)
+  const previewText = markdownPreviewSource(comparison)
+  if (surface === 'preview' && previewText != null) {
+    return <MarkdownFilePreview source={previewText} />
+  }
+
+  let codeView
   if (comparison.mode === 'file' && comparison.newFile != null) {
+    codeView = (
+      <Virtualizer className="diff-scroll editor-scroll" contentClassName="diff-content editor-content">
+        <File<ReviewAnnotationMetadata>
+          file={comparison.newFile}
+          edit={editing}
+          editorOptions={editorOptions}
+          options={fileOptions}
+          selectedLines={selectedLines}
+          lineAnnotations={fileAnnotations}
+          renderAnnotation={renderFileAnnotation}
+          className="pierre-diff editor-file"
+          style={codeStyle}
+        />
+        <VirtualizedBackToTop />
+      </Virtualizer>
+    )
+  } else {
+    const sharedDiffProps = {
+      options: diffOptions,
+      edit: editing,
+      editorOptions,
+      selectedLines,
+      lineAnnotations: diffAnnotations,
+      renderAnnotation: renderDiffAnnotation,
+      className: 'pierre-diff',
+      style: codeStyle
+    }
+    const diff = comparison.oldFile != null && comparison.newFile != null
+      ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={comparison.newFile} {...sharedDiffProps} />
+      : comparison.oldFile != null
+        ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={null} {...sharedDiffProps} />
+        : <MultiFileDiff<ReviewAnnotationMetadata> oldFile={null} newFile={comparison.newFile!} {...sharedDiffProps} />
+    codeView = <Virtualizer className="diff-scroll" contentClassName="diff-content">{diff}<VirtualizedBackToTop /></Virtualizer>
+  }
+
+  if (surface === 'split' && previewText != null) {
     return (
-      <>
-        <Virtualizer className="diff-scroll editor-scroll" contentClassName="diff-content editor-content">
-          <File<ReviewAnnotationMetadata>
-            file={comparison.newFile}
-            edit={editing}
-            editorOptions={editorOptions}
-            options={fileOptions}
-            selectedLines={selectedLines}
-            lineAnnotations={fileAnnotations}
-            renderAnnotation={renderFileAnnotation}
-            className="pierre-diff editor-file"
-            style={codeStyle}
-          />
-          <VirtualizedBackToTop />
-        </Virtualizer>
-      </>
+      <div className="markdown-split">
+        <div className="markdown-split-source">{codeView}</div>
+        <MarkdownSplitResizer />
+        <MarkdownFilePreview source={previewText} />
+      </div>
     )
   }
 
-  const sharedDiffProps = {
-    options: diffOptions,
-    edit: editing,
-    editorOptions,
-    selectedLines,
-    lineAnnotations: diffAnnotations,
-    renderAnnotation: renderDiffAnnotation,
-    className: 'pierre-diff',
-    style: codeStyle
-  }
-  const diff = comparison.oldFile != null && comparison.newFile != null
-    ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={comparison.newFile} {...sharedDiffProps} />
-    : comparison.oldFile != null
-      ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={null} {...sharedDiffProps} />
-      : <MultiFileDiff<ReviewAnnotationMetadata> oldFile={null} newFile={comparison.newFile!} {...sharedDiffProps} />
-
-  return <Virtualizer className="diff-scroll" contentClassName="diff-content">{diff}<VirtualizedBackToTop /></Virtualizer>
+  return codeView
 }
 
 const MemoizedDiffContents = memo(DiffContents)

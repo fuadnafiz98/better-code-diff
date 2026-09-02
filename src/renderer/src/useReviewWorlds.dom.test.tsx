@@ -194,6 +194,7 @@ test('closing the final tab for a root releases its repository session', async (
   }))
 
   await waitFor(() => expect(result.current.worlds).toHaveLength(1))
+  expect(result.current.worlds[0]?.label).toBe('repo')
   let patchWorldId!: string
   act(() => {
     patchWorldId = result.current.openPatchWorld(snapshot, review, 1, false)
@@ -241,4 +242,39 @@ test('refreshes working-tree tab state when status changes without a new commit'
       { path: 'desk.ts', status: 'modified' }
     ])
   })
+})
+
+test('opening a plain folder starts in the file browser', async () => {
+  const folder: RepositorySnapshot = {
+    root: '/plain',
+    name: 'plain',
+    kind: 'folder',
+    branch: null,
+    head: null,
+    paths: ['readme.md', 'src/app.ts'],
+    statuses: []
+  }
+  const { result } = renderHook(() => {
+    const [selectedPath, setSelectedPath] = useState<string | null>(null)
+    const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('multi')
+    const worlds = useReviewWorlds({
+      snapshot: folder,
+      selectedPath,
+      workspaceView,
+      onActivateSnapshot: () => {},
+      onActivateRepository: async () => folder,
+      onReleaseRepository: async () => {},
+      onActivationError: () => {},
+      onSelectPath: setSelectedPath,
+      onWorkspaceViewChange: setWorkspaceView
+    })
+    return { selectedPath, workspaceView, worlds }
+  })
+
+  await waitFor(() => expect(result.current.worlds.worlds).toHaveLength(1))
+  act(() => {
+    result.current.worlds.openDeskWorld(folder)
+  })
+  expect(result.current.workspaceView).toBe('file')
+  expect(result.current.selectedPath).toBe('src/app.ts')
 })

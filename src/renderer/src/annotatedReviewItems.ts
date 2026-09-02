@@ -210,6 +210,7 @@ export function deriveAnnotatedReviewItems({
 
     changed = true
     const metadata: ReviewAnnotationMetadata[] = [
+      ...inheritedImageMetadata(baseItem),
       ...remoteThreads.map((thread) => ({ kind: 'remote' as const, thread })),
       ...threads.map((thread) => ({ kind: 'thread' as const, thread })),
       ...(draftRange == null ? [] : [{ kind: 'draft' as const, range: draftRange }]),
@@ -236,4 +237,15 @@ export function deriveAnnotatedReviewItems({
   // poll tick that changed nothing.
   if (!changed && previousItems != null) return { items: previousItems, cache: previousCache }
   return { items: nextItems, cache: nextCache }
+}
+
+function inheritedImageMetadata(
+  item: CodeViewItem<ReviewAnnotationMetadata>
+): ReviewAnnotationMetadata[] {
+  const annotated = item as CodeViewItem<ReviewAnnotationMetadata> & {
+    annotations?: ReadonlyArray<{ metadata?: ReviewAnnotationMetadata }>
+  }
+  return (annotated.annotations ?? []).flatMap((annotation) => (
+    annotation.metadata?.kind === 'image' ? [annotation.metadata] : []
+  ))
 }

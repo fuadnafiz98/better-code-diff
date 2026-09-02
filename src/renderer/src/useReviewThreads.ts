@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } 
 import type { CodeViewItem, CodeViewLineSelection, SelectedLineRange } from '@pierre/diffs'
 
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
+import { selectedRangeLastLine } from './reviewAnnotations'
 import { pathFromReviewItemId as pathFromItemId } from './reviewItems'
 import {
   attachReviewThreadToRange,
@@ -157,7 +158,7 @@ export function useReviewThreads({
     const thread: ReviewThread = {
       id: crypto.randomUUID(),
       body,
-      lineNumber: draftComment.range.start,
+      lineNumber: selectedRangeLastLine(draftComment.range),
       side: draftComment.range.side,
       range: draftComment.range,
       ...(anchor == null ? {} : { anchor }),

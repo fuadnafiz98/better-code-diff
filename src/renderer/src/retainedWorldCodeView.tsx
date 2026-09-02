@@ -77,7 +77,7 @@ interface RetainedWorldCodeViewProps {
   codeViewOptions: CodeViewReactOptions<ReviewAnnotationMetadata>
   codeStyle: CSSProperties
   slots: ReviewCodeViewSlots
-  onSelectLines(selection: CodeViewLineSelection | null): void
+  onHighlightLines(selection: CodeViewLineSelection | null): void
   onScroll(scrollTop: number): void
   scrollContainerRef: RefObject<HTMLDivElement | null>
   setViewerRef(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): void
@@ -93,7 +93,7 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
   codeViewOptions,
   codeStyle,
   slots,
-  onSelectLines,
+  onHighlightLines,
   onScroll,
   scrollContainerRef,
   setViewerRef,
@@ -110,7 +110,7 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
     codeViewOptions,
     codeStyle,
     slots,
-    onSelectLines,
+    onHighlightLines,
     onScroll
   })
   const view = active
@@ -120,7 +120,7 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
         codeViewOptions,
         codeStyle,
         slots,
-        onSelectLines,
+        onHighlightLines,
         onScroll
       }
     : frozenRef.current
@@ -138,7 +138,7 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
       codeViewOptions,
       codeStyle,
       slots,
-      onSelectLines,
+      onHighlightLines,
       onScroll
     }
   }, [
@@ -146,8 +146,8 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
     codeStyle,
     codeViewOptions,
     items,
+    onHighlightLines,
     onScroll,
-    onSelectLines,
     selectedLines,
     slots
   ])
@@ -210,7 +210,7 @@ export const RetainedWorldCodeView = memo(function RetainedWorldCodeView({
         <CodeView<ReviewAnnotationMetadata> ref={assignViewer} containerRef={localContainerRef}
           items={view.items} onScroll={active ? view.onScroll : NOOP_SCROLL}
           options={view.codeViewOptions} selectedLines={view.selectedLines}
-          onSelectedLinesChange={view.onSelectLines}
+          onSelectedLinesChange={view.onHighlightLines}
           {...codeViewSlotProps(view.slots)}
           className="multi-file-code-view" style={view.codeStyle} />
       </div>

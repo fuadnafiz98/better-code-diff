@@ -4,7 +4,7 @@ Horus is a local-first desktop application for exploring projects and reviewing 
 
 ## Features
 
-- Open Git repositories and ordinary folders.
+- Open Git repositories and ordinary folders from a searchable picker, with the macOS folder dialog as a fallback.
 - Browse a virtualized project tree with file-type icons and Git status markers.
 - Review the working tree, a GitHub pull request, a local branch compare, or a single commit.
 - View changes in split or unified diff, as a multi-file review or one file at a time.
@@ -36,6 +36,16 @@ bun run dev
 
 Use the Electron window opened by `bun run dev`. The renderer URL on its own does not have access to the native folder picker or repository service.
 
+## Raycast
+
+The `extensions/horus` Raycast extension opens a GitHub pull request URL in Horus. Copying the URL, pasting it into the command, or enabling the 10-second clipboard warmer starts the review in the background so Enter does not wait on a cold fetch.
+
+1. Install Horus with `bun run update:mac` so the `horus://` link is registered.
+2. Run `bun run raycast:dev` (or `npm install && npm run dev` in `extensions/horus`). Do not Import Extension on the source folder — that produces `Missing executable`.
+3. Raycast will not put Horus under **Use with...** by itself. After install, paste a PR URL, click the gear on that section, and enable **Open in Horus** once.
+
+See `extensions/horus/README.md` for the commands and hotkey setup.
+
 ## Commands
 
 | Command | Description |
@@ -51,6 +61,7 @@ Use the Electron window opened by `bun run dev`. The renderer URL on its own doe
 | `bun run lint` | Lint `src` with oxlint |
 | `bun test` | Run the test suite |
 | `bun run verify` | Lint, type-check, test, and build in one pass |
+| `bun run raycast:dev` | Register the local Horus Raycast extension |
 
 Run the complete local verification with:
 
@@ -65,7 +76,7 @@ Doctor scan that fails on any diagnostic.
 
 | Shortcut | Action |
 | --- | --- |
-| `Command+O` | Open a folder |
+| `Command+O` | Search and open a folder |
 | `Command+P` | Go to file |
 | `Command+Shift+F` | Search file contents |
 | `Control+J` / `Command+J` | Toggle the project terminal |

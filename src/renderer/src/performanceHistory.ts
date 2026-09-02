@@ -189,6 +189,21 @@ export function buildPerformanceChart(
   }
 }
 
+export function interpolateChartY(points: readonly ChartPoint[], x: number): number | null {
+  const first = points[0]
+  if (first == null) return null
+  if (x <= first.x) return first.y
+  for (let index = 1; index < points.length; index++) {
+    const right = points[index]!
+    const left = points[index - 1]!
+    if (x > right.x) continue
+    const span = right.x - left.x
+    if (span <= 0) return right.y
+    return left.y + ((x - left.x) / span) * (right.y - left.y)
+  }
+  return points[points.length - 1]?.y ?? null
+}
+
 export function findNearestSampleIndex(history: readonly MemorySample[], atMs: number): number {
   if (history.length === 0) return -1
   let low = 0

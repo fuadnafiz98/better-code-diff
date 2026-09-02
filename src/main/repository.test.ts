@@ -1271,6 +1271,30 @@ describe('RepositoryService', () => {
     }
   })
 
+  it('attaches a png preview instead of an empty binary comparison', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-image-preview-'))
+    const repository = new RepositoryService()
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64'
+    )
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'icon.png'), png)
+      await repository.open(repositoryPath)
+      const comparison = await repository.getComparison('icon.png')
+
+      expect(comparison.binary).toBe(true)
+      expect(comparison.newFile).toBeNull()
+      expect(comparison.image?.new?.mimeType).toBe('image/png')
+      expect(comparison.image?.new?.dataUrl.startsWith('data:image/png;base64,')).toBe(true)
+      expect(comparison.image?.old).toBeNull()
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
   it('keeps tracked build output visible and consistent between a commit review files and patch', async () => {
     const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-tracked-dist-'))
     const repository = new RepositoryService()

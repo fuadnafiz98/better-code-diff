@@ -37,9 +37,9 @@ const SKELETON_CSS = `
 .workspace-skeleton-rows { flex: 1; min-height: 0; overflow: hidden; padding: 6px 12px; display: flex; flex-direction: column; gap: 10px; }
 .workspace-skeleton-code { padding: 16px var(--gutter); gap: 9px; }
 .workspace-skeleton-bar { height: 9px; flex: none; border-radius: 4px; corner-shape: squircle; background: var(--control-fill); position: relative; overflow: hidden; }
-.workspace-skeleton-toolbar { display: flex; flex-direction: column; justify-content: center; gap: 6px; }
+.workspace-skeleton-toolbar { display: flex; align-items: center; gap: 10px; }
 .workspace-skeleton-toolbar .workspace-skeleton-bar:first-child { width: 168px; }
-.workspace-skeleton-toolbar .workspace-skeleton-bar:last-child { width: 96px; height: 7px; }
+.workspace-skeleton-toolbar .workspace-skeleton-bar:last-child { width: 96px; height: 8px; }
 .workspace-skeleton-bar::after {
   content: ""; position: absolute; inset: 0;
   background: linear-gradient(90deg, transparent 0%, var(--control-fill-hover) 50%, transparent 100%);
@@ -82,7 +82,9 @@ export function WorkspaceSkeleton(): React.JSX.Element {
       <style href="workspace-skeleton" precedence="medium">{SKELETON_CSS}</style>
       <aside className="sidebar workspace-skeleton" aria-hidden="true">
         <div className="sidebar-heading">
-          <strong>Explorer</strong>
+          <div className="sidebar-heading-identity">
+            <div className="workspace-skeleton-bar" style={{ width: 24, height: 24, borderRadius: 7 }} />
+          </div>
           <div className="sidebar-heading-actions">
             <div className="workspace-skeleton-bar" style={{ width: 28, height: 10 }} />
             <div className="workspace-skeleton-bar" style={{ width: 30, height: 30, borderRadius: 9 }} />

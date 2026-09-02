@@ -1,46 +1,65 @@
 import type { SelectedLineRange } from '@pierre/diffs'
 
 export const DRAG_SELECTION_CSS = `
-  [data-selected-line],
+  /* Tint through Pierre's mix variables so added/removed greens stay visible.
+     A solid background !important is what turned the selection into mud. */
   [data-drag-range] {
-    background: color-mix(in srgb, var(--accent) 16%, transparent) !important;
+    --diffs-computed-hovered-line-bg: color-mix(
+      in srgb,
+      var(--diffs-computed-diff-line-bg, transparent) 82%,
+      var(--accent)
+    );
+    --diffs-line-bg: var(--diffs-computed-hovered-line-bg);
   }
 
-  [data-gutter] [data-drag-range] {
+  [data-gutter] [data-drag-range],
+  [data-gutter] [data-selected-line] {
     position: relative;
   }
 
-  [data-gutter] [data-drag-range]::after {
+  [data-gutter] [data-drag-range]::after,
+  [data-gutter] [data-selected-line]::after {
     content: "";
     position: absolute;
     z-index: 2;
     top: 0;
-    right: -4px;
+    right: 0;
     bottom: 0;
     width: 2px;
-    border-radius: 2px;
     background: var(--accent);
     pointer-events: none;
   }
 
-  [data-gutter] [data-drag-range="first"]::after {
-    top: 50%;
+  [data-gutter-utility-slot] {
+    align-items: center;
+    justify-content: center;
   }
 
-  [data-gutter] [data-drag-range="last"]::after {
-    bottom: 50%;
-  }
-
-  [data-gutter] [data-drag-range="single"]::after {
-    display: none;
-  }
-
-  [data-utility-button] {
-    position: relative;
-    border-radius: var(--corner-compact);
-    corner-shape: squircle;
+  /* Pierre’s default is width 1lh with margin-right: calc(-1lh + 1ch), which
+     parks a shrunk 18px control on the number/code seam and covers tokens.
+     Keep the button in the gutter and sit it on the strip between rows. */
+  [data-gutter] [data-utility-button] {
+    width: 18px !important;
+    height: 18px !important;
+    min-width: 18px;
+    margin-right: 0 !important;
+    padding: 0;
+    border: 0;
+    border-radius: 6px !important;
+    corner-shape: squircle !important;
     background: var(--accent);
     color: var(--accent-contrast);
+    transform: translateY(50%);
+    box-shadow:
+      0 0 0 2px var(--diffs-bg, var(--canvas)),
+      0 1px 2px color-mix(in srgb, var(--accent) 30%, transparent),
+      0 4px 10px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
+  [data-utility-button] svg,
+  [data-utility-button] [data-icon] {
+    width: 10px;
+    height: 10px;
   }
 `
 
@@ -282,6 +301,22 @@ export function syncDragGuideLifecycle(
     event.stopImmediatePropagation()
   }
 
+  const cancelActiveDrag = (): void => {
+    if (drag == null) return
+    if (drag.captureTarget.hasPointerCapture?.(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture(drag.pointerId)
+    }
+    drag = null
+    clearDragGuide(root)
+  }
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== 'Escape' || drag == null) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    cancelActiveDrag()
+  }
+
   const scrollContainer = node.closest<HTMLElement>('.multi-file-code-view, .diff-scroll')
   const onScroll = (): void => {
     if (drag != null) drag.geometryStale = true
@@ -292,6 +327,7 @@ export function syncDragGuideLifecycle(
   root.addEventListener('pointerup', onPointerUp, true)
   root.addEventListener('pointercancel', onPointerCancel, true)
   root.addEventListener('click', onClick, true)
+  window.addEventListener('keydown', onKeyDown, true)
   scrollContainer?.addEventListener('scroll', onScroll, { passive: true })
 
   binding.teardown = () => {
@@ -300,8 +336,9 @@ export function syncDragGuideLifecycle(
     root.removeEventListener('pointerup', onPointerUp, true)
     root.removeEventListener('pointercancel', onPointerCancel, true)
     root.removeEventListener('click', onClick, true)
+    window.removeEventListener('keydown', onKeyDown, true)
     scrollContainer?.removeEventListener('scroll', onScroll)
-    clearDragGuide(root)
+    cancelActiveDrag()
   }
   dragGuideBindings.set(node, binding)
 }

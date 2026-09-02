@@ -3,7 +3,15 @@ import type { FileTree as FileTreeModel, TreeThemeStyles } from '@pierre/trees'
 import { themeToTreeStyles } from '@pierre/trees'
 import { FileTree, useFileTreeSearch } from '@pierre/trees/react'
 import pierreDarkTheme from '@pierre/theme/pierre-dark'
-import { IconChevronsClose, IconExpandAll, IconSearch, IconX } from '@pierre/icons'
+import {
+  IconBranch,
+  IconChevronsClose,
+  IconExpandAll,
+  IconSearch,
+  IconSidebarLeft,
+  IconSidebarLeftOpen,
+  IconX
+} from '@pierre/icons'
 
 import { getDirectoryPaths } from './treeExpansion'
 import type { EditorThemeType } from './preferences'
@@ -37,10 +45,27 @@ interface ExplorerProps {
   filePaths: readonly string[]
   model: FileTreeModel
   themeType: EditorThemeType
+  sidebarVisible: boolean
+  onSidebarToggle(): void
+  sidebarShortcut: string
+  isGit: boolean
+  branchName: string | null
+  onBranchesOpen(): void
   onRowActivate(path: string): void
 }
 
-export const Explorer = memo(function Explorer({ filePaths, model, themeType, onRowActivate }: ExplorerProps) {
+export const Explorer = memo(function Explorer({
+  filePaths,
+  model,
+  themeType,
+  sidebarVisible,
+  onSidebarToggle,
+  sidebarShortcut,
+  isGit,
+  branchName,
+  onBranchesOpen,
+  onRowActivate
+}: ExplorerProps) {
   const search = useFileTreeSearch(model)
   const directoryPaths = useMemo(() => getDirectoryPaths(filePaths), [filePaths])
   const visibleFileCount = search.value.length > 0 ? search.matchingPaths.length : filePaths.length
@@ -83,7 +108,30 @@ export const Explorer = memo(function Explorer({ filePaths, model, themeType, on
   return (
     <aside className="sidebar" id="repository-explorer">
       <div className="sidebar-heading">
-        <strong>Explorer</strong>
+        <div className="sidebar-heading-identity">
+          <button
+            type="button"
+            aria-label={sidebarVisible ? 'Hide explorer' : 'Show explorer'}
+            title={`${sidebarVisible ? 'Hide' : 'Show'} Explorer (${sidebarShortcut})`}
+            onClick={onSidebarToggle}
+          >
+            <span className="icon-swap sidebar-icon-swap" data-state={sidebarVisible ? 'base' : 'alt'}>
+              <IconSidebarLeft /><IconSidebarLeftOpen />
+            </span>
+          </button>
+          {isGit ? (
+            <button
+              className="chrome-branch-button"
+              type="button"
+              onClick={onBranchesOpen}
+              aria-label={`Switch branch. Current branch: ${branchName ?? 'detached HEAD'}`}
+              title="Switch branch"
+            >
+              <IconBranch />
+              <span>{branchName ?? 'Detached HEAD'}</span>
+            </button>
+          ) : null}
+        </div>
         <div className="sidebar-heading-actions">
           <span className="sidebar-file-count">{visibleFileCount.toLocaleString()} files</span>
           <button type="button" aria-label="Expand all folders" title="Expand all folders" onClick={expandAll}>

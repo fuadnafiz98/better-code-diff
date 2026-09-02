@@ -10,6 +10,49 @@ import { REVIEW_CARET_CSS } from './reviewCaret'
  * whole session in. Degrading identically inside and outside the viewer means the
  * scale drops and the background tint stays as the confirmation.
  */
+export const IMAGE_DIFF_PREVIEW_CSS = `
+  .image-diff-preview {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: start;
+    gap: 16px;
+    padding: 16px 18px 24px;
+  }
+
+  .image-diff-preview.is-compare {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .image-diff-side {
+    margin: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .image-diff-side figcaption {
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
+  }
+
+  .image-diff-side img {
+    max-width: 100%;
+    max-height: min(70vh, 720px);
+    height: auto;
+    object-fit: contain;
+    border: 1px solid var(--border);
+    border-radius: var(--corner-card);
+    background:
+      linear-gradient(45deg, var(--panel-subtle) 25%, transparent 25%) 0 0 / 12px 12px,
+      linear-gradient(-45deg, var(--panel-subtle) 25%, transparent 25%) 0 6px / 12px 12px,
+      var(--canvas);
+  }
+`
+
 export const REDUCED_MOTION_CSS = `
   @media (prefers-reduced-motion: reduce) {
     button {
@@ -27,6 +70,33 @@ export const REDUCED_MOTION_CSS = `
     [data-expand-button] {
       transition: none !important;
     }
+  }
+`
+
+/**
+ * Pierre injects annotations as a row after the line. A pointer on that row is
+ * mapped to the previous line, then data-selected-line is copied onto this row
+ * and the paired split column — the “section” on the left and right.
+ * The slotted card is also left-flush against the number gutter / split
+ * divider, so a white card edge disappears into the white rule.
+ */
+export const ANNOTATION_LAYOUT_CSS = `
+  [data-annotation-content] {
+    padding: 8px 12px 10px;
+    box-sizing: border-box;
+  }
+
+  [data-line-annotation][data-selected-line],
+  [data-gutter-buffer="annotation"][data-selected-line] {
+    --mix-selection-light: 100%;
+    --mix-selection-dark: 100%;
+    --diffs-selection-mix-target: var(--diffs-computed-decoration-bg);
+    --diffs-computed-selected-line-bg: var(--diffs-computed-decoration-bg);
+  }
+
+  [data-line-annotation][data-hovered],
+  [data-gutter-buffer="annotation"][data-hovered] {
+    --diffs-computed-hovered-line-bg: var(--diffs-computed-decoration-bg);
   }
 `
 
@@ -86,6 +156,8 @@ export const VIEWER_BASE_CSS = `
   ${SPLIT_DIFF_RESIZE_CSS}
   ${COPY_FILE_PATH_CSS}
   ${REVIEW_CARET_CSS}
+  ${IMAGE_DIFF_PREVIEW_CSS}
+  ${ANNOTATION_LAYOUT_CSS}
   ${REDUCED_MOTION_CSS}
 `
 
@@ -93,19 +165,19 @@ export const VIEWER_BASE_CSS = `
 export const SELECTION_ACTION_CSS = `
   [data-selection-action] {
     display: flex;
-    gap: 2px;
-    padding: 3px;
-    border: 1px solid var(--border);
+    gap: 4px;
+    padding: 4px;
+    border: 0;
     border-radius: var(--corner-control);
     background: var(--floating-surface);
-    box-shadow: var(--elev-1);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text) 8%, transparent);
   }
 
-  /* Concentric: the shell's radius minus its 3px inset. */
+  /* Concentric: the shell's radius minus its 4px inset. */
   [data-selection-action] button {
     border: 0;
-    border-radius: calc(var(--corner-control) - 3px);
-    padding: 4px 8px;
+    border-radius: calc(var(--corner-control) - 4px);
+    padding: 6px 10px;
     background: transparent;
     color: var(--text-secondary);
     font-family: var(--font-ui);
@@ -113,8 +185,17 @@ export const SELECTION_ACTION_CSS = `
     cursor: pointer;
   }
 
+  [data-selection-action] button:first-child {
+    background: var(--accent-soft);
+    color: var(--path-text);
+  }
+
   [data-selection-action] button:hover {
     background: var(--control-fill-hover);
     color: var(--text);
+  }
+
+  [data-selection-action] button:active:not(:disabled) {
+    scale: 0.97;
   }
 `

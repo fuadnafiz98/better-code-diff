@@ -16,7 +16,7 @@ const COMMANDS: PaletteEntry[] = [
   entry('wrap', 'Toggle word wrap', 'Wrap or scroll long code lines.'),
   entry('sidebar', 'Toggle explorer', 'Show or hide the file explorer.'),
   entry('settings', 'Open settings', 'Appearance, editor, and keybindings.'),
-  entry('folder', 'Open folder', 'Open the macOS folder picker.'),
+  entry('folder', 'Open folder', 'Search recent folders or open the macOS picker.'),
   entry('fold', 'Toggle context folding', 'Fold or expand unchanged diff regions.')
 ]
 

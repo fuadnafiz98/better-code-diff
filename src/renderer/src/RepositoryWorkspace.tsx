@@ -5,6 +5,7 @@ import type { FileTree as FileTreeModel } from '@pierre/trees'
 import { useFileTree } from '@pierre/trees/react'
 
 import type { FileComparison, PullRequestReviewComment, PullRequestReviewEvent, RepositoryChangeEvent, RepositoryFileStatus, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
+import { isMarkdownPath } from '../../shared/markdownPreview'
 import { DiffToolbar, type DiffStyle, type FileEditControls, type WorkspaceView } from './AppView'
 import { Explorer } from './Explorer'
 import { getEditorThemeType, type AppPreferences } from './preferences'
@@ -19,7 +20,7 @@ import { usePullRequestConversation } from './usePullRequestConversation'
 import { useReviewSession } from './useReviewSession'
 import { useReviewLoadState, type ReviewLoadState } from './useReviewLoadState'
 import { useViewerSuspension } from './useViewerSuspension'
-import type { ReviewCommand } from './keybindings'
+import { formatKeybinding, type ReviewCommand } from './keybindings'
 import { useReviewShortcuts } from './useReviewShortcuts'
 import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
 import { FindBar } from './FindBar'
@@ -29,11 +30,13 @@ import { useCodeZoomGesture } from './useCodeZoomGesture'
 import { useFileEditing } from './useFileEditing'
 import { EditorStatusBar } from './editor/EditorStatusBar'
 import { useViewerContext } from './editor/ViewerProviders'
-import { workspaceViewForTreePath } from './workspaceMode'
+import { reviewPathsForSnapshot, workspaceViewForTreePath } from './workspaceMode'
 import { getErrorMessage } from './repositoryApi'
 import {
   getLoadedDiffSurface,
   getLoadedMultiFileReview,
+  preloadDiffSurface,
+  preloadMultiFileReview,
   preloadWorkspaceViewer,
   subscribeDiffSurface,
   subscribeMultiFileReview
@@ -69,7 +72,7 @@ const TREE_STYLES = `
   button,
   [data-type="item"],
   [data-file-tree-search-input],
-  [data-horus-tree-menu] {
+  [data-type="context-menu-trigger"] {
     corner-shape: squircle;
   }
 
@@ -118,44 +121,49 @@ const TREE_STYLES = `
   }
 
   [data-file-tree-search-input] {
-    height: var(--control-height);
-    border-radius: var(--corner-control);
-    font-size: var(--text-md);
+    height: var(--control-height) !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: var(--corner-control) !important;
+    padding: 0 8px !important;
+    background: var(--surface-input) !important;
+    color: var(--text) !important;
+    font-size: var(--text-md) !important;
+    box-shadow: none !important;
+  }
+
+  [data-file-tree-search-input]::placeholder {
+    color: var(--faint);
+  }
+
+  [data-file-tree-search-input]:focus {
+    outline: 0;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong)) !important;
+    box-shadow: var(--focus-glow) !important;
   }
 
   [data-file-tree-search-container] {
-    padding: 7px var(--gutter-sidebar) 6px;
+    padding: 8px var(--gutter-sidebar);
   }
 
-  [data-horus-tree-menu] {
-    min-width: 190px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--corner-card);
-    padding: 4px;
-    background: var(--popover);
-    box-shadow: var(--elev-2);
+  [data-file-tree-search-container][data-open="false"] {
+    display: none;
   }
 
-  [data-horus-tree-menu] button {
-    min-height: 28px;
-    display: flex;
-    align-items: center;
+  /* The menu itself is portaled onto .app-shell so the sidebar cannot clip it
+     and light-theme tokens still apply. Only the row trigger lives here. */
+  [data-type="context-menu-trigger"] {
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
     border: 0;
     border-radius: var(--corner-compact);
-    padding: 0 9px;
+    padding: 0;
     background: transparent;
-    color: var(--text-secondary);
-    font: 12px var(--font-ui);
-    text-align: left;
-    cursor: pointer;
+    color: var(--muted);
   }
 
-  [data-horus-tree-menu] button:hover,
-  [data-horus-tree-menu] button:focus-visible {
-    outline: 0;
+  [data-type="context-menu-trigger"]:hover,
+  [data-type="context-menu-trigger"][aria-expanded="true"] {
     background: var(--control-fill-hover);
     color: var(--text);
   }
@@ -213,6 +221,9 @@ export interface RepositoryWorkspaceProps {
   onError(message: string | null): void
   patchLoadError?: string | null
   reviewWorldId: string
+  sidebarVisible: boolean
+  onSidebarToggle(): void
+  onBranchesOpen(): void
 }
 
 interface RepositoryReviewHeaderProps {
@@ -244,6 +255,9 @@ interface RepositoryReviewHeaderProps {
   onFoldUnchangedToggle(): void
   onOpenReviewSummary(): void
   onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string): Promise<boolean>
+  sidebarVisible: boolean
+  onSidebarToggle(): void
+  sidebarShortcut: string
 }
 
 function RepositoryReviewHeader({
@@ -274,10 +288,11 @@ function RepositoryReviewHeader({
   onWordWrapToggle,
   onFoldUnchangedToggle,
   onOpenReviewSummary,
-  onSubmitPullRequestReview
+  onSubmitPullRequestReview,
+  sidebarVisible,
+  onSidebarToggle,
+  sidebarShortcut
 }: RepositoryReviewHeaderProps): React.JSX.Element {
-  const pathSegments = selectedPath?.split('/') ?? []
-
   return (
     <>
       <DiffToolbar
@@ -297,6 +312,9 @@ function RepositoryReviewHeader({
         onDiffStyleChange={onDiffStyleChange}
         onWordWrapToggle={onWordWrapToggle}
         onFoldUnchangedToggle={onFoldUnchangedToggle}
+        sidebarVisible={sidebarVisible}
+        onSidebarToggle={onSidebarToggle}
+        sidebarShortcut={sidebarShortcut}
       />
       {repositoryReview?.kind === 'github' && reviewWorldSource === 'patch' ? (
         <ReviewCheckpointBar
@@ -329,16 +347,6 @@ function RepositoryReviewHeader({
       ) : repositoryReview?.kind === 'local' ? (
         <div className="review-bar pr-review-readonly" role="status">Local branch review. Comments stay local and can be copied from the review summary.</div>
       ) : null}
-      {isFilePreview && pathSegments.length > 0 ? (
-        <nav className="editor-breadcrumbs" aria-label="File path">
-          {pathSegments.map((segment, index) => (
-            <span key={`${segment}:${index}`}>
-              {index > 0 ? <span className="breadcrumb-separator" aria-hidden="true">›</span> : null}
-              <span>{segment}</span>
-            </span>
-          ))}
-        </nav>
-      ) : null}
     </>
   )
 }
@@ -348,9 +356,8 @@ function useReviewPaths(
   repositoryReview: RepositoryReview | null
 ): string[] {
   const unorderedReviewPaths = useMemo(
-    () => repositoryReview?.files.map((file) => file.path)
-      ?? (snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : snapshot.paths),
-    [repositoryReview, snapshot.kind, snapshot.paths, snapshot.statuses]
+    () => reviewPathsForSnapshot(snapshot, repositoryReview),
+    [repositoryReview, snapshot]
   )
   return useMemo(() => orderPathsForTree(unorderedReviewPaths), [unorderedReviewPaths])
 }
@@ -359,17 +366,20 @@ function useReviewTreeData(
   snapshot: RepositorySnapshot,
   repositoryReview: RepositoryReview | null,
   reviewPaths: readonly string[],
-  threadsByPath: Record<string, ReviewThread[]>
+  threadsByPath: Record<string, ReviewThread[]>,
+  reviewWorldSource: RepositoryWorkspaceProps['reviewWorldSource']
 ) {
   // Both source arrays are already memoized, so identity is the whole test the
   // tree needs. Joining them into multi-megabyte keys on every render was the
   // most expensive thing this component did on a large repository.
-  const treePaths = repositoryReview == null ? snapshot.paths : reviewPaths
+  const treePaths = reviewWorldSource === 'desk' && repositoryReview == null
+    ? snapshot.paths
+    : reviewPaths
   const treeStatuses = useMemo<Array<{ path: string; status: TreeFileStatus }>>(
-    () => repositoryReview == null
+    () => reviewWorldSource === 'desk' && repositoryReview == null
       ? snapshot.statuses.map((status) => ({ path: status.path, status: toTreeStatus(status.status) }))
-      : repositoryReview.files.map((file) => ({ path: file.path, status: 'modified' as const })),
-    [repositoryReview, snapshot.statuses]
+      : (repositoryReview?.files ?? []).map((file) => ({ path: file.path, status: 'modified' as const })),
+    [repositoryReview, reviewWorldSource, snapshot.statuses]
   )
   const reviewComments = useMemo(
     () => createPullRequestReviewComments(threadsByPath),
@@ -425,13 +435,32 @@ function repositoryReviewIdentity(repositoryReview: RepositoryReview | null): st
     : repositoryReview.id
 }
 
+function positionPortaledTreeMenu(
+  menu: HTMLElement,
+  anchor: { top: number; right: number; bottom: number; left: number }
+): void {
+  const gap = 4
+  const width = menu.offsetWidth || 196
+  const height = menu.offsetHeight || 104
+  const maxLeft = window.innerWidth - width - 8
+  const maxTop = window.innerHeight - height - 8
+  let left = anchor.right - width
+  if (left < 8) left = Math.min(anchor.left, maxLeft)
+  left = Math.max(8, Math.min(left, maxLeft))
+  let top = anchor.bottom + gap
+  if (top > maxTop) top = Math.max(8, anchor.top - height - gap)
+  menu.style.left = `${Math.round(left)}px`
+  menu.style.top = `${Math.round(top)}px`
+}
+
 function createTreeContextMenu(
   root: string,
   item: { path: string },
-  close: () => void
+  context: { close: () => void; anchorRect: { top: number; right: number; bottom: number; left: number } }
 ): HTMLElement {
   const menu = document.createElement('div')
   menu.dataset.horusTreeMenu = ''
+  menu.dataset.fileTreeContextMenuRoot = 'true'
   menu.setAttribute('role', 'menu')
   const addAction = (label: string, run: () => void): void => {
     const button = document.createElement('button')
@@ -439,7 +468,7 @@ function createTreeContextMenu(
     button.setAttribute('role', 'menuitem')
     button.textContent = label
     button.addEventListener('click', () => {
-      close()
+      context.close()
       run()
     })
     menu.append(button)
@@ -448,7 +477,15 @@ function createTreeContextMenu(
   const absolutePath = `${root.replace(/[/\\]$/, '')}/${item.path}`
   addAction('Copy absolute path', () => void navigator.clipboard.writeText(absolutePath))
   addAction('Reveal in Finder', () => void window.repository?.revealPath(item.path))
-  return menu
+
+  document.querySelector('[data-horus-tree-menu]')?.remove()
+  const host = document.querySelector('.app-shell') ?? document.body
+  host.append(menu)
+  positionPortaledTreeMenu(menu, context.anchorRect)
+
+  const placeholder = document.createElement('span')
+  placeholder.hidden = true
+  return placeholder
 }
 
 // Applying the same paths again would collapse every directory, so the model is
@@ -482,6 +519,12 @@ function useTreeContentSync(
         const item = model.getItem(directoryPath)
         if (item != null && 'expand' in item) item.expand()
       }
+      return
+    }
+    for (const directoryPath of directoryPaths) {
+      if (directoryPath.includes('/')) continue
+      const item = model.getItem(directoryPath)
+      if (item != null && 'expand' in item) item.expand()
     }
   }, [changedDirectoryPaths, directoryPaths, isGitRepository, model, treePaths, treeStatuses])
 
@@ -572,6 +615,7 @@ interface RepositoryDiffPanelProps {
   surfaceLoading: boolean
   contentSearch?: ContentSearchState
   editMode: 'edit' | 'preview' | 'read'
+  documentView: FileEditControls['documentView']
   onDraftFileChange(file: FileContents): void
   onEditorAttach(editor: Editor<ReviewAnnotationMetadata>): void
   onEditorBlur(): void
@@ -608,7 +652,10 @@ function useRepositoryReviewHeader({
   onDiffStyleChange,
   onPreferencesChange,
   onOpenReviewSummary,
-  onSubmitPullRequestReview
+  onSubmitPullRequestReview,
+  sidebarVisible,
+  onSidebarToggle,
+  sidebarShortcut
 }: {
   comparison: FileComparison | null
   selectedPath: string | null
@@ -636,6 +683,9 @@ function useRepositoryReviewHeader({
   onPreferencesChange(preferences: AppPreferences): void
   onOpenReviewSummary(): void
   onSubmitPullRequestReview(event: PullRequestReviewEvent, body: string): Promise<boolean>
+  sidebarVisible: boolean
+  onSidebarToggle(): void
+  sidebarShortcut: string
 }): RepositoryReviewHeaderProps {
   const toggleWordWrap = useCallback(() => {
     onPreferencesChange({ ...preferences, wordWrap: !preferences.wordWrap })
@@ -671,7 +721,10 @@ function useRepositoryReviewHeader({
     onWordWrapToggle: toggleWordWrap,
     onFoldUnchangedToggle: toggleFoldUnchanged,
     onOpenReviewSummary,
-    onSubmitPullRequestReview
+    onSubmitPullRequestReview,
+    sidebarVisible,
+    onSidebarToggle,
+    sidebarShortcut
   }), [
     comparison,
     diffStyle,
@@ -700,7 +753,10 @@ function useRepositoryReviewHeader({
     submittingPullRequestReview,
     toggleFoldUnchanged,
     toggleWordWrap,
-    workspaceView
+    workspaceView,
+    sidebarVisible,
+    onSidebarToggle,
+    sidebarShortcut
   ])
 }
 
@@ -749,6 +805,7 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
   surfaceLoading,
   contentSearch,
   editMode,
+  documentView,
   onDraftFileChange,
   onEditorAttach,
   onEditorBlur,
@@ -771,9 +828,17 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
 
   useEffect(() => {
     let active = true
-    void preloadWorkspaceViewer(workspaceView).catch((error: unknown) => {
-      if (active) onError(getErrorMessage(error))
-    })
+    // Current view first so the first paint is not waiting on the other chunk,
+    // then warm the sibling so file ↔ review does not flash the code skeleton.
+    void preloadWorkspaceViewer(workspaceView)
+      .then(async () => {
+        if (!active) return
+        if (workspaceView === 'multi') await preloadDiffSurface()
+        else await preloadMultiFileReview()
+      })
+      .catch((error: unknown) => {
+        if (active) onError(getErrorMessage(error))
+      })
     return () => { active = false }
   }, [onError, workspaceView])
 
@@ -836,7 +901,7 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
       ) : (
         DiffSurface == null ? <WorkspaceCodeSkeleton /> : (
             <DiffSurface comparison={surfaceComparison} loading={surfaceLoading} diffStyle={diffStyle}
-              preferences={viewerPreferences} editMode={editMode}
+              preferences={viewerPreferences} editMode={editMode} documentView={documentView}
               contentSearch={contentSearch} getEditor={getEditor}
               onDraftFileChange={onDraftFileChange} onEditorAttach={onEditorAttach}
               onEditorBlur={onEditorBlur}
@@ -847,6 +912,7 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
       {showStatusBar ? (
         <EditorStatusBar
           mode={editMode}
+          documentView={documentView}
           dirty={dirty}
           fileExtension={fileExtension}
           getEditor={getEditor}
@@ -1006,6 +1072,7 @@ function useReviewNavigation({
 
 function useRepositoryExplorer({
   snapshot,
+  reviewWorldSource,
   treePaths,
   treeStatuses,
   selectedPath,
@@ -1021,6 +1088,7 @@ function useRepositoryExplorer({
   visibleMultiFilePathRef
 }: {
   snapshot: RepositorySnapshot
+  reviewWorldSource: RepositoryWorkspaceProps['reviewWorldSource']
   treePaths: readonly string[]
   treeStatuses: readonly { path: string; status: TreeFileStatus }[]
   selectedPath: string | null
@@ -1045,8 +1113,9 @@ function useRepositoryExplorer({
     [treePaths, treeStatuses]
   )
   const deferredTreeContent = useDeferredValue(treeContent)
-  const explorerPaths = deferredTreeContent.treePaths
-  const explorerStatuses = deferredTreeContent.treeStatuses
+  const liveTree = reviewWorldSource !== 'desk'
+  const explorerPaths = liveTree ? treePaths : deferredTreeContent.treePaths
+  const explorerStatuses = liveTree ? treeStatuses : deferredTreeContent.treeStatuses
   const pathSet = useMemo(() => new Set(explorerPaths), [explorerPaths])
   const directoryPaths = useMemo(() => getDirectoryPaths(explorerPaths), [explorerPaths])
   const changedDirectoryPaths = useMemo(() => {
@@ -1068,12 +1137,17 @@ function useRepositoryExplorer({
     const previous = navigatedSelectionRef.current
     navigatedSelectionRef.current = selectedPath
     if (selectedPath == null || selectedPath === previous) return
-    if (workspaceView !== 'multi' || selectedPath === visibleMultiFilePathRef.current) return
+    if (workspaceView !== 'multi') return
+    if (!reviewPathSet.has(selectedPath)) {
+      onWorkspaceViewChange('file')
+      return
+    }
+    if (selectedPath === visibleMultiFilePathRef.current) return
     if (!pathSet.has(selectedPath)) return
     markInstantTreeFollowTarget(selectedPath)
     advanceMultiFileNavigation()
-  }, [advanceMultiFileNavigation, markInstantTreeFollowTarget, pathSet, selectedPath,
-    visibleMultiFilePathRef, workspaceView])
+  }, [advanceMultiFileNavigation, markInstantTreeFollowTarget, onWorkspaceViewChange, pathSet,
+    reviewPathSet, selectedPath, visibleMultiFilePathRef, workspaceView])
 
   const handleTreeSelection = useCallback((paths: readonly string[]) => {
     const path = paths.at(-1)
@@ -1109,7 +1183,10 @@ function useRepositoryExplorer({
         enabled: true,
         triggerMode: 'both',
         buttonVisibility: 'when-needed',
-        render: (item, context) => createTreeContextMenu(snapshot.root, item, context.close)
+        render: (item, context) => createTreeContextMenu(snapshot.root, item, context),
+        onClose: () => {
+          document.querySelector('[data-horus-tree-menu]')?.remove()
+        }
       }
     },
     onSelectionChange: (paths) => treeSelectionRef.current(paths)
@@ -1153,7 +1230,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   onDiffStyleChange, onWorkspaceViewChange, onClosePullRequestReview, onSetReviewCheckpoint,
   onOpenSinceReview, submittingPullRequestReview,
   pullRequestReviewMessage, onSubmitPullRequestReview, onComparisonSaved, onError,
-  patchLoadError, reviewWorldId
+  patchLoadError, reviewWorldId, sidebarVisible, onSidebarToggle, onBranchesOpen
 }: RepositoryWorkspaceProps): React.JSX.Element {
   useLayoutEffect(() => markRendererStartup('explorerCommitted'), [])
   useEffect(markRepositoryWorkspaceRender)
@@ -1215,7 +1292,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onError
   })
   const { treePaths, treeStatuses, reviewComments, orphanedCommentCount } =
-    useReviewTreeData(snapshot, repositoryReview, reviewPaths, threadsByPath)
+    useReviewTreeData(snapshot, repositoryReview, reviewPaths, threadsByPath, reviewWorldSource)
   const reviewPathSet = useMemo(() => new Set(reviewPaths), [reviewPaths])
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
   const viewerPreferences = useViewerPreferences(preferences, codeZoom)
@@ -1250,6 +1327,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   const { model, explorerPaths, activateTreeRow, handleVisibleMultiFilePathChange } =
     useRepositoryExplorer({
       snapshot,
+      reviewWorldSource,
       treePaths,
       treeStatuses,
       selectedPath,
@@ -1265,6 +1343,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
       visibleMultiFilePathRef
     })
 
+  const sidebarShortcut = formatKeybinding(preferences.keybindings.toggleSidebar)
   const reviewHeader = useRepositoryReviewHeader({
     comparison: fileEditing.renderedComparison,
     selectedPath,
@@ -1291,13 +1370,18 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onDiffStyleChange,
     onPreferencesChange,
     onOpenReviewSummary: openReviewSummary,
-    onSubmitPullRequestReview: submitPullRequestReview
+    onSubmitPullRequestReview: submitPullRequestReview,
+    sidebarVisible,
+    onSidebarToggle,
+    sidebarShortcut
   })
 
   return (
     <>
       <Explorer filePaths={explorerPaths} model={model} themeType={getEditorThemeType(preferences.editorTheme)}
-        onRowActivate={activateTreeRow} />
+        sidebarVisible={sidebarVisible} onSidebarToggle={onSidebarToggle} sidebarShortcut={sidebarShortcut}
+        isGit={snapshot.kind === 'git'} branchName={snapshot.kind === 'git' ? snapshot.branch : null}
+        onBranchesOpen={onBranchesOpen} onRowActivate={activateTreeRow} />
       <SidebarResizer />
       <RepositoryDiffPanel
         surfaceRef={codeZoom.surfaceRef}
@@ -1344,6 +1428,9 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         surfaceLoading={surfaceLoading}
         contentSearch={contentSearch}
         editMode={fileEditing.activeSession?.mode ?? 'read'}
+        documentView={selectedPath != null && isMarkdownPath(selectedPath)
+          ? fileEditing.controls.documentView
+          : 'source'}
         onDraftFileChange={fileEditing.updateDraftFile}
         onEditorAttach={fileEditing.attachEditor}
         onEditorBlur={fileEditing.handleEditorBlur}

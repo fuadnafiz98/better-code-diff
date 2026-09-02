@@ -3,7 +3,7 @@ import { showToast } from './toast'
 export const COPY_FILE_PATH_CSS = `
   [data-diffs-header] [data-title],
   [data-diffs-header] [data-prev-name] {
-    cursor: copy;
+    cursor: pointer;
   }
 
   [data-diffs-header] [data-title]:hover,

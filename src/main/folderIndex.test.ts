@@ -1,0 +1,82 @@
+import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { describe, expect, test } from 'bun:test'
+
+import { collectFolderCandidates, resolveOpenableFolder } from './folderIndex.js'
+
+async function makeGitRepo(path: string): Promise<void> {
+  await mkdir(path, { recursive: true })
+  await mkdir(join(path, '.git'))
+}
+
+describe('collectFolderCandidates', () => {
+  test('indexes Developer children and nested git repos', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-folders-'))
+    const developer = join(home, 'Developer')
+    await makeGitRepo(join(developer, 'personal', 'echo'))
+    await makeGitRepo(join(developer, 'vibes', 'echo'))
+    await makeGitRepo(join(developer, 'vibes', 'echo-old'))
+    await mkdir(join(developer, 'vibes', 'echo', 'node_modules', 'left-pad'), { recursive: true })
+
+    const folders = await collectFolderCandidates(home)
+    const displayPaths = folders.map((folder) => folder.displayPath)
+
+    expect(displayPaths).toContain('~/Developer/personal')
+    expect(displayPaths).toContain('~/Developer/personal/echo')
+    expect(displayPaths).toContain('~/Developer/vibes/echo-old')
+    expect(folders.some((folder) => folder.path.includes('node_modules'))).toBe(false)
+  })
+
+  test('includes previously opened folders outside the default scan roots', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-folders-'))
+    const extra = join(home, 'Documents', 'notes')
+    await mkdir(extra, { recursive: true })
+
+    const folders = await collectFolderCandidates(home, [extra])
+    expect(folders.map((folder) => folder.path)).toContain(await realpath(extra))
+  })
+})
+
+describe('resolveOpenableFolder', () => {
+  test('accepts a folder under a default scan root', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-open-'))
+    const folder = join(home, 'Developer', 'echo')
+    await mkdir(folder, { recursive: true })
+
+    expect(await resolveOpenableFolder(folder, { home, approvedRoots: [] })).toBe(await realpath(folder))
+  })
+
+  test('rejects an unapproved folder that is not under a scan root', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-open-'))
+    const folder = join(home, 'Downloads', 'echo')
+    await mkdir(folder, { recursive: true })
+
+    await expect(resolveOpenableFolder(folder, { home, approvedRoots: [] }))
+      .rejects.toThrow('Use Existing')
+  })
+
+  test('accepts an approved folder outside home', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-home-'))
+    const approved = await mkdtemp(join(tmpdir(), 'horus-approved-'))
+
+    expect(await resolveOpenableFolder(approved, { home, approvedRoots: [approved] })).toBe(await realpath(approved))
+  })
+
+  test('rejects the home directory itself and unapproved outside paths', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-home-'))
+    const outside = await mkdtemp(join(tmpdir(), 'horus-outside-'))
+    const file = join(home, 'readme.txt')
+    await writeFile(file, 'hi')
+
+    await expect(resolveOpenableFolder(home, { home, approvedRoots: [] }))
+      .rejects.toThrow('project folder')
+    await expect(resolveOpenableFolder(outside, { home, approvedRoots: [] }))
+      .rejects.toThrow('Use Existing')
+    await expect(resolveOpenableFolder(file, { home, approvedRoots: [] }))
+      .rejects.toThrow('not a file')
+    await expect(resolveOpenableFolder('relative/path', { home, approvedRoots: [] }))
+      .rejects.toThrow('absolute')
+  })
+})

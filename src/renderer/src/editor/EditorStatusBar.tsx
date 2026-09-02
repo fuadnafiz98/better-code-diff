@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Editor } from '@pierre/diffs/edit'
 
 import type { ReviewAnnotationMetadata } from '../ReviewComments'
+import type { DocumentView } from '../documentView'
 import { EMPTY_CARET, readCaret, type CaretReadout } from './caret'
 import { EDITOR_SHORTCUTS, formatEditorShortcut } from './editorKeymap'
 
 interface EditorStatusBarProps {
   mode: 'read' | 'edit' | 'preview'
+  documentView?: DocumentView
   dirty: boolean
   fileExtension?: string
   getEditor(): Editor<ReviewAnnotationMetadata> | null
@@ -14,6 +16,7 @@ interface EditorStatusBarProps {
 
 export function EditorStatusBar({
   mode,
+  documentView = 'source',
   dirty,
   fileExtension,
   getEditor
@@ -64,10 +67,17 @@ export function EditorStatusBar({
   }, [shortcutsOpen])
 
   const editing = mode === 'edit'
+  const status = editing
+    ? 'Editing'
+    : mode === 'preview'
+      ? 'Draft preview'
+      : documentView === 'preview' ? 'Preview'
+        : documentView === 'split' ? 'Source and preview'
+          : 'Read only'
 
   return (
     <footer className="editor-statusbar">
-      <span>{mode === 'edit' ? 'Editing' : mode === 'preview' ? 'Draft preview' : 'Read only'}</span>
+      <span>{status}</span>
       {editing ? <span>{dirty ? 'Unsaved' : 'Saved'}</span> : null}
       {editing ? <span>Ln {caret.line}, Col {caret.column}</span> : null}
       {editing && caret.selectedLines > 0 ? (

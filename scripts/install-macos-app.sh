@@ -9,7 +9,6 @@ staged_app="$user_applications/.Horus.installing.$$"
 backup_app="$user_applications/.Horus.previous.$$"
 legacy_app="/Applications/Horus.app"
 previous_app="$user_applications/Better Code Diff.app"
-cache_dir="${HOME}/Library/Caches/Horus"
 trash_dir="${HOME}/.Trash"
 bundle_id="com.fuadnafiz.horus"
 previous_bundle_id="com.fuadnafiz.bettercodediff"
@@ -48,6 +47,12 @@ pkill -x "Better Code Diff Helper (Renderer)" 2>/dev/null || true
 
 ditto "$source_app" "$staged_app"
 
+# electron-builder with CSC_IDENTITY_AUTO_DISCOVERY=false leaves the stock
+# Electron linker signature (Identifier=Electron, no sealed resources). Launch
+# Services then fails Gatekeeper's first check on a 300 MB bundle — that is the
+# long dock bounce when Raycast opens a just-replaced build.
+codesign --force --deep --sign - "$staged_app"
+
 staged_bundle_id="$(defaults read "$staged_app/Contents/Info.plist" CFBundleIdentifier)"
 if [[ "$staged_bundle_id" != "$bundle_id" ]]; then
   echo "Staged app failed bundle validation." >&2
@@ -76,10 +81,6 @@ if [[ -d "$previous_app" ]]; then
   if [[ "$installed_bundle_id" == "$previous_bundle_id" ]]; then
     mv "$previous_app" "$trash_dir/Better Code Diff replaced by Horus.$$"
   fi
-fi
-
-if [[ -d "$cache_dir" ]]; then
-  mv "$cache_dir" "$trash_dir/Horus cache.$$"
 fi
 
 mv "$source_app" "$trash_dir/Horus build.$$"

@@ -110,7 +110,6 @@ function applySplitPercentage(surface: HTMLElement, value: number, resistanceWid
   splitPercentages.set(surface, percentage)
   surface.style.setProperty('--horus-split-before', `${displayed}fr`)
   surface.style.setProperty('--horus-split-after', `${100 - displayed}fr`)
-  surface.style.setProperty('--horus-split-before-width', `${displayed}cqi`)
   surface.dispatchEvent(new CustomEvent<number>('horus:split-resize', { detail: percentage }))
   return percentage
 }

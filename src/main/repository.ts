@@ -9,6 +9,7 @@ import type {
   ContentSearchResult,
   DiffFileContents,
   FileComparison,
+  ImagePreviewSide,
   GitCommit,
   GitIntegrationSnapshot,
   GitRemote,
@@ -37,6 +38,7 @@ import type {
   WorkingFileSaveRequest,
   WorkingTreePatch
 } from '../shared/contracts.js'
+import { createImagePreviewSide } from '../shared/imagePreview.js'
 import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
 import {
   COMMAND_ABORTED_MESSAGE,
@@ -293,6 +295,7 @@ type ReadVersion = {
   file: DiffFileContents | null
   binary: boolean
   oversized: boolean
+  image?: ImagePreviewSide | null
 }
 
 type WorkingFileRead = ReadVersion & {
@@ -1109,6 +1112,7 @@ export class RepositoryService {
   #selfWriteObserver: ((path: string) => void) | null = null
   #checkFieldsSupported = true
   #reviewAborts = new Map<string, AbortController>()
+  #reviewFlights = new Map<string, Promise<PullRequestReview>>()
   #pullRequestCache: PullRequestReviewCache | null = null
   #activeSearch: { child: ReturnType<typeof spawn>; cancelled: boolean; startedAt: number } | null = null
   #contentSearchMetrics: ContentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
@@ -1319,6 +1323,8 @@ export class RepositoryService {
     ])
     const binary = Boolean(oldVersion?.binary || workingVersion?.binary)
     const oversized = Boolean(oldVersion?.oversized || workingVersion?.oversized)
+    const oldImage = oldVersion?.image ?? null
+    const newImage = workingVersion?.image ?? null
 
     return {
       path,
@@ -1327,7 +1333,8 @@ export class RepositoryService {
       oldFile: binary || oversized ? null : oldVersion?.file ?? null,
       newFile: binary || oversized ? null : workingVersion?.file ?? null,
       binary,
-      oversized
+      oversized,
+      image: oldImage != null || newImage != null ? { old: oldImage, new: newImage } : null
     }
   }
 
@@ -2019,14 +2026,20 @@ export class RepositoryService {
     requestId: string = randomUUID()
   ): Promise<PullRequestReview> {
     this.#requireGitRepository()
+    const normalized = normalizePullRequestSelector(selector)
+    const inFlight = this.#reviewFlights.get(normalized)
+    if (inFlight != null) return inFlight
+
     this.cancelPullRequestReview(requestId)
     const abort = new AbortController()
     this.#reviewAborts.set(requestId, abort)
-    try {
-      return await this.#loadPullRequestReview(normalizePullRequestSelector(selector), abort.signal, onProgress)
-    } finally {
-      if (this.#reviewAborts.get(requestId) === abort) this.#reviewAborts.delete(requestId)
-    }
+    const promise = this.#loadPullRequestReview(normalized, abort.signal, onProgress)
+      .finally(() => {
+        if (this.#reviewFlights.get(normalized) === promise) this.#reviewFlights.delete(normalized)
+        if (this.#reviewAborts.get(requestId) === abort) this.#reviewAborts.delete(requestId)
+      })
+    this.#reviewFlights.set(normalized, promise)
+    return promise
   }
 
   async #loadPullRequestReview(
@@ -2344,7 +2357,8 @@ export class RepositoryService {
       this.#evictHeadFileCache()
     }
     entry.promise = this.#loadHeadFile(path, object, chargeBytes).then((version) => {
-      chargeBytes(version?.file == null ? 0 : Buffer.byteLength(version.file.contents, 'utf8'))
+      const fileBytes = version?.file == null ? 0 : Buffer.byteLength(version.file.contents, 'utf8')
+      chargeBytes(fileBytes + (version?.image?.byteLength ?? 0))
       return version
     }).catch((error: unknown) => {
       if (this.#headFileCache.get(object) === entry) this.#deleteHeadCacheEntry(object)
@@ -2376,8 +2390,10 @@ export class RepositoryService {
     chargeBytes(read.size)
 
     const contents = read.contents ?? Buffer.alloc(0)
-    const binary = isBinary(contents)
-    return { file: binary ? null : toDiffFile(path, contents), binary, oversized: false }
+    const looksBinary = isBinary(contents)
+    const image = createImagePreviewSide(path, contents, looksBinary)
+    const binary = looksBinary || image != null
+    return { file: binary ? null : toDiffFile(path, contents), binary, oversized: false, image }
   }
 
   async #readWorkingFile(
@@ -2438,13 +2454,16 @@ export class RepositoryService {
     const resolvedPath = await realpath(candidate)
     if (!isWithinRoot(root, resolvedPath)) throw new Error('The selected file resolves outside the repository.')
     const contents = await readFile(resolvedPath)
-    const binary = isBinary(contents)
+    const looksBinary = isBinary(contents)
+    const image = createImagePreviewSide(path, contents, looksBinary)
+    const binary = looksBinary || image != null
     return {
       contents,
       file: binary ? null : toDiffFile(path, contents),
       binary,
       oversized: false,
-      revision
+      revision,
+      image
     }
   }
 

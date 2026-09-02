@@ -9,7 +9,10 @@ export const COMPARISON_CACHE_MAX_CHARS = 4_000_000
 export const COMPARISON_ENTRY_MAX_CHARS = 1_000_000
 
 export function comparisonWeight(comparison: FileComparison): number {
-  return (comparison.oldFile?.contents.length ?? 0) + (comparison.newFile?.contents.length ?? 0)
+  return (comparison.oldFile?.contents.length ?? 0)
+    + (comparison.newFile?.contents.length ?? 0)
+    + (comparison.image?.old?.dataUrl.length ?? 0)
+    + (comparison.image?.new?.dataUrl.length ?? 0)
 }
 
 export interface ComparisonCacheOptions {

@@ -30,11 +30,37 @@ describe('split diff resizing', () => {
     expect(resistedSplitPercentage(85, 1_000)).toBeLessThan(85)
   })
 
-  it('keeps wrapped unchanged-context labels clear of the divider', () => {
+  it('centres unmodified-line labels in the code column, not on the host', () => {
     expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
-      'width: var(--horus-split-before-width, 50cqi)'
+      '[data-content] [data-separator="line-info-basic"] [data-separator-wrapper]'
     )
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      '[data-gutter] [data-separator="line-info-basic"] [data-separator-content]'
+    )
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).not.toContain('width: 100cqi')
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).not.toContain('--horus-split-before-width')
+  })
 
+  it('keeps expand chevrons on the unmodified-lines seam', () => {
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      '[data-gutter] [data-separator="line-info-basic"] [data-expand-button]'
+    )
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      '[data-content] [data-separator="line-info-basic"] [data-expand-button]'
+    )
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      'grid-template-columns: 28px 28px minmax(0, 1fr)'
+    )
+  })
+
+  it('keeps one unmodified-line count in split view', () => {
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain(
+      '[data-diff-type="split"] [data-additions] [data-unmodified-lines]'
+    )
+    expect(CENTERED_COLLAPSED_SEPARATOR_CSS).toContain('display: none')
+  })
+
+  it('updates the split track when the handle moves', () => {
     const surface = document.createElement('div')
     surface.className = 'diff-panel'
     const viewer = document.createElement('div')
@@ -52,7 +78,7 @@ describe('split diff resizing', () => {
       key: 'ArrowLeft'
     }))
 
-    expect(surface.style.getPropertyValue('--horus-split-before-width')).toBe('48cqi')
+    expect(surface.style.getPropertyValue('--horus-split-before')).toBe('48fr')
     syncSplitDiffResizeLifecycle(viewer, 'unmount')
   })
 

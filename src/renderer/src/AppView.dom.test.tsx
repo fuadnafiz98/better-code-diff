@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { cleanup, render, screen } from '@testing-library/react'
 
-import { DiffToolbar, type FileEditControls } from './AppView'
+import type { RepositorySnapshot } from '../../shared/contracts'
+import { DiffToolbar, Titlebar, type FileEditControls } from './AppView'
+import { formatEditorShortcut } from './editor/editorKeymap'
+import { DEFAULT_KEYBINDINGS } from './keybindings'
 
 afterEach(cleanup)
 
@@ -11,6 +14,7 @@ function editControls(overrides: Partial<FileEditControls> = {}): FileEditContro
     unavailableReason: 'Editing is unavailable for this file.',
     startLabel: 'Edit',
     mode: 'read',
+    documentView: 'split',
     dirty: false,
     saving: false,
     canUndo: false,
@@ -18,6 +22,7 @@ function editControls(overrides: Partial<FileEditControls> = {}): FileEditContro
     unsavedPaths: [],
     onStart: () => {},
     onModeChange: () => {},
+    onDocumentViewChange: () => {},
     onUndo: () => {},
     onRedo: () => {},
     onCancel: () => {},
@@ -46,6 +51,97 @@ describe('DiffToolbar editing controls', () => {
       fileEdit={editControls({ available: true, mode: 'edit' })}
       onDiffStyleChange={() => {}} onWordWrapToggle={() => {}} onFoldUnchangedToggle={() => {}} />)
 
-    expect((screen.getByRole('button', { name: /Save/ }) as HTMLButtonElement).disabled).toBe(true)
+    const save = screen.getByRole('button', { name: /Save/ }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    expect(save.textContent).toContain(formatEditorShortcut('cmdOrCtrl+s'))
+    expect(screen.getByRole('button', { name: `Undo (${formatEditorShortcut('cmdOrCtrl+z')})` })).toBeTruthy()
+    expect(screen.getByRole('button', { name: `Redo (${formatEditorShortcut('cmdOrCtrl+shift+z')})` })).toBeTruthy()
   })
+})
+
+test('DiffToolbar offers Source, Both, and Preview for a markdown file', () => {
+  render(<DiffToolbar comparison={null} selectedPath="docs/plan.md" isGitRepository isFilePreview
+    diffStyle="split" workspaceView="file" reviewFileCount={0} wordWrap={false} foldUnchanged
+    fileEdit={editControls({ available: true, documentView: 'split' })}
+    onDiffStyleChange={() => {}} onWordWrapToggle={() => {}} onFoldUnchangedToggle={() => {}} />)
+
+  expect(screen.getByRole('button', { name: 'Both' }).getAttribute('aria-pressed')).toBe('true')
+  expect(screen.getByRole('button', { name: 'Source' }).getAttribute('aria-pressed')).toBe('false')
+  expect(screen.getByRole('button', { name: 'Preview' }).getAttribute('aria-pressed')).toBe('false')
+  expect(screen.getByRole('group', { name: 'Markdown view' })).toBeTruthy()
+  expect(screen.queryByText('Source')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Toggle word wrap' })).toBeTruthy()
+})
+
+test('DiffToolbar keeps the markdown view switch in preview-only', () => {
+  render(<DiffToolbar comparison={null} selectedPath="docs/plan.md" isGitRepository isFilePreview
+    diffStyle="split" workspaceView="file" reviewFileCount={0} wordWrap={false} foldUnchanged
+    fileEdit={editControls({ available: true, documentView: 'preview' })}
+    onDiffStyleChange={() => {}} onWordWrapToggle={() => {}} onFoldUnchangedToggle={() => {}} />)
+
+  expect(screen.getByRole('group', { name: 'Markdown view' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Preview' }).getAttribute('aria-pressed')).toBe('true')
+  expect(screen.queryByRole('button', { name: 'Toggle word wrap' })).toBeNull()
+})
+
+test('DiffToolbar keeps TypeScript files on the source viewer', () => {
+  render(<DiffToolbar comparison={null} selectedPath="src/app.ts" isGitRepository isFilePreview
+    diffStyle="split" workspaceView="file" reviewFileCount={0} wordWrap={false} foldUnchanged
+    fileEdit={editControls({ available: true })}
+    onDiffStyleChange={() => {}} onWordWrapToggle={() => {}} onFoldUnchangedToggle={() => {}} />)
+
+  expect(screen.queryByRole('group', { name: 'Markdown view' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Toggle word wrap' })).toBeTruthy()
+})
+
+test('DiffToolbar reveals the explorer when the sidebar is hidden', () => {
+  let shown = false
+  render(<DiffToolbar comparison={null} selectedPath="src/app.ts" isGitRepository isFilePreview={false}
+    diffStyle="split" workspaceView="multi" reviewFileCount={4} wordWrap={false} foldUnchanged
+    fileEdit={editControls()} sidebarVisible={false} onSidebarToggle={() => { shown = true }}
+    sidebarShortcut="⌘B"
+    onDiffStyleChange={() => {}} onWordWrapToggle={() => {}} onFoldUnchangedToggle={() => {}} />)
+
+  screen.getByRole('button', { name: 'Show explorer' }).click()
+  expect(shown).toBe(true)
+})
+
+const snapshot: RepositorySnapshot = {
+  root: '/projects/alpha',
+  name: 'alpha',
+  kind: 'git',
+  branch: 'main',
+  head: 'a'.repeat(40),
+  paths: ['src/app.ts'],
+  statuses: [{ path: 'src/app.ts', status: 'modified' }]
+}
+
+test('Titlebar keeps explorer controls out of the window chrome', () => {
+  render(<Titlebar snapshot={snapshot} keybindings={DEFAULT_KEYBINDINGS} newTab={false}
+    locator="" locatorBusy={false} onLocatorChange={() => {}} onLocatorSubmit={() => {}}
+    onSearchOpen={() => {}}
+    onSettingsOpen={() => {}} onGitOpen={() => {}} agentOpen={false} onAgentToggle={() => {}}
+    terminalOpen={false} onTerminalToggle={() => {}} />)
+
+  expect(screen.queryByRole('button', { name: 'Hide explorer' })).toBeNull()
+  expect(screen.queryByRole('button', { name: /Switch branch/ })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Open folder' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Open settings' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Open branches and pull requests' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Search files and commands' }).getAttribute('title')).toContain('⌘P')
+  expect(screen.queryByRole('combobox')).toBeNull()
+})
+
+test('Titlebar centers the pull-request locator on a new tab', () => {
+  render(<Titlebar snapshot={null} keybindings={DEFAULT_KEYBINDINGS} newTab={true}
+    locator="" locatorBusy={false} onLocatorChange={() => {}} onLocatorSubmit={() => {}}
+    onSearchOpen={() => {}}
+    onSettingsOpen={() => {}} onGitOpen={() => {}} agentOpen={false} onAgentToggle={() => {}}
+    terminalOpen={false} onTerminalToggle={() => {}} />)
+
+  expect(screen.getByRole('textbox', { name: 'Open pull request URL' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Open folder' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Open settings' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Search files and commands' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Open branches and pull requests' })).toBeNull()
 })

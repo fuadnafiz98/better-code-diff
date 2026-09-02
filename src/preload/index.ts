@@ -51,11 +51,19 @@ function countRendererDomNodes(root: RendererQueryRoot | undefined): number {
 const repositoryApi: RepositoryApi = {
   getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
+  listFolderCandidates: () => ipcRenderer.invoke(IPC_CHANNELS.listFolderCandidates),
+  openPickedFolder: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPickedFolder, path),
   openPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPath, path),
   activateRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.activateRepository, root),
   releaseRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.releaseRepository, root),
   resolvePullRequestRepository: (pullRequestUrl) =>
     ipcRenderer.invoke(IPC_CHANNELS.resolvePullRequestRepository, pullRequestUrl),
+  getPendingExternalPullRequest: () => ipcRenderer.invoke(IPC_CHANNELS.getPendingExternalPullRequest),
+  onOpenExternalPullRequest: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, url: string): void => listener(url)
+    ipcRenderer.on(IPC_CHANNELS.openExternalPullRequest, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.openExternalPullRequest, handler)
+  },
   readClipboardText: (type) => ipcRenderer.invoke(IPC_CHANNELS.readClipboardText, type),
   revealPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.revealPath, path),
   refresh: () => ipcRenderer.invoke(IPC_CHANNELS.refresh),

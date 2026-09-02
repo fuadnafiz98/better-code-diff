@@ -322,6 +322,17 @@ export interface DiffFileContents {
   cacheKey: string
 }
 
+export interface ImagePreviewSide {
+  mimeType: string
+  dataUrl: string
+  byteLength: number
+}
+
+export interface FileImagePreview {
+  old: ImagePreviewSide | null
+  new: ImagePreviewSide | null
+}
+
 export interface FileComparison {
   path: string
   mode: 'diff' | 'file'
@@ -330,6 +341,7 @@ export interface FileComparison {
   newFile: DiffFileContents | null
   binary: boolean
   oversized: boolean
+  image?: FileImagePreview | null
 }
 
 export interface WorkingFileSaveRequest {
@@ -488,13 +500,28 @@ export interface TerminalExitEvent {
   signal?: number
 }
 
+export interface FolderCandidate {
+  name: string
+  path: string
+  displayPath: string
+}
+
+export interface FolderPickerCatalog {
+  home: string
+  folders: FolderCandidate[]
+}
+
 export interface RepositoryApi {
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
+  listFolderCandidates(): Promise<FolderPickerCatalog>
+  openPickedFolder(path: string): Promise<RepositorySnapshot>
   openPath(path: string): Promise<RepositorySnapshot>
   activateRepository(root: string): Promise<RepositorySnapshot>
   releaseRepository(root: string): Promise<void>
   resolvePullRequestRepository(pullRequestUrl: string): Promise<RepositorySnapshot | null>
+  getPendingExternalPullRequest(): Promise<string | null>
+  onOpenExternalPullRequest(listener: (url: string) => void): () => void
   readClipboardText(type?: string): Promise<string>
   revealPath(path: string): Promise<void>
   refresh(): Promise<RepositorySnapshot>
@@ -559,10 +586,14 @@ export interface RepositoryApi {
 export const IPC_CHANNELS = {
   getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
+  listFolderCandidates: 'repository:list-folder-candidates',
+  openPickedFolder: 'repository:open-picked-folder',
   openPath: 'repository:open-path',
   activateRepository: 'repository:activate',
   releaseRepository: 'repository:release',
   resolvePullRequestRepository: 'repository:resolve-pull-request',
+  getPendingExternalPullRequest: 'app:get-pending-external-pull-request',
+  openExternalPullRequest: 'app:open-external-pull-request',
   readClipboardText: 'app:clipboard-read-text',
   revealPath: 'app:reveal-path',
   refresh: 'repository:refresh',

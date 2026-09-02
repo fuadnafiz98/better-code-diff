@@ -1,9 +1,8 @@
-import { memo, useEffect, useRef, useState, type KeyboardEvent, type RefObject } from 'react'
+import { memo, useEffect, useState } from 'react'
 import {
   IconArrowLeftBar,
   IconBraces,
   IconBranch,
-  IconCodeFolder,
   IconCollapsedRow,
   IconCheck,
   IconClockArrow,
@@ -13,12 +12,10 @@ import {
   IconEye,
   IconFolder,
   IconGear,
-  IconGlobe,
   IconPencil,
   IconRefresh,
   IconRepeat,
   IconSearch,
-  IconSidebarLeft,
   IconSidebarLeftOpen,
   IconSparkles,
   IconTerminalFill,
@@ -28,14 +25,21 @@ import {
 } from '@pierre/icons'
 
 import type {
-  ContentSearchResult,
   FileComparison,
   RepositorySnapshot
 } from '../../shared/contracts'
+import { isMarkdownPath } from '../../shared/markdownPreview'
+import type { DocumentView } from './documentView'
 import type { RecentFolder } from './recentFolders'
+import { FolderPicker } from './FolderPicker'
+import { preloadFolderCatalog } from './folderPickerModel'
 import { PerformanceHud } from './PerformanceHud'
+import { formatEditorShortcut } from './editor/editorKeymap'
 import { formatKeybinding, formatTerminalToggleShortcut, type KeybindingMap } from './keybindings'
-import { tokenizeSearchPreview } from './searchPreview'
+
+const UNDO_SHORTCUT = formatEditorShortcut('cmdOrCtrl+z')
+const REDO_SHORTCUT = formatEditorShortcut('cmdOrCtrl+shift+z')
+const SAVE_SHORTCUT = formatEditorShortcut('cmdOrCtrl+s')
 
 export type DiffStyle = 'split' | 'unified'
 export type WorkspaceView = 'file' | 'multi'
@@ -51,25 +55,15 @@ function ShortcutHint({ keys, label }: ShortcutHintProps): React.JSX.Element {
 
 interface TitlebarProps {
   snapshot: RepositorySnapshot | null
-  sidebarVisible: boolean
-  searchQuery: string
-  searchInputRef: RefObject<HTMLInputElement | null>
-  searchingContent: boolean
-  opening: boolean
   keybindings: KeybindingMap
-  activeSearchResultId?: string
   newTab: boolean
   locator: string
   locatorBusy: boolean
-  onSidebarToggle(): void
-  onSearchQueryChange(query: string): void
-  onSearchKeyDown(event: KeyboardEvent<HTMLInputElement>): void
   onLocatorChange(locator: string): void
   onLocatorSubmit(): void
-  onOpen(): Promise<void>
+  onSearchOpen(): void
   onSettingsOpen(): void
   onGitOpen(): void
-  onBranchesOpen(): void
   agentOpen: boolean
   onAgentToggle(): void
   terminalOpen: boolean
@@ -78,272 +72,106 @@ interface TitlebarProps {
 
 export const Titlebar = memo(function Titlebar({
   snapshot,
-  sidebarVisible,
-  searchQuery,
-  searchInputRef,
-  searchingContent,
-  opening,
   keybindings,
-  activeSearchResultId,
   newTab,
   locator,
   locatorBusy,
-  onSidebarToggle,
-  onSearchQueryChange,
-  onSearchKeyDown,
   onLocatorChange,
   onLocatorSubmit,
-  onOpen,
+  onSearchOpen,
   onSettingsOpen,
   onGitOpen,
-  onBranchesOpen,
   agentOpen,
   onAgentToggle,
   terminalOpen,
   onTerminalToggle
 }: TitlebarProps): React.JSX.Element {
   return (
-    <header className="titlebar">
-      <div className="titlebar-repository">
-        {snapshot == null ? (
-          <>
-            <span className="product-name"><IconBraces />Horus</span>
-            <button
-              className="open-button titlebar-open-button"
-              type="button"
-              onClick={() => void onOpen()}
-              disabled={opening}
-              title={`Open Folder (${formatKeybinding(keybindings.openFolder)})`}
-            >
-              {opening ? <IconRefresh className="spin" /> : <IconFolder />}
-              <span>Open</span>
-            </button>
-          </>
-        ) : (
-          <>
-            <button
-              className="icon-button"
-              type="button"
-              aria-label={sidebarVisible ? 'Hide explorer' : 'Show explorer'}
-              title={sidebarVisible ? 'Hide Explorer' : 'Show Explorer'}
-              onClick={onSidebarToggle}
-            >
-              <span className="icon-swap sidebar-icon-swap" data-state={sidebarVisible ? 'base' : 'alt'}>
-                <IconSidebarLeft /><IconSidebarLeftOpen />
-              </span>
-            </button>
-            <button
-              className="open-button titlebar-open-button"
-              type="button"
-              onClick={() => void onOpen()}
-              disabled={opening}
-              title={`Open Folder (${formatKeybinding(keybindings.openFolder)})`}
-            >
-              {opening ? <IconRefresh className="spin" /> : <IconFolder />}
-              <span>Open</span>
-            </button>
-            <IconCodeFolder className="repository-icon" />
-            <strong>{snapshot.name}</strong>
-            {snapshot.kind === 'git' ? (
-              <button
-                className="titlebar-branch-button"
-                type="button"
-                onClick={onBranchesOpen}
-                aria-label={`Switch branch. Current branch: ${snapshot.branch ?? 'detached HEAD'}`}
-                title="Switch branch"
-              >
-                <IconBranch />
-                <span>{snapshot.branch ?? 'Detached HEAD'}</span>
+    <div className="titlebar">
+      <div className="titlebar-find">
+        {newTab ? (
+          <div className="global-search">
+            <IconSearch aria-hidden="true" />
+            <input
+              name="review-locator"
+              value={locator}
+              onChange={(event) => onLocatorChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') return
+                event.preventDefault()
+                onLocatorSubmit()
+              }}
+              placeholder="Enter a GitHub pull request URL"
+              aria-label="Open pull request URL"
+              disabled={locatorBusy}
+            />
+            {locatorBusy ? <IconRefresh className="spin search-spinner" /> : null}
+            {locator !== '' ? (
+              <button className="clear-search" type="button" onClick={() => onLocatorChange('')}>
+                <IconX /><span className="sr-only">Clear pull request URL</span>
               </button>
-            ) : (
-              <span className="branch-label" title="Folder">
-                <IconFolder />
-                Folder
-              </span>
-            )}
-          </>
-        )}
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
-      <div className="global-search">
-        {newTab ? <IconGlobe aria-hidden="true" /> : <IconSearch aria-hidden="true" />}
-        <input
-          name={newTab ? 'review-locator' : 'repository-search'}
-          ref={newTab ? undefined : searchInputRef}
-          value={newTab ? locator : searchQuery}
-          onChange={(event) => newTab
-            ? onLocatorChange(event.target.value)
-            : onSearchQueryChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (newTab && event.key === 'Enter') {
-              event.preventDefault()
-              onLocatorSubmit()
-              return
-            }
-            if (!newTab) onSearchKeyDown(event)
-          }}
-          placeholder={newTab ? 'Enter a GitHub pull request URL' : 'Search files and content'}
-          aria-label={newTab ? 'Open pull request URL' : 'Search repository files and content'}
-          role={newTab ? undefined : 'combobox'}
-          aria-autocomplete={newTab ? undefined : 'list'}
-          aria-controls={newTab ? undefined : 'repository-search-results'}
-          aria-activedescendant={newTab ? undefined : activeSearchResultId}
-          aria-expanded={newTab ? undefined : searchQuery.trim().length > 0}
-          disabled={newTab ? locatorBusy : snapshot == null}
-        />
-        {searchingContent || locatorBusy ? <IconRefresh className="spin search-spinner" /> : null}
-        {(newTab ? locator : searchQuery) !== '' ? (
-          <button className="clear-search" type="button" onClick={() => newTab
-            ? onLocatorChange('')
-            : onSearchQueryChange('')}>
-            <IconX /><span className="sr-only">Clear search</span>
-          </button>
-        ) : newTab ? null : (
-          <ShortcutHint keys={formatKeybinding(keybindings.goToFile)} label="Search repository shortcut" />
-        )}
-      </div>
-
-      <div className="titlebar-actions">
+      <div className="titlebar-trailing">
         {snapshot != null ? (
-          <>
+          <div className="titlebar-status">
             <PerformanceHud />
-            {snapshot.kind === 'git' ? (
+          </div>
+        ) : null}
+        <div className="titlebar-actions">
+          <div className="titlebar-action-cluster">
+            {newTab ? null : (
+              <button
+                className="icon-button"
+                type="button"
+                onClick={onSearchOpen}
+                aria-label="Search files and commands"
+                title={`Search files and commands (${formatKeybinding(keybindings.goToFile)})`}
+              >
+                <IconSearch />
+              </button>
+            )}
+            {snapshot?.kind === 'git' ? (
               <button className="icon-button" type="button" onClick={onGitOpen} aria-label="Open branches and pull requests" title="Branches and pull requests">
                 <IconBranch />
               </button>
             ) : null}
-          </>
-        ) : null}
-        <button className="icon-button" type="button" onClick={onSettingsOpen} aria-label="Open settings" title="Settings">
-          <IconGear />
-        </button>
-        {snapshot != null ? (
-          <>
-            <button
-              className={`icon-button terminal-titlebar-button ${terminalOpen ? 'active' : ''}`}
-              type="button"
-              aria-label={terminalOpen ? 'Hide terminal' : 'Show terminal'}
-              aria-pressed={terminalOpen}
-              title={`Toggle Terminal (${formatTerminalToggleShortcut()})`}
-              onClick={onTerminalToggle}
-            >
-              <IconTerminalFill />
+            <button className="icon-button" type="button" onClick={onSettingsOpen} aria-label="Open settings" title="Settings">
+              <IconGear />
             </button>
-            <button
-              className={`icon-button agent-titlebar-button ${agentOpen ? 'active' : ''}`}
-              type="button"
-              aria-label={agentOpen ? 'Close agent' : 'Ask agent'}
-              aria-pressed={agentOpen}
-              title={agentOpen ? 'Close Agent' : 'Ask Agent'}
-              onClick={onAgentToggle}
-            >
-              <IconSparkles />
-            </button>
-          </>
-        ) : null}
-      </div>
-    </header>
-  )
-})
-
-interface SearchResultsProps {
-  query: string
-  fileResults: string[]
-  contentResults: ContentSearchResult[]
-  searchingContent: boolean
-  activeIndex: number
-  onSelect(path: string): void
-  onActiveIndexChange(index: number): void
-}
-
-const SearchPreview = memo(function SearchPreview({
-  path,
-  preview,
-  query
-}: { path: string; preview: string; query: string }): React.JSX.Element {
-  const tokens = tokenizeSearchPreview(path, preview, query)
-  return <>{tokens.map((token, index) => (
-    <span
-      className={`search-syntax-${token.kind}${token.match ? ' search-query-match' : ''}`}
-      key={`${index}:${token.text}`}
-    >
-      {token.text}
-    </span>
-  ))}</>
-})
-
-export function SearchResults({
-  query,
-  fileResults,
-  contentResults,
-  searchingContent,
-  activeIndex,
-  onSelect,
-  onActiveIndexChange
-}: SearchResultsProps): React.JSX.Element {
-  const hasResults = fileResults.length > 0 || contentResults.length > 0
-  const resultsListRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    resultsListRef.current
-      ?.querySelector<HTMLElement>(`[data-search-result-index="${activeIndex}"]`)
-      ?.scrollIntoView({ block: 'nearest' })
-  }, [activeIndex])
-
-  return (
-    <div className="search-popover" id="repository-search-results">
-      <div className="search-popover-heading">
-        <IconSearch />
-        <span>Files and content</span>
-        <span className="search-query-label">“{query}”</span>
-      </div>
-      <div ref={resultsListRef} className="search-results-list" role="listbox" aria-label="Repository search results">
-        {fileResults.length > 0 ? <div className="search-result-group-heading">
-          <span>Files</span><span>{fileResults.length}</span>
-        </div> : null}
-        {fileResults.map((path, resultIndex) => (
-          <button
-            id={`repository-search-result-${resultIndex}`}
-            data-search-result-index={resultIndex}
-            key={path}
-            type="button"
-            role="option"
-            aria-selected={activeIndex === resultIndex}
-            onMouseEnter={() => onActiveIndexChange(resultIndex)}
-            onClick={() => onSelect(path)}
-          >
-            <IconFileCode />
-            <span>{path}</span>
-          </button>
-        ))}
-        {contentResults.length > 0 || searchingContent ? <div className="search-result-group-heading">
-          <span>Content</span>
-          <span>{searchingContent ? 'Searching…' : contentResults.length}</span>
-        </div> : null}
-        {contentResults.map((result, resultIndex) => (
-          <button
-            id={`repository-search-result-${fileResults.length + resultIndex}`}
-            data-search-result-index={fileResults.length + resultIndex}
-            key={`${result.path}:${result.line}:${result.column}:${resultIndex}`}
-            type="button"
-            role="option"
-            aria-selected={activeIndex === fileResults.length + resultIndex}
-            className="content-result"
-            onMouseEnter={() => onActiveIndexChange(fileResults.length + resultIndex)}
-            onClick={() => onSelect(result.path)}
-          >
-            <div><IconFileCode /><strong>{result.path}</strong><span>:{result.line}:{result.column}</span></div>
-            <code><SearchPreview path={result.path} preview={result.preview} query={query} /></code>
-          </button>
-        ))}
-        {!hasResults && !searchingContent ? <div className="no-search-results">No matches</div> : null}
-        <span className="sr-only" aria-live="polite">
-          {searchingContent ? 'Searching repository content' : `${fileResults.length + contentResults.length} results`}
-        </span>
+            {snapshot != null ? (
+              <>
+                <button
+                  className={`icon-button terminal-titlebar-button ${terminalOpen ? 'active' : ''}`}
+                  type="button"
+                  aria-label={terminalOpen ? 'Hide terminal' : 'Show terminal'}
+                  aria-pressed={terminalOpen}
+                  title={`Toggle Terminal (${formatTerminalToggleShortcut()})`}
+                  onClick={onTerminalToggle}
+                >
+                  <IconTerminalFill />
+                </button>
+                <button
+                  className={`icon-button agent-titlebar-button ${agentOpen ? 'active' : ''}`}
+                  type="button"
+                  aria-label={agentOpen ? 'Close agent' : 'Ask agent'}
+                  aria-pressed={agentOpen}
+                  title={agentOpen ? 'Close Agent' : 'Ask Agent'}
+                  onClick={onAgentToggle}
+                >
+                  <IconSparkles />
+                </button>
+              </>
+            ) : null}
+          </div>
+        </div>
       </div>
     </div>
   )
-}
+})
 
 export function ErrorBanner({ message, onDismiss, closing }: {
   message: string
@@ -368,12 +196,14 @@ interface WelcomeProps {
   recentFolders: readonly RecentFolder[]
   keybindings: KeybindingMap
   onOpen(): Promise<void>
+  onOpenPickedFolder(path: string): void
   onRecentOpen(folder: RecentFolder): Promise<void>
   onRecentRemove(path: string): void
 }
 
 export function Welcome({
   onOpen,
+  onOpenPickedFolder,
   opening,
   openingRecentPath,
   recentFolders,
@@ -382,6 +212,7 @@ export function Welcome({
   onRecentRemove
 }: WelcomeProps): React.JSX.Element {
   const [animateEntrance] = useState(() => !welcomeEntranceShown)
+  const [pickerOpen, setPickerOpen] = useState(false)
   useEffect(() => {
     welcomeEntranceShown = true
   }, [])
@@ -394,10 +225,36 @@ export function Welcome({
           <p className="welcome-copy">
             Open any folder. Select a file to read it, or compare its working copy with HEAD when Git is available.
           </p>
-          <button className="welcome-open" type="button" onClick={() => void onOpen()} disabled={opening}>
-            {opening ? <IconRefresh className="spin" /> : <IconFolder />}
-            Open Folder
-          </button>
+          <div className="folder-picker-host welcome-open-host">
+            <button
+              className="welcome-open"
+              type="button"
+              onClick={() => setPickerOpen((open) => !open)}
+              onMouseEnter={preloadFolderCatalog}
+              onFocus={preloadFolderCatalog}
+              disabled={opening}
+              aria-expanded={pickerOpen}
+              aria-haspopup="dialog"
+            >
+              {opening ? <IconRefresh className="spin" /> : <IconFolder />}
+              Open Folder
+            </button>
+            {pickerOpen ? (
+              <FolderPicker
+                recentFolders={recentFolders}
+                openingPath={openingRecentPath}
+                onClose={() => setPickerOpen(false)}
+                onSelect={(path) => {
+                  setPickerOpen(false)
+                  onOpenPickedFolder(path)
+                }}
+                onUseExisting={() => {
+                  setPickerOpen(false)
+                  void onOpen()
+                }}
+              />
+            ) : null}
+          </div>
           <div className="shortcut-list" aria-label="Keyboard shortcuts">
             <span>Open folder</span><ShortcutHint keys={formatKeybinding(keybindings.openFolder)} label="Open folder shortcut" />
             <span>Go to file</span><ShortcutHint keys={formatKeybinding(keybindings.goToFile)} label="Go to file shortcut" />
@@ -443,6 +300,7 @@ export interface FileEditControls {
   unavailableReason: string | null
   startLabel: 'Edit' | 'Resume draft'
   mode: 'read' | 'edit' | 'preview'
+  documentView: DocumentView
   dirty: boolean
   saving: boolean
   canUndo: boolean
@@ -450,6 +308,7 @@ export interface FileEditControls {
   unsavedPaths: readonly string[]
   onStart(): void
   onModeChange(mode: 'edit' | 'preview'): void
+  onDocumentViewChange(view: DocumentView): void
   onUndo(): void
   onRedo(): void
   onCancel(): void
@@ -475,6 +334,23 @@ interface DiffToolbarProps {
   onDiffStyleChange(style: DiffStyle): void
   onWordWrapToggle(): void
   onFoldUnchangedToggle(): void
+  sidebarVisible?: boolean
+  onSidebarToggle?(): void
+  sidebarShortcut?: string
+}
+
+function FilePathBreadcrumbs({ path }: { path: string }): React.JSX.Element {
+  const segments = path.split('/')
+  return (
+    <nav className="editor-breadcrumbs" aria-label="File path">
+      {segments.map((segment, index) => (
+        <span key={`${segment}:${index}`}>
+          {index > 0 ? <span className="breadcrumb-separator" aria-hidden="true">›</span> : null}
+          <span>{segment}</span>
+        </span>
+      ))}
+    </nav>
+  )
 }
 
 function formatStatus(status: FileComparison['status']): string {
@@ -521,7 +397,10 @@ export function DiffToolbar({
   onCloseExternalReview,
   onDiffStyleChange,
   onWordWrapToggle,
-  onFoldUnchangedToggle
+  onFoldUnchangedToggle,
+  sidebarVisible = true,
+  onSidebarToggle,
+  sidebarShortcut
 }: DiffToolbarProps): React.JSX.Element {
   const displayName = workspaceView === 'multi'
     ? reviewTitle ?? 'Repository review'
@@ -531,9 +410,26 @@ export function DiffToolbar({
   const showDiffLayout = isGitRepository && (workspaceView === 'multi' || !isFilePreview)
   const showEditStart = (fileEdit.available && fileEdit.mode === 'read')
     || (!fileEdit.available && fileEdit.unavailableReason != null && workspaceView === 'file')
+  const markdownPath = selectedPath != null && isMarkdownPath(selectedPath)
+  const showMarkdownViewToggle = markdownPath && workspaceView === 'file' && fileEdit.mode === 'read'
+  const markdownPreviewOnly = markdownPath && (
+    fileEdit.mode === 'preview'
+    || (fileEdit.mode === 'read' && fileEdit.documentView === 'preview')
+  )
 
   return (
     <div className="diff-toolbar">
+      {onSidebarToggle != null && !sidebarVisible ? (
+        <button
+          className="icon-button"
+          type="button"
+          aria-label="Show explorer"
+          title={sidebarShortcut == null ? 'Show Explorer' : `Show Explorer (${sidebarShortcut})`}
+          onClick={onSidebarToggle}
+        >
+          <IconSidebarLeftOpen />
+        </button>
+      ) : null}
       {/* Leaving a pull request belongs beside its title, not in the group of view
           toggles on the right where it read as another display mode. */}
       {onCloseExternalReview != null ? (
@@ -543,13 +439,17 @@ export function DiffToolbar({
         </button>
       ) : null}
       <div className="diff-toolbar-context">
-        <div className="diff-file-title" title={selectedPath ?? undefined}>
-          <IconFileCode />
-          <span>{displayName ?? 'Select a file'}</span>
-          {workspaceView === 'file' && comparison != null && comparison.status !== 'unchanged' ? (
-            <span className={`status-pill status-${comparison.status}`}>{formatStatus(comparison.status)}</span>
-          ) : null}
-        </div>
+        {isFilePreview && selectedPath != null ? (
+          <FilePathBreadcrumbs path={selectedPath} />
+        ) : (
+          <div className="diff-file-title" title={selectedPath ?? undefined}>
+            <IconFileCode />
+            <span>{displayName ?? 'Select a file'}</span>
+            {workspaceView === 'file' && comparison != null && comparison.status !== 'unchanged' ? (
+              <span className={`status-pill status-${comparison.status}`}>{formatStatus(comparison.status)}</span>
+            ) : null}
+          </div>
+        )}
         <span className="comparison-label">
           {workspaceView === 'multi'
             ? reviewComparison ?? `${reviewFileCount} ${isGitRepository ? 'changed' : 'project'} files`
@@ -564,18 +464,26 @@ export function DiffToolbar({
             </span>
             <UnsavedDraftsPill fileEdit={fileEdit} currentPath={selectedPath} />
             <div className="editor-option-controls file-history-controls" role="group" aria-label="Edit history">
-              <button type="button" aria-label="Undo" title="Undo" disabled={!fileEdit.canUndo || fileEdit.saving} onClick={fileEdit.onUndo}>
+              <button type="button" aria-label={`Undo (${UNDO_SHORTCUT})`}
+                title={`Undo (${UNDO_SHORTCUT})`}
+                disabled={!fileEdit.canUndo || fileEdit.saving} onClick={fileEdit.onUndo}>
                 <IconClockArrow />
               </button>
-              <button type="button" aria-label="Redo" title="Redo" disabled={!fileEdit.canRedo || fileEdit.saving} onClick={fileEdit.onRedo}>
+              <button type="button" aria-label={`Redo (${REDO_SHORTCUT})`}
+                title={`Redo (${REDO_SHORTCUT})`}
+                disabled={!fileEdit.canRedo || fileEdit.saving} onClick={fileEdit.onRedo}>
                 <IconRepeat />
               </button>
             </div>
             <div className="segmented-control file-edit-mode" role="group" aria-label="Draft view">
-              <button type="button" aria-pressed={fileEdit.mode === 'edit'} className={fileEdit.mode === 'edit' ? 'active' : undefined} onClick={() => fileEdit.onModeChange('edit')} disabled={fileEdit.saving}>
+              <button type="button" aria-pressed={fileEdit.mode === 'edit'}
+                className={fileEdit.mode === 'edit' ? 'active' : undefined}
+                title="Edit" onClick={() => fileEdit.onModeChange('edit')} disabled={fileEdit.saving}>
                 <IconPencil /><span>Edit</span>
               </button>
-              <button type="button" aria-pressed={fileEdit.mode === 'preview'} className={fileEdit.mode === 'preview' ? 'active' : undefined} onClick={() => fileEdit.onModeChange('preview')} disabled={fileEdit.saving}>
+              <button type="button" aria-pressed={fileEdit.mode === 'preview'}
+                className={fileEdit.mode === 'preview' ? 'active' : undefined}
+                title="Preview" onClick={() => fileEdit.onModeChange('preview')} disabled={fileEdit.saving}>
                 <IconEye /><span>Preview</span>
               </button>
             </div>
@@ -589,12 +497,17 @@ export function DiffToolbar({
               <IconX /><span>Close</span>
             </button>
             <button className="file-edit-save" type="button" onClick={fileEdit.onSave}
-              aria-keyshortcuts="Meta+S Control+S" title="Save file (⌘S)"
+              aria-keyshortcuts="Meta+S Control+S"
+              aria-label={`Save (${SAVE_SHORTCUT})`}
+              title={`Save (${SAVE_SHORTCUT})`}
               disabled={!fileEdit.dirty || fileEdit.saving}>
-              <span className="icon-swap" data-state={fileEdit.saving ? 'alt' : 'base'}>
+              <span className="icon-swap" data-state={fileEdit.saving ? 'alt' : 'base'} aria-hidden="true">
                 <IconCheck /><IconRefresh className="spin" />
               </span>
-              <span className="file-edit-save-label">{fileEdit.saving ? 'Saving' : 'Save'}</span>
+              <span className="file-edit-save-label" aria-hidden="true">{fileEdit.saving ? 'Saving' : 'Save'}</span>
+              {fileEdit.saving ? null : (
+                <kbd className="shortcut-hint" aria-hidden="true">{SAVE_SHORTCUT}</kbd>
+              )}
             </button>
           </div>
         ) : null}
@@ -611,12 +524,39 @@ export function DiffToolbar({
               <IconPencil /><span>{fileEdit.startLabel}</span>
             </button>
           ) : null}
-          {showEditStart ? <span className="diff-control-divider" aria-hidden="true" /> : null}
+          {showEditStart && (showMarkdownViewToggle || !markdownPreviewOnly || showDiffLayout)
+            ? <span className="diff-control-divider" aria-hidden="true" />
+            : null}
+          {showMarkdownViewToggle || !markdownPreviewOnly || showDiffLayout ? (
           <div className="editor-option-controls" role="group" aria-label="Editor display options">
-            <button type="button" aria-label="Toggle word wrap" aria-pressed={wordWrap}
-              data-tooltip="Word wrap" className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle}>
-              <IconTypeWord />
-            </button>
+            {showMarkdownViewToggle ? (
+              <div className="markdown-view-toggle" role="group" aria-label="Markdown view">
+                <button type="button" aria-label="Source" data-tooltip="Source"
+                  aria-pressed={fileEdit.documentView === 'source'}
+                  className={fileEdit.documentView === 'source' ? 'active' : undefined}
+                  onClick={() => fileEdit.onDocumentViewChange('source')}>
+                  <IconFileCode />
+                </button>
+                <button type="button" aria-label="Both" data-tooltip="Source and preview"
+                  aria-pressed={fileEdit.documentView === 'split'}
+                  className={fileEdit.documentView === 'split' ? 'active' : undefined}
+                  onClick={() => fileEdit.onDocumentViewChange('split')}>
+                  <IconDiffSplit />
+                </button>
+                <button type="button" aria-label="Preview" data-tooltip="Preview"
+                  aria-pressed={fileEdit.documentView === 'preview'}
+                  className={fileEdit.documentView === 'preview' ? 'active' : undefined}
+                  onClick={() => fileEdit.onDocumentViewChange('preview')}>
+                  <IconEye />
+                </button>
+              </div>
+            ) : null}
+            {markdownPreviewOnly ? null : (
+              <button type="button" aria-label="Toggle word wrap" aria-pressed={wordWrap}
+                data-tooltip="Word wrap" className={wordWrap ? 'active' : undefined} onClick={onWordWrapToggle}>
+                <IconTypeWord />
+              </button>
+            )}
             {showDiffLayout ? (
               <button type="button" aria-label="Toggle unchanged context folding" aria-pressed={foldUnchanged}
                 data-tooltip="Context folding" className={foldUnchanged ? 'active' : undefined} onClick={onFoldUnchangedToggle}>
@@ -624,6 +564,7 @@ export function DiffToolbar({
               </button>
             ) : null}
           </div>
+          ) : null}
           {showDiffLayout ? (
             <>
               <span className="diff-control-divider" aria-hidden="true" />

@@ -12,7 +12,7 @@ import type {
 import type { WorkspaceView } from './AppView'
 import type { ConfirmRequest } from './ConfirmDialog'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
-import { automaticWorkspaceView } from './workspaceMode'
+import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
 import { useReviewWorlds, type ReviewWorld } from './useReviewWorlds'
 import {
   compareReviewCheckpoint,
@@ -315,7 +315,7 @@ export function useGitWorkflow({
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(firstOpenPathForSnapshot(nextSnapshot), nextView)
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
@@ -597,7 +597,7 @@ export function useGitWorkflow({
       setSubmissionMessage(null)
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(firstOpenPathForSnapshot(nextSnapshot), nextView)
       setPanelOpen(false)
     } catch (error) {
       onError(getErrorMessage(error))
@@ -633,7 +633,7 @@ export function useGitWorkflow({
       const nextSnapshot = await requireRepositoryApi().pullCurrentBranch()
       applySnapshot(nextSnapshot)
       const nextView = automaticWorkspaceView(nextSnapshot, null)
-      focusDesk(nextSnapshot.statuses[0]?.path ?? null, nextView)
+      focusDesk(firstOpenPathForSnapshot(nextSnapshot), nextView)
       await Promise.all([loadIntegration(true), loadInbox(true)])
     } catch (error) {
       onError(getErrorMessage(error))

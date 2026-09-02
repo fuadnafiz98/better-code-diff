@@ -38,6 +38,8 @@ describe('parsePullRequestSelector', () => {
     )).toBe('https://github.com/pierrecomputer/pierre/pull/123')
     expect(parsePullRequestSelector('https://www.github.com/pierrecomputer/pierre/pull/123/files?diff=split'))
       .toBe('https://github.com/pierrecomputer/pierre/pull/123')
+    expect(parsePullRequestSelector('please review https://github.com/pierrecomputer/pierre/pull/123 thanks'))
+      .toBe('https://github.com/pierrecomputer/pierre/pull/123')
   })
 
   it('rejects invalid and unsafe values', () => {

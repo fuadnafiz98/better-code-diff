@@ -1,49 +1,43 @@
 export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
-  :host {
-    container-type: inline-size;
-  }
-
-  /* Widths below are measured against the nearest container. In wrap mode the
-     panes are display:contents, so that is the whole viewer and the label centres
-     across both panes; in scroll mode each pane is a real scrolling box, which
-     clips anything wider — there the label centres inside its own pane instead. */
-  [data-code] {
-    container-type: inline-size;
-  }
+  /* Pierre mounts the same separator in the gutter and the content column, then
+     hides the content copy. Stretching the gutter copy with 100cqi centres the
+     label on :host — both split panes — whenever [data-code] is not a valid
+     query container (wrap uses display:contents; scroll size-containment often
+     falls through). The label belongs in the content column, which is always a
+     real track. */
 
   [data-separator="line-info-basic"] {
     border-block: 0;
     background: transparent;
   }
 
-  [data-separator="line-info-basic"] [data-separator-wrapper] {
-    width: 100cqi;
-    grid-template-columns: 32px minmax(0, 1fr) 32px;
-    /* Inherited rather than set: the wrapper covers the whole strip, and its own
-       fill would otherwise show the page background through any cell no button
-       occupies — a white notch at the end of the strip. */
+  [data-gutter] [data-separator="line-info-basic"] [data-separator-wrapper] {
+    width: auto;
     background: inherit;
   }
 
-  [data-separator="line-info-basic"] [data-separator-wrapper][data-separator-multi-button] {
-    grid-template-columns: 32px 32px minmax(0, 1fr) 32px 32px;
+  [data-gutter] [data-separator="line-info-basic"] [data-separator-content],
+  [data-gutter] [data-separator="line-info-basic"] [data-expand-button] {
+    display: none;
   }
 
-  /* In wrapped split view, the only visible separator belongs to the old-code
-     gutter. Keep it inside that pane so neither label variant sits beneath the
-     draggable divider. The percentage follows the divider while it moves. */
-  [data-diff-type="split"][data-overflow="wrap"]
-    [data-deletions] > [data-gutter]
-    [data-separator="line-info-basic"] [data-separator-wrapper],
-  [data-dehydrated][data-diff-type="split"][data-overflow="scroll"]
-    [data-deletions] > [data-gutter]
-    [data-separator="line-info-basic"] [data-separator-wrapper] {
-    width: var(--horus-split-before-width, 50cqi);
+  [data-content] [data-separator="line-info-basic"] [data-separator-wrapper] {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    width: auto;
+    inset-inline: 0;
+    background: inherit;
   }
 
-  /* A collapsed run of lines reads as a seam in the file: one hairline across the
-     strip, broken by the count. */
+  [data-content] [data-separator="line-info-basic"] [data-separator-wrapper][data-separator-multi-button] {
+    grid-template-columns: 28px 28px minmax(0, 1fr);
+  }
+
+  /* A collapsed run of lines reads as a seam in the file: one hairline across
+     the code, broken by the count. */
   [data-separator="line-info-basic"] [data-separator-content] {
+    min-width: 0;
+    width: 100%;
     justify-content: center;
     gap: 8px;
     padding-inline: 12px;
@@ -54,6 +48,7 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
   [data-separator="line-info-basic"] [data-separator-content]::after {
     content: "";
     flex: 1 1 0;
+    min-width: 0;
     height: 1px;
     background: color-mix(in srgb, var(--border) 72%, transparent);
   }
@@ -73,25 +68,30 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     font-variant-numeric: tabular-nums;
   }
 
-  /* Hovering the seam says it can be opened, which is otherwise discoverable only
-     by finding the 32px chevron parked at the edge. */
+  /* Split mounts the same hunk in both panes. One count; the new pane keeps a
+     seam so the row still reads across the divider. */
+  [data-diff-type="split"] [data-additions] [data-unmodified-lines],
+  [data-diff-type="split"] [data-additions] [data-expand-button] {
+    display: none;
+  }
+
+  [data-diff-type="split"] [data-additions] [data-separator-content]::after {
+    display: none;
+  }
+
   [data-separator="line-info-basic"]:hover [data-unmodified-lines] {
     color: var(--text-secondary);
   }
 
-  /* Keep the vendor's full 32px allocation as the pointer target while drawing
-     the ghost affordance two pixels inside it. Multi-button rows can therefore
-     keep their vendor-managed split without a forced height. */
-  [data-separator="line-info-basic"] [data-expand-button] {
+  [data-content] [data-separator="line-info-basic"] [data-expand-button] {
     position: relative;
-    min-width: 32px;
-    border-block: 0;
-    border-right: 0;
+    min-width: 28px;
+    border: 0;
     background: transparent;
-    color: var(--faint);
+    color: var(--text-secondary);
   }
 
-  [data-separator="line-info-basic"] [data-expand-button]::before {
+  [data-content] [data-separator="line-info-basic"] [data-expand-button]::before {
     content: "";
     position: absolute;
     inset: 2px;
@@ -100,35 +100,32 @@ export const CENTERED_COLLAPSED_SEPARATOR_CSS = `
     pointer-events: none;
   }
 
-  [data-separator="line-info-basic"] [data-expand-button]:hover {
+  [data-content] [data-separator="line-info-basic"] [data-expand-button]:hover {
     background: transparent;
-    color: var(--text-secondary);
+    color: var(--text);
   }
 
-  [data-separator="line-info-basic"] [data-expand-button]:hover::before {
+  [data-content] [data-separator="line-info-basic"] [data-expand-button]:hover::before {
     background: var(--control-fill-hover);
   }
 
-  [data-separator="line-info-basic"] [data-expand-button] [data-icon] {
+  [data-content] [data-separator="line-info-basic"] [data-expand-button] [data-icon] {
     position: relative;
+    width: 14px;
+    height: 14px;
   }
 
   @media (pointer: fine) {
-    [data-separator="line-info-basic"] [data-separator-wrapper][data-separator-multi-button] {
+    [data-content] [data-separator="line-info-basic"] [data-separator-wrapper][data-separator-multi-button] {
       grid-template-rows: 100%;
     }
 
-    [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-up] {
+    [data-content] [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-up] {
       grid-area: 1 / 1;
     }
 
-    [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-down] {
+    [data-content] [data-separator="line-info-basic"] [data-separator-multi-button] [data-expand-down] {
       grid-area: 1 / 2;
     }
-
-    [data-separator="line-info-basic"] [data-separator-multi-button] [data-separator-content] {
-      grid-area: 1 / 3 / 2 / 4;
-    }
   }
-
 `

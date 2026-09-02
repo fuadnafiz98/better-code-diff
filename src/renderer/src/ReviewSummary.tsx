@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
-import { IconCheck, IconCodeComments, IconCopy, IconRefresh, IconTrash, IconX } from '@pierre/icons'
+import { IconCheck, IconCopy, IconRefresh, IconTrash, IconX } from '@pierre/icons'
 
-import { formatSelectedRange, type ReviewThread } from './ReviewComments'
+import { formatCompactSelectedRange, formatSelectedRange, type ReviewThread } from './ReviewComments'
 
 export interface ReviewSummaryEntry {
   path: string
   thread: ReviewThread
+}
+
+export function fileNameFromReviewPath(path: string): string {
+  return path.split('/').at(-1) ?? path
 }
 
 export function formatReviewCommentsForAgent(entries: readonly ReviewSummaryEntry[]): string {
@@ -18,6 +22,7 @@ export function formatReviewCommentsForAgent(entries: readonly ReviewSummaryEntr
 }
 
 const COPY_STATE_MS = { copied: 1_600, failed: 2_400 } as const
+const CLEAR_CONFIRM_MS = 2_400
 
 interface ReviewSummaryProps {
   entries: readonly ReviewSummaryEntry[]
@@ -25,6 +30,7 @@ interface ReviewSummaryProps {
   onBeginReattach(entry: ReviewSummaryEntry): void
   onCancelReattach(): void
   onDrop(entry: ReviewSummaryEntry): void
+  onDropAll(): void
 }
 
 export function ReviewSummary({
@@ -32,12 +38,43 @@ export function ReviewSummary({
   reattachingThreadId,
   onBeginReattach,
   onCancelReattach,
-  onDrop
+  onDrop,
+  onDropAll
 }: ReviewSummaryProps): React.JSX.Element | null {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const [confirmingClear, setConfirmingClear] = useState(false)
+  const [open, setOpen] = useState(false)
   const resetTimerRef = useRef(0)
+  const rootRef = useRef<HTMLElement>(null)
 
   useEffect(() => () => window.clearTimeout(resetTimerRef.current), [])
+  useEffect(() => {
+    if (!confirmingClear) return
+    const timer = window.setTimeout(() => setConfirmingClear(false), CLEAR_CONFIRM_MS)
+    return () => window.clearTimeout(timer)
+  }, [confirmingClear])
+  useEffect(() => {
+    if (!confirmingClear && !open) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      if (confirmingClear) setConfirmingClear(false)
+      else setOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [confirmingClear, open])
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (event: PointerEvent): void => {
+      const root = rootRef.current
+      if (root == null || (event.target instanceof Node && root.contains(event.target))) return
+      setOpen(false)
+      setConfirmingClear(false)
+    }
+    window.addEventListener('pointerdown', onPointerDown, true)
+    return () => window.removeEventListener('pointerdown', onPointerDown, true)
+  }, [open])
 
   if (entries.length === 0) return null
 
@@ -58,27 +95,77 @@ export function ReviewSummary({
     }
   }
 
+  const requestClear = (): void => {
+    if (entries.length === 1 || confirmingClear) {
+      onDropAll()
+      setConfirmingClear(false)
+      return
+    }
+    setConfirmingClear(true)
+  }
+
   return (
-    <section className="review-summary" aria-label="Review comments summary">
+    <section ref={rootRef} className="review-summary" aria-label="Review comments summary">
       <header>
-        <div><IconCodeComments /><strong>Review notes</strong><span>{entries.length}</span></div>
-        <button type="button" data-copy-state={copyState} onClick={() => void copyComments()}>
-          <span className="icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
-            <IconCopy /><IconCheck />
-          </span>
-          <span className="review-copy-label">
-            {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy for agent'}
-          </span>
-        </button>
+        <h2 className="review-summary-title">
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-controls="review-notes-list"
+            aria-haspopup="true"
+            onClick={() => setOpen((current) => !current)}
+          >
+            Review notes
+            <span className="review-summary-count">{entries.length}</span>
+          </button>
+        </h2>
+        <div className="review-summary-toolbar">
+          <button
+            type="button"
+            data-copy-state={copyState}
+            title="Copy for agent"
+            onClick={() => void copyComments()}
+          >
+            <span className="icon-swap" data-state={copyState === 'copied' ? 'alt' : 'base'}>
+              <IconCopy /><IconCheck />
+            </span>
+            <span className="review-copy-label">
+              {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'}
+            </span>
+          </button>
+          <button
+            className="review-summary-clear"
+            type="button"
+            data-confirming={confirmingClear ? '' : undefined}
+            onClick={requestClear}
+          >
+            <IconTrash />
+            {confirmingClear ? `Delete ${entries.length} notes` : 'Delete all'}
+          </button>
+        </div>
       </header>
-      <ol>
+      <ol id="review-notes-list" role="list" hidden={!open}>
         {entries.map((entry) => {
           const { path, thread } = entry
           const reattaching = reattachingThreadId === thread.id
+          const fileName = fileNameFromReviewPath(path)
           return (
             <li key={thread.id}>
-              <div className="review-summary-line"><code>{path}</code><span>{formatSelectedRange(thread.range)}</span>
-                {thread.orphaned ? <em data-state="orphaned">Orphaned</em> : thread.resolved ? <em>Resolved</em> : null}
+              <div className="review-summary-item-head">
+                <div className="review-summary-file">
+                  <strong title={path}>{fileName}</strong>
+                  <span>{formatCompactSelectedRange(thread.range)}</span>
+                  {thread.orphaned ? <em data-state="orphaned">Orphaned</em> : thread.resolved ? <em>Resolved</em> : null}
+                </div>
+                <button
+                  className="review-summary-delete"
+                  type="button"
+                  aria-label={`Delete comment on ${fileName}`}
+                  title="Delete comment"
+                  onClick={() => onDrop(entry)}
+                >
+                  <IconTrash />
+                </button>
               </div>
               <p>{thread.body}</p>
               {thread.replies.map((reply) => <blockquote key={reply.id}>{reply.body}</blockquote>)}
@@ -90,7 +177,6 @@ export function ReviewSummary({
                   ) : (
                     <button type="button" onClick={() => onBeginReattach(entry)}><IconRefresh />Reattach</button>
                   )}
-                  <button type="button" onClick={() => onDrop(entry)}><IconTrash />Drop</button>
                 </div>
               ) : null}
             </li>

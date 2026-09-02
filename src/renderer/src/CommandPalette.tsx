@@ -14,12 +14,14 @@ import {
   IconFolder,
   IconGear,
   IconInReview,
+  IconRefresh,
   IconSearch,
   IconSidebar,
   IconTerminalFill,
   IconTypeWord
 } from '@pierre/icons'
 
+import type { ContentSearchResult } from '../../shared/contracts'
 import {
   KEYBINDING_COMMANDS,
   formatKeybinding,
@@ -34,9 +36,12 @@ import {
   type PaletteEntry
 } from './paletteCommands'
 import { parsePullRequestSelector } from './pullRequestSelector'
+import { tokenizeSearchPreview } from './searchPreview'
 
 const MAX_RESULTS = 30
-const MAX_FILE_RESULTS = 5
+const MAX_RECENT_FILES = 5
+const MAX_SEARCH_FILES = 12
+const MAX_CONTENT_RESULTS = 8
 const MAX_BRANCH_RESULTS = 5
 
 const COMMAND_ICONS: Record<AppCommand, React.ComponentType> = {
@@ -51,30 +56,34 @@ const COMMAND_ICONS: Record<AppCommand, React.ComponentType> = {
   openSettings: IconGear
 }
 
-// Everything but opening a folder or the settings needs something open first.
 const PROJECT_COMMANDS = new Set<AppCommand>([
-  'goToFile',
-  'searchContent',
   'toggleSidebar',
   'toggleWordWrap',
   'toggleFoldUnchanged',
   'toggleTerminal'
 ])
 
+const PALETTE_ONLY_COMMANDS = new Set<AppCommand>([
+  'openCommandPalette',
+  'goToFile',
+  'searchContent'
+])
+
 interface CommandPaletteProps {
   gitRepositoryOpen: boolean
   projectOpen: boolean
   keybindings: KeybindingMap
-  /** Recently opened files, most recent first. Rendered under a Files group. */
   recentFiles?: readonly string[]
-  /** Local branch names, already loaded by the git panel. Never fetched here. */
+  fileResults?: readonly string[]
+  contentResults?: readonly ContentSearchResult[]
+  searchingContent?: boolean
   branches?: readonly string[]
   onClose(): void
+  onQueryChange?(query: string): void
   onOpenPullRequest(selector: number | string): void
   onOpenRepository(): void
   onOpenSettings(): void
   onToggleTerminal(): void
-  /** Runs an application command. Without it only the three wired actions show. */
   onRunCommand?(command: AppCommand): void
   onOpenFile?(path: string): void
   onSwitchBranch?(branch: string): void
@@ -82,6 +91,7 @@ interface CommandPaletteProps {
 
 export interface CommandPaletteHandle {
   close(): boolean
+  open(): void
   toggle(): void
 }
 
@@ -89,6 +99,8 @@ type CommandPaletteControllerProps = Omit<CommandPaletteProps, 'onClose'>
 
 interface PaletteAction extends PaletteEntry {
   icon: React.ComponentType
+  preview?: string
+  previewPath?: string
   run(): void
 }
 
@@ -98,13 +110,51 @@ function pullRequestNumber(selector: number | string): number {
   return Number(match?.[1])
 }
 
+function fileNameFromPath(path: string): string {
+  const slash = path.lastIndexOf('/')
+  return slash < 0 ? path : path.slice(slash + 1)
+}
+
+function isCommandOnlyQuery(query: string): boolean {
+  return query.trimStart().startsWith('>')
+}
+
+function paletteFilterQuery(query: string): string {
+  const trimmed = query.trimStart()
+  return trimmed.startsWith('>') ? trimmed.slice(1).trim() : query
+}
+
+function searchQueryForRepository(query: string): string {
+  return isCommandOnlyQuery(query) ? '' : query
+}
+
+const SearchPreview = memo(function SearchPreview({
+  path,
+  preview,
+  query
+}: { path: string; preview: string; query: string }): React.JSX.Element {
+  const tokens = tokenizeSearchPreview(path, preview, query)
+  return <>{tokens.map((token, index) => (
+    <span
+      className={`search-syntax-${token.kind}${token.match ? ' search-query-match' : ''}`}
+      key={`${index}:${token.text}`}
+    >
+      {token.text}
+    </span>
+  ))}</>
+})
+
 function CommandPalette({
   gitRepositoryOpen,
   projectOpen,
   keybindings,
   recentFiles,
+  fileResults,
+  contentResults,
+  searchingContent,
   branches,
   onClose,
+  onQueryChange,
   onOpenPullRequest,
   onOpenRepository,
   onOpenSettings,
@@ -120,6 +170,8 @@ function CommandPalette({
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
   const scrollActiveRowRef = useRef(false)
   const selector = parsePullRequestSelector(query)
+  const filterQuery = paletteFilterQuery(query)
+  const commandOnly = isCommandOnlyQuery(query)
 
   useLayoutEffect(() => {
     const dialog = dialogRef.current
@@ -130,8 +182,9 @@ function CommandPalette({
     }
   }, [])
 
-  const actions = useMemo<PaletteAction[]>(() => {
+  const commandActions = useMemo<PaletteAction[]>(() => {
     const runAndClose = (run: () => void) => () => {
+      onQueryChange?.('')
       onClose()
       run()
     }
@@ -146,8 +199,7 @@ function CommandPalette({
     }]
 
     for (const { command, label, description } of KEYBINDING_COMMANDS) {
-      // The palette cannot open itself, and re-binding it is a settings concern.
-      if (command === 'openCommandPalette') continue
+      if (PALETTE_ONLY_COMMANDS.has(command)) continue
       const dedicated = command === 'openSettings'
         ? onOpenSettings
         : command === 'toggleTerminal' ? onToggleTerminal : null
@@ -167,19 +219,6 @@ function CommandPalette({
       })
     }
 
-    if (onOpenFile != null) {
-      for (const path of (recentFiles ?? []).slice(0, MAX_FILE_RESULTS)) {
-        entries.push({
-          id: `file:${path}`,
-          group: 'Files',
-          title: path.slice(path.lastIndexOf('/') + 1),
-          subtitle: path,
-          icon: IconFileCode,
-          run: runAndClose(() => onOpenFile(path))
-        })
-      }
-    }
-
     if (onSwitchBranch != null) {
       for (const branch of (branches ?? []).slice(0, MAX_BRANCH_RESULTS)) {
         entries.push({
@@ -195,14 +234,79 @@ function CommandPalette({
 
     return entries
   }, [
-    branches, gitRepositoryOpen, keybindings, onClose, onOpenFile, onOpenRepository,
-    onOpenSettings, onRunCommand, onSwitchBranch, onToggleTerminal, projectOpen, recentFiles
+    branches, gitRepositoryOpen, keybindings, onClose, onOpenRepository, onOpenSettings,
+    onQueryChange, onRunCommand, onSwitchBranch, onToggleTerminal, projectOpen
   ])
 
-  const results = useMemo(
-    () => selector != null ? [] : rankPaletteEntries(actions, query, MAX_RESULTS) as PaletteAction[],
-    [actions, query, selector]
-  )
+  const recentFileActions = useMemo<PaletteAction[]>(() => {
+    if (onOpenFile == null) return []
+    return (recentFiles ?? []).slice(0, MAX_RECENT_FILES).map((path) => ({
+      id: `recent:${path}`,
+      group: 'Files' as const,
+      title: fileNameFromPath(path),
+      subtitle: path,
+      icon: IconFileCode,
+      run: () => {
+        onQueryChange?.('')
+        onClose()
+        onOpenFile(path)
+      }
+    }))
+  }, [onClose, onOpenFile, onQueryChange, recentFiles])
+
+  const searchFileActions = useMemo<PaletteAction[]>(() => {
+    if (onOpenFile == null) return []
+    return (fileResults ?? []).slice(0, MAX_SEARCH_FILES).map((path) => ({
+      id: `file:${path}`,
+      group: 'Files' as const,
+      title: fileNameFromPath(path),
+      subtitle: path,
+      icon: IconFileCode,
+      run: () => {
+        onQueryChange?.('')
+        onClose()
+        onOpenFile(path)
+      }
+    }))
+  }, [fileResults, onClose, onOpenFile, onQueryChange])
+
+  const contentActions = useMemo<PaletteAction[]>(() => {
+    if (onOpenFile == null) return []
+    return (contentResults ?? []).slice(0, MAX_CONTENT_RESULTS).map((result, index) => ({
+      id: `content:${result.path}:${result.line}:${result.column}:${index}`,
+      group: 'Content' as const,
+      title: fileNameFromPath(result.path),
+      subtitle: `${result.path}:${result.line}:${result.column}`,
+      icon: IconFileCode,
+      preview: result.preview,
+      previewPath: result.path,
+      run: () => {
+        onQueryChange?.('')
+        onClose()
+        onOpenFile(result.path)
+      }
+    }))
+  }, [contentResults, onClose, onOpenFile, onQueryChange])
+
+  const results = useMemo<PaletteAction[]>(() => {
+    if (selector != null) return []
+    if (commandOnly) {
+      return rankPaletteEntries(commandActions, filterQuery, MAX_RESULTS) as PaletteAction[]
+    }
+    if (filterQuery.trim() === '') {
+      return rankPaletteEntries(
+        [...commandActions, ...recentFileActions],
+        '',
+        MAX_RESULTS
+      ) as PaletteAction[]
+    }
+    const matched = rankPaletteEntries(commandActions, filterQuery, MAX_RESULTS) as PaletteAction[]
+    return [...searchFileActions, ...contentActions, ...matched].slice(0, MAX_RESULTS)
+  }, [
+    commandActions, commandOnly, contentActions, filterQuery, recentFileActions,
+    searchFileActions, selector
+  ])
+
   const groups = useMemo(() => groupPaletteEntries(results), [results])
   const clampedIndex = results.length === 0 ? 0 : Math.min(activeIndex, results.length - 1)
   const activeAction = results[clampedIndex]
@@ -220,6 +324,7 @@ function CommandPalette({
 
   const displayPullRequest = (): void => {
     if (!gitRepositoryOpen || selector == null) return
+    onQueryChange?.('')
     onClose()
     onOpenPullRequest(selector)
   }
@@ -232,6 +337,12 @@ function CommandPalette({
     if (activeAction?.disabledReason == null) activeAction?.run()
   }
 
+  const updateQuery = (next: string): void => {
+    setQuery(next)
+    setActiveIndex(0)
+    onQueryChange?.(searchQueryForRepository(next))
+  }
+
   let rowIndex = -1
 
   return (
@@ -241,6 +352,7 @@ function CommandPalette({
       aria-labelledby="command-palette-title"
       onCancel={(event) => {
         event.preventDefault()
+        onQueryChange?.('')
         onClose()
       }}
     >
@@ -255,19 +367,17 @@ function CommandPalette({
             ref={inputRef}
             id="command-palette-input"
             value={query}
-            onChange={(event) => {
-              setQuery(event.target.value)
-              setActiveIndex(0)
-            }}
+            onChange={(event) => updateQuery(event.target.value)}
             onKeyDown={(event) => {
               if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
               event.preventDefault()
               moveActive(event.key === 'ArrowDown' ? 1 : -1)
             }}
-            placeholder="Type a command, PR number, or GitHub URL"
+            placeholder="Search files, commands, or a pull request"
             spellCheck={false}
             autoCapitalize="none"
           />
+          {searchingContent ? <IconRefresh className="spin search-spinner" aria-hidden="true" /> : null}
           <kbd>{formatKeybinding(keybindings.openCommandPalette)}</kbd>
         </form>
 
@@ -284,8 +394,8 @@ function CommandPalette({
           ) : results.length === 0 ? (
             <div className="command-palette-empty">
               <IconSearch aria-hidden="true" />
-              <strong>No matching command</strong>
-              <span>Try a command name, a PR number such as #123, or a GitHub pull request URL.</span>
+              <strong>No matching files or commands</strong>
+              <span>Try a file name, a command, &gt; for commands only, a PR number such as #123, or a GitHub pull request URL.</span>
             </div>
           ) : groups.map(({ group, entries }) => (
             <div key={group}>
@@ -299,13 +409,24 @@ function CommandPalette({
                     key={action.id}
                     ref={(node) => { rowRefs.current[index] = node }}
                     type="button"
-                    className={action.id === activeAction?.id ? 'primary-result' : undefined}
+                    className={[
+                      action.id === activeAction?.id ? 'primary-result' : '',
+                      action.preview != null ? 'palette-content' : ''
+                    ].filter(Boolean).join(' ') || undefined}
                     disabled={action.disabledReason != null}
                     onPointerEnter={() => setActiveIndex(index)}
                     onClick={action.run}
                   >
                     <span className="command-icon"><action.icon /></span>
-                    <span><strong>{action.title}</strong><small>{action.disabledReason ?? action.subtitle}</small></span>
+                    <span>
+                      <strong>{action.title}</strong>
+                      <small>{action.disabledReason ?? action.subtitle}</small>
+                      {action.preview != null && action.previewPath != null ? (
+                        <code className="palette-content-preview">
+                          <SearchPreview path={action.previewPath} preview={action.preview} query={filterQuery} />
+                        </code>
+                      ) : null}
+                    </span>
                     {action.keybinding == null ? null : <kbd>{action.keybinding}</kbd>}
                   </button>
                 )
@@ -316,7 +437,8 @@ function CommandPalette({
 
         <footer>
           <span><kbd>↑↓</kbd> Select</span>
-          <span><kbd>↵</kbd> Run</span>
+          <span><kbd>↵</kbd> Open</span>
+          <span><kbd>&gt;</kbd> Commands</span>
           <span><kbd>esc</kbd> Close</span>
         </footer>
       </section>
@@ -329,6 +451,10 @@ export const CommandPaletteController = memo(forwardRef<CommandPaletteHandle, Co
     const [open, setOpen] = useState(false)
     const openRef = useRef(false)
     const focusReturnRef = useRef<HTMLElement | null>(null)
+    const onQueryChangeRef = useRef(props.onQueryChange)
+    useLayoutEffect(() => {
+      onQueryChangeRef.current = props.onQueryChange
+    })
 
     const setVisibility = (visible: boolean): void => {
       if (visible && !openRef.current) {
@@ -339,6 +465,7 @@ export const CommandPaletteController = memo(forwardRef<CommandPaletteHandle, Co
       openRef.current = visible
       setOpen(visible)
       if (!visible) {
+        onQueryChangeRef.current?.('')
         const focusTarget = focusReturnRef.current
         focusReturnRef.current = null
         window.requestAnimationFrame(() => focusTarget?.focus())
@@ -351,6 +478,7 @@ export const CommandPaletteController = memo(forwardRef<CommandPaletteHandle, Co
         setVisibility(false)
         return true
       },
+      open: () => setVisibility(true),
       toggle: () => setVisibility(!openRef.current)
     }), [])
 

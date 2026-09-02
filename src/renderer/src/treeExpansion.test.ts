@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
+import { firstTreePath, getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
 
 describe('getTreeFollowBehavior', () => {
   it('centers the active file instantly when the review scroll drives the tree', () => {
@@ -9,6 +9,20 @@ describe('getTreeFollowBehavior', () => {
 
   it('does not recenter the tree during direct navigation', () => {
     expect(getTreeFollowBehavior('direct-navigation')).toEqual({ offset: 'nearest', animate: false })
+  })
+})
+
+describe('firstTreePath', () => {
+  it('picks the folders-first file, not the byte-sorted path', () => {
+    expect(firstTreePath([
+      'apps/web/src/chat/ChatMessageItem.tsx',
+      'apps/web/src/chat/PromptAttachmentControls.tsx',
+      'apps/web/src/chat/attachment-preview/AttachmentPreviewChips.tsx'
+    ])).toBe('apps/web/src/chat/attachment-preview/AttachmentPreviewChips.tsx')
+  })
+
+  it('returns null for an empty list', () => {
+    expect(firstTreePath([])).toBeNull()
   })
 })
 

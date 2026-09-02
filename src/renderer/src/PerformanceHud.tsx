@@ -54,6 +54,7 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
   const [popoverOpen, setPopoverOpen] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const [samplingStatus, setSamplingStatus] = useState<SamplingStatus>('sampling')
+  const hudRef = useRef<HTMLDetailsElement>(null)
 
   useEffect(() => {
     const repository = window.repository
@@ -121,6 +122,25 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
     }
   }, [diagnosticsOpen, popoverOpen])
 
+  useEffect(() => {
+    if (!popoverOpen) return
+    const onPointerDown = (event: PointerEvent): void => {
+      if (hudRef.current?.contains(event.target as Node) === true) return
+      setPopoverOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setPopoverOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [popoverOpen])
+
   const highMemory = isHighMemory(metrics?.workingSetMegabytes)
   const description = metrics == null
     ? 'Collecting application performance metrics.'
@@ -135,11 +155,14 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
       : metrics == null ? 'Unavailable' : 'Stale'
 
   return (
-    <details className="performance-hud" onToggle={(event) => setPopoverOpen(event.currentTarget.open)}>
+    <details
+      ref={hudRef}
+      className="performance-hud"
+      open={popoverOpen}
+      onToggle={(event) => setPopoverOpen(event.currentTarget.open)}
+    >
       <summary aria-label={description}>
         <span className={`performance-signal ${metrics?.production ? 'production' : ''} ${highMemory ? 'high-memory' : ''}`} aria-hidden="true" />
-        <span className="performance-metric"><small>CPU</small><strong>{formatPerformancePercent(metrics?.cpuPercent)}</strong></span>
-        <span className="performance-metric"><small>GPU</small><strong>{formatPerformancePercent(metrics?.gpuProcessCpuPercent)}</strong></span>
         <span className={`performance-memory ${highMemory ? 'high-memory' : ''}`}
           title={highMemory ? 'Working set is above 1 GB' : undefined}>
           {highMemory ? <IconCiWarningFill aria-hidden="true" /> : null}
@@ -149,14 +172,14 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
 
       <div className="performance-popover">
         <header className="performance-popover-header">
-          <span>
+          <div className="performance-popover-heading">
             <strong>Performance</strong>
             <small>{metrics == null ? 'Detecting build' : metrics.production ? 'Production build' : 'Development build'}</small>
-          </span>
-          <span className={`performance-live ${samplingStatus}`}>
+          </div>
+          <div className={`performance-live ${samplingStatus}`}>
             <span>{statusLabel}</span>
             {metrics == null ? null : <time dateTime={new Date(metrics.sampledAt).toISOString()}>{sampledTimeFormatter.format(metrics.sampledAt)}</time>}
-          </span>
+          </div>
         </header>
 
         <div className="performance-popover-body">

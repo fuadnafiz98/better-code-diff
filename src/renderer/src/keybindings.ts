@@ -31,14 +31,14 @@ export const KEYBINDING_COMMANDS: ReadonlyArray<{
   label: string
   description: string
 }> = [
-  { command: 'openCommandPalette', label: 'Open command palette', description: 'Open a pull request or run an application command.' },
+  { command: 'openCommandPalette', label: 'Open command palette', description: 'Search files, run a command, or open a pull request.' },
   { command: 'toggleSidebar', label: 'Toggle explorer', description: 'Show or hide the file explorer.' },
   { command: 'toggleWordWrap', label: 'Toggle word wrap', description: 'Wrap or scroll long code lines.' },
   { command: 'toggleFoldUnchanged', label: 'Toggle context folding', description: 'Fold or expand unchanged diff regions.' },
   { command: 'toggleTerminal', label: 'Toggle terminal', description: 'Show or hide the project terminal.' },
-  { command: 'goToFile', label: 'Search repository', description: 'Search file names and repository content together.' },
-  { command: 'searchContent', label: 'Search repository (alternate)', description: 'Open the same unified search with the code-search shortcut.' },
-  { command: 'openFolder', label: 'Open folder', description: 'Open the macOS folder picker.' },
+  { command: 'goToFile', label: 'Go to file', description: 'Open the command palette to search files and content.' },
+  { command: 'searchContent', label: 'Search in files', description: 'Open the command palette to search file contents.' },
+  { command: 'openFolder', label: 'Open folder', description: 'Search recent folders or open the macOS picker.' },
   { command: 'openSettings', label: 'Open settings', description: 'Open application settings.' }
 ]
 

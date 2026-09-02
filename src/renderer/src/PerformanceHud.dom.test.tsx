@@ -61,3 +61,43 @@ test('shows a visible warning when the working set reaches 1 GB', async () => {
   fireEvent.click(document.querySelector<HTMLElement>('.performance-hud > summary')!)
   expect(await screen.findByText('High · 4 processes')).toBeTruthy()
 })
+
+test('keeps CPU and GPU out of the titlebar trigger', async () => {
+  window.repository = {
+    getPerformanceMetrics: async () => metrics(Date.now())
+  } as unknown as RepositoryApi
+
+  render(<PerformanceHud />)
+
+  await waitFor(() => expect(document.querySelector('.performance-memory strong')?.textContent).toBe('512 MB'))
+  expect(document.querySelector('.performance-hud > summary')?.textContent).not.toMatch(/CPU|GPU/)
+
+  fireEvent.click(document.querySelector<HTMLElement>('.performance-hud > summary')!)
+  expect(await screen.findByText('App CPU')).toBeTruthy()
+})
+
+test('closes when clicking outside or pressing Escape', async () => {
+  window.repository = {
+    getPerformanceMetrics: async () => metrics(Date.now())
+  } as unknown as RepositoryApi
+
+  render(
+    <div>
+      <button type="button">outside</button>
+      <PerformanceHud />
+    </div>
+  )
+
+  const hud = (): HTMLDetailsElement => document.querySelector<HTMLDetailsElement>('.performance-hud')!
+  fireEvent.click(hud().querySelector('summary')!)
+  await waitFor(() => expect(hud().open).toBe(true))
+
+  fireEvent.pointerDown(screen.getByRole('button', { name: 'outside' }))
+  await waitFor(() => expect(hud().open).toBe(false))
+
+  fireEvent.click(hud().querySelector('summary')!)
+  await waitFor(() => expect(hud().open).toBe(true))
+
+  fireEvent.keyDown(document, { key: 'Escape' })
+  await waitFor(() => expect(hud().open).toBe(false))
+})

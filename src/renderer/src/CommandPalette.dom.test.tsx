@@ -45,14 +45,52 @@ describe('CommandPaletteController', () => {
       onOpenSettings={() => {}} onToggleTerminal={() => {}} onOpenFile={() => {}} />)
 
     act(() => ref.current?.toggle())
-    const input = screen.getByPlaceholderText('Type a command, PR number, or GitHub URL')
+    const input = screen.getByPlaceholderText('Search files, commands, or a pull request')
     for (let step = 0; step < 40; step += 1) {
       fireEvent.keyDown(input, { key: 'ArrowDown' })
     }
     fireEvent.change(input, { target: { value: 'zzzz-no-palette-match' } })
-    expect(screen.getByText('No matching command')).toBeTruthy()
+    expect(screen.getByText('No matching files or commands')).toBeTruthy()
     fireEvent.change(input, { target: { value: '' } })
     const highlighted = document.querySelector('.primary-result')
     expect(highlighted).toBeTruthy()
+  })
+
+  test('lists repository file matches while typing', () => {
+    const onOpenFile = mock(() => {})
+    const onQueryChange = mock(() => {})
+    const ref = createRef<CommandPaletteHandle>()
+    render(<CommandPaletteController ref={ref} gitRepositoryOpen projectOpen
+      keybindings={DEFAULT_KEYBINDINGS} fileResults={['src/app.ts']}
+      onOpenPullRequest={() => {}} onOpenRepository={() => {}}
+      onOpenSettings={() => {}} onToggleTerminal={() => {}}
+      onOpenFile={onOpenFile} onQueryChange={onQueryChange} />)
+
+    act(() => ref.current?.toggle())
+    fireEvent.change(screen.getByPlaceholderText('Search files, commands, or a pull request'), {
+      target: { value: 'app' }
+    })
+    expect(onQueryChange).toHaveBeenCalledWith('app')
+    fireEvent.click(screen.getByRole('button', { name: /app\.ts/ }))
+    expect(onOpenFile).toHaveBeenCalledWith('src/app.ts')
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  test('a leading > keeps the palette on commands', () => {
+    const onQueryChange = mock(() => {})
+    const ref = createRef<CommandPaletteHandle>()
+    render(<CommandPaletteController ref={ref} gitRepositoryOpen projectOpen
+      keybindings={DEFAULT_KEYBINDINGS} fileResults={['src/app.ts']}
+      onOpenPullRequest={() => {}} onOpenRepository={() => {}}
+      onOpenSettings={() => {}} onToggleTerminal={() => {}}
+      onRunCommand={() => {}} onOpenFile={() => {}} onQueryChange={onQueryChange} />)
+
+    act(() => ref.current?.toggle())
+    fireEvent.change(screen.getByPlaceholderText('Search files, commands, or a pull request'), {
+      target: { value: '>wrap' }
+    })
+    expect(onQueryChange).toHaveBeenCalledWith('')
+    expect(screen.getByRole('button', { name: /Toggle word wrap/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /app\.ts/ })).toBeNull()
   })
 })

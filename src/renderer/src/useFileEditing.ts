@@ -4,6 +4,7 @@ import type { Editor, EditorOptions } from '@pierre/diffs/edit'
 
 import type { FileComparison, RepositoryReview } from '../../shared/contracts'
 import type { FileEditControls, WorkspaceView } from './AppView'
+import type { DocumentView } from './documentView'
 import type { ReviewAnnotationMetadata } from './ReviewComments'
 import {
   browserDraftStorage,
@@ -121,6 +122,7 @@ export function useFileEditing({
   onError
 }: UseFileEditingOptions): FileEditingController {
   const [session, setSession] = useState<FileEditSession | null>(null)
+  const [documentView, setDocumentView] = useState<DocumentView>('split')
   const [saving, setSaving] = useState(false)
   const [history, setHistory] = useState({ canUndo: false, canRedo: false })
   const [drafts, setDrafts] = useState<DraftMap>(() => readDrafts(root, browserDraftStorage()))
@@ -457,6 +459,7 @@ export function useFileEditing({
     unavailableReason: canRequestEdit || session != null ? null : unavailableReason,
     startLabel: session != null && activeSession == null ? 'Resume draft' : 'Edit',
     mode: activeSession?.mode ?? 'read',
+    documentView,
     dirty: activeSession?.dirty ?? false,
     saving,
     canUndo: activeSession?.mode === 'edit' && history.canUndo,
@@ -464,14 +467,15 @@ export function useFileEditing({
     unsavedPaths: dirtyPaths,
     onStart: () => { void startEditing() },
     onModeChange: setMode,
+    onDocumentViewChange: setDocumentView,
     onUndo: undo,
     onRedo: redo,
     onCancel: close,
     onRevert: revert,
     onSave: () => { void save() },
     onOpenPath: onSelectPath
-  }), [activeSession, canRequestEdit, close, dirtyPaths, history, onSelectPath, redo, revert, save,
-    saving, session, setMode, startEditing, unavailableReason, undo])
+  }), [activeSession, canRequestEdit, close, dirtyPaths, documentView, history, onSelectPath, redo,
+    revert, save, saving, session, setMode, startEditing, unavailableReason, undo])
 
   return {
     hasSession: session != null,

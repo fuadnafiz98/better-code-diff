@@ -1,7 +1,6 @@
 import { memo, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import {
   IconBrandGithub,
-  IconBraces,
   IconClockArrow,
   IconCodeFolder,
   IconEllipsis,
@@ -31,6 +30,7 @@ interface WorldStripProps {
   worlds: readonly ReviewWorld[]
   activeWorldId: string | null
   collisionCount: number
+  leadingAction?: React.ReactNode
   onFocus(worldId: string): void | Promise<boolean>
   onClose(worldId: string): void
   onNew(): void
@@ -186,6 +186,7 @@ export const WorldStrip = memo(function WorldStrip({
   worlds,
   activeWorldId,
   collisionCount,
+  leadingAction,
   onFocus,
   onClose,
   onNew
@@ -215,7 +216,8 @@ export const WorldStrip = memo(function WorldStrip({
 
   return (
     <nav className="world-strip" aria-label="Review tabs">
-      <span className="world-strip-brand" aria-label="Horus Review"><IconBraces /><span>Review</span></span>
+      <span className="world-strip-safe-area" aria-hidden="true" />
+      {leadingAction}
       <div className="world-tabs" role="tablist" aria-label="Review tabs" onKeyDown={handleTablistKeyDown}>
         {partition.visible.map((world) => (
           <WorldTab
@@ -229,10 +231,15 @@ export const WorldStrip = memo(function WorldStrip({
         ))}
       </div>
       {partition.overflow.length > 0 ? <OverflowMenu worlds={partition.overflow} onFocus={onFocus} /> : null}
-      <button className="world-new" type="button" aria-label="New tab" title="New Tab (⌘T)" onClick={onNew}>
+      <button
+        className="world-new"
+        type="button"
+        aria-label="New tab"
+        title="New Tab (⌘T). Cycle tabs with ⌘⇧[ ]"
+        onClick={onNew}
+      >
         <IconPlus />
       </button>
-      <span className="world-shortcuts" aria-hidden="true">⌘⇧[ ]</span>
     </nav>
   )
 })

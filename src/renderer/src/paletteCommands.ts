@@ -1,4 +1,4 @@
-export type PaletteGroup = 'Commands' | 'Files' | 'Branches'
+export type PaletteGroup = 'Commands' | 'Files' | 'Content' | 'Branches'
 
 export interface PaletteEntry {
   id: string

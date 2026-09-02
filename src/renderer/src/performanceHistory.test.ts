@@ -4,6 +4,7 @@ import {
   buildPerformanceChart,
   clearMemorySamples,
   findNearestSampleIndex,
+  interpolateChartY,
   formatSpan,
   formatTrendPerHour,
   getMemorySamples,
@@ -110,6 +111,18 @@ describe('findNearestSampleIndex', () => {
 
   it('returns -1 for empty history', () => {
     expect(findNearestSampleIndex([], Date.now())).toBe(-1)
+  })
+})
+
+describe('interpolateChartY', () => {
+  it('returns null for an empty series and clamps to the ends', () => {
+    expect(interpolateChartY([], 10)).toBeNull()
+    expect(interpolateChartY([{ x: 4, y: 8 }, { x: 12, y: 20 }], 0)).toBe(8)
+    expect(interpolateChartY([{ x: 4, y: 8 }, { x: 12, y: 20 }], 40)).toBe(20)
+  })
+
+  it('lerps between neighboring points', () => {
+    expect(interpolateChartY([{ x: 0, y: 10 }, { x: 10, y: 20 }], 5)).toBe(15)
   })
 })
 

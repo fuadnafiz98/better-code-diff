@@ -8,7 +8,11 @@ import {
   planAnnotatedReviewItemMutations
 } from './annotatedReviewItems'
 import {
+  applyImagePreviews,
+  createImageReviewItem,
+  imageReviewFile,
   createPatchReviewItems,
+  createReviewItem,
   findCollapseFollowItemId,
   findActiveReviewItemId,
   findNextUnreadReviewItemId,
@@ -16,6 +20,7 @@ import {
   orderReviewItems,
   retainReviewItems
 } from './reviewItems'
+import type { FileComparison, FileImagePreview } from '../../shared/contracts'
 import { agentSelectionForReviewItem, reviewScrollAnchorTarget } from './MultiFileReview'
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
 import type { RemoteReviewThread } from '../../shared/contracts'
@@ -90,6 +95,51 @@ describe('createPatchReviewItems', () => {
       selectedText: 'export const value = 1',
       blobOid: '1'.repeat(40)
     })
+  })
+})
+
+describe('image review items', () => {
+  const image: FileImagePreview = {
+    old: null,
+    new: {
+      mimeType: 'image/png',
+      dataUrl: 'data:image/png;base64,aaa',
+      byteLength: 12
+    }
+  }
+
+  test('turns a binary image comparison into a file item with an image annotation', () => {
+    const comparison: FileComparison = {
+      path: 'assets/icon.png',
+      mode: 'diff',
+      status: 'untracked',
+      oldFile: null,
+      newFile: null,
+      binary: true,
+      oversized: false,
+      image
+    }
+    const item = createReviewItem(comparison)
+    expect(item?.type).toBe('file')
+    expect(item?.id).toBe('review:assets/icon.png')
+  })
+
+  test('replaces an empty binary patch item once the preview arrives', () => {
+    const empty = createPatchReviewItems(
+      'diff --git a/assets/icon.png b/assets/icon.png\nnew file mode 100644\nBinary files /dev/null and b/assets/icon.png differ\n',
+      'working-tree'
+    )
+    expect(empty[0]?.type).toBe('diff')
+    const hydrated = applyImagePreviews(empty, new Map([['assets/icon.png', image]]))
+    expect(hydrated[0]?.type).toBe('file')
+    expect(hydrated[0]?.type === 'file' ? hydrated[0].file.cacheKey : null)
+      .toBe(imageReviewFile('assets/icon.png', image).cacheKey)
+  })
+
+  test('keeps item identity when the same preview is applied again', () => {
+    const item = createImageReviewItem('assets/icon.png', image)
+    const again = applyImagePreviews([item], new Map([['assets/icon.png', image]]))
+    expect(again[0]).toBe(item)
   })
 })
 

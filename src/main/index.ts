@@ -1,3 +1,4 @@
+import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
@@ -12,9 +13,11 @@ import {
   type RendererTermination,
   type RepositorySnapshot
 } from '../shared/contracts.js'
-import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
+import { findHorusReviewRequest, HORUS_PROTOCOL, parseHorusReviewUrl, type HorusReviewRequest } from '../shared/horusUrl.js'
+import { extractGitHubPullRequestUrl, normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
 import { AgentService, coalesceAgentTextEvents } from './agentService.js'
 import { parseAgentAskRequest } from './agentRequest.js'
+import { FolderIndex, resolveOpenableFolder } from './folderIndex.js'
 import { isPathWithinApprovedRoots, parseRemotes, pullRequestTargetsRemotes } from './repository.js'
 import { runCommand } from './gitCommands.js'
 import { RepositorySessionRegistry } from './repositorySessions.js'
@@ -28,6 +31,8 @@ process.on('uncaughtException', (error) => {
 
 const PRODUCT_NAME = 'Horus'
 const startHidden = process.env.HORUS_BACKGROUND === '1'
+const CLIPBOARD_WARMUP_MS = 800
+const WARMUP_COOLDOWN_MS = 60_000
 const remoteDebuggingPort = process.env.HORUS_REMOTE_DEBUGGING_PORT?.trim()
 if (remoteDebuggingPort != null && remoteDebuggingPort !== '') {
   app.commandLine.appendSwitch('remote-debugging-port', remoteDebuggingPort)
@@ -61,6 +66,7 @@ process.title = PRODUCT_NAME
 
 const agentService = new AgentService()
 const terminalService = new TerminalService()
+const folderIndex = new FolderIndex(homedir())
 const repositorySessions = new RepositorySessionRegistry(
   (change) => {
     for (const window of BrowserWindow.getAllWindows()) {
@@ -81,6 +87,95 @@ let sessionState: SessionState = DEFAULT_SESSION_STATE
 // alongside the renderer boot, and without the wait the renderer asks before
 // the first git call lands and falls back to the Welcome screen.
 let restoreLastSession: Promise<unknown> | null = null
+let holdWindowHidden = startHidden
+let pendingOpenPullRequestUrl: string | null = null
+const queuedExternalReviews: HorusReviewRequest[] = []
+const warmupFlights = new Map<string, Promise<void>>()
+const recentlyWarmedAt = new Map<string, number>()
+
+function enqueueExternalReview(request: HorusReviewRequest): void {
+  queuedExternalReviews.push(request)
+}
+
+function revealMainWindow(): void {
+  holdWindowHidden = false
+  if (process.platform === 'darwin') app.dock?.show()
+  const window = BrowserWindow.getAllWindows()[0]
+  if (window == null || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  if (!window.webContents.isLoadingMainFrame()) {
+    window.show()
+    window.focus()
+  }
+}
+
+function publishPendingOpenPullRequest(): void {
+  const url = pendingOpenPullRequestUrl
+  if (url == null) return
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || window.webContents.isLoadingMainFrame()) continue
+    window.webContents.send(IPC_CHANNELS.openExternalPullRequest, url)
+  }
+}
+
+async function warmupPullRequest(url: string): Promise<void> {
+  const inFlight = warmupFlights.get(url)
+  if (inFlight != null) return inFlight
+  const warmedAt = recentlyWarmedAt.get(url)
+  if (warmedAt != null && Date.now() - warmedAt < WARMUP_COOLDOWN_MS) return
+
+  const work = (async () => {
+    try {
+      const matchingRoot = await findPullRequestRoot(url)
+      if (matchingRoot == null) return
+      const snapshot = await openRepository(matchingRoot, false)
+      await repositorySessions.require(snapshot.root).getPullRequestReview(url, undefined, `warmup:${url}`)
+      recentlyWarmedAt.set(url, Date.now())
+    } catch (error) {
+      console.warn(`Could not warm pull request ${url}:`, error)
+    }
+  })().finally(() => {
+    if (warmupFlights.get(url) === work) warmupFlights.delete(url)
+  })
+  warmupFlights.set(url, work)
+  return work
+}
+
+function applyExternalReview(request: HorusReviewRequest): void {
+  void warmupPullRequest(request.url)
+  if (request.intent !== 'open') return
+  pendingOpenPullRequestUrl = request.url
+  revealMainWindow()
+  publishPendingOpenPullRequest()
+}
+
+function acceptExternalReview(value: string): void {
+  const request = parseHorusReviewUrl(value)
+  if (request == null) return
+  if (app.isReady()) applyExternalReview(request)
+  else enqueueExternalReview(request)
+}
+
+function startClipboardWarmup(): void {
+  let seen = clipboard.readText()
+  setInterval(() => {
+    const text = clipboard.readText()
+    if (text === seen) return
+    seen = text
+    const url = extractGitHubPullRequestUrl(text)
+    if (url != null) void warmupPullRequest(url)
+  }, CLIPBOARD_WARMUP_MS)
+}
+
+const launchRequest = findHorusReviewRequest(process.argv)
+if (launchRequest != null) enqueueExternalReview(launchRequest)
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  acceptExternalReview(url)
+})
+// Only the installed app owns horus://. A `bun run dev` registration would
+// steal the scheme from ~/Applications/Horus.app and break Raycast.
+if (app.isPackaged) app.setAsDefaultProtocolClient(HORUS_PROTOCOL)
 
 function rendererDiagnosticsPath(): string {
   return join(app.getPath('userData'), 'renderer-terminations.json')
@@ -210,7 +305,7 @@ function createMainWindow(): BrowserWindow {
   }
 
   window.once('ready-to-show', () => {
-    if (startHidden) return
+    if (holdWindowHidden) return
     if (savedGeometry?.maximized === true) window.maximize()
     window.show()
   })
@@ -257,6 +352,7 @@ function createMainWindow(): BrowserWindow {
   window.on('leave-full-screen', publishFullscreen(false))
   window.webContents.on('did-finish-load', () => {
     if (!window.isDestroyed() && window.isFullScreen()) publishFullscreen(true)()
+    publishPendingOpenPullRequest()
   })
   window.webContents.on('found-in-page', (_event, result) => {
     window.webContents.send(IPC_CHANNELS.foundInPage, {
@@ -370,6 +466,14 @@ function registerIpcHandlers(): void {
     if (result.canceled || folderPath == null) return null
     return openRepository(folderPath)
   })
+  ipcMain.handle(IPC_CHANNELS.listFolderCandidates, () => folderIndex.list(sessionState.approvedRoots))
+  ipcMain.handle(IPC_CHANNELS.openPickedFolder, async (_event, folderPath: unknown) => {
+    const resolved = await resolveOpenableFolder(folderPath, {
+      home: folderIndex.home,
+      approvedRoots: sessionState.approvedRoots
+    })
+    return openRepository(resolved)
+  })
   ipcMain.handle(IPC_CHANNELS.openPath, async (_event, folderPath: unknown) => {
     if (typeof folderPath !== 'string' || !isAbsolute(folderPath)) {
       throw new Error('Recent folder path must be absolute.')
@@ -385,6 +489,7 @@ function registerIpcHandlers(): void {
     repositorySessions.release(requireRepositoryRoot(root)))
   ipcMain.handle(IPC_CHANNELS.resolvePullRequestRepository, (_event, pullRequestUrl: unknown) =>
     resolvePullRequestRepository(pullRequestUrl))
+  ipcMain.handle(IPC_CHANNELS.getPendingExternalPullRequest, () => pendingOpenPullRequestUrl)
   ipcMain.handle(IPC_CHANNELS.readClipboardText, (_event, type: unknown) => {
     if (type == null) return clipboard.readText()
     if (typeof type !== 'string' || type === '' || type.length > 200) {
@@ -637,21 +742,28 @@ app.whenReady().then(() => {
   nativeTheme.themeSource = sessionState.themeType
   app.setAboutPanelOptions({ applicationName: PRODUCT_NAME })
   applyDevelopmentDockIcon()
-  if (startHidden) app.dock?.hide()
+  const initialReviews = queuedExternalReviews.splice(0)
+  if (initialReviews.length > 0 && initialReviews.every((request) => request.intent === 'warmup')) {
+    holdWindowHidden = true
+  }
+  if (initialReviews.some((request) => request.intent === 'open')) holdWindowHidden = false
+  if (startHidden || holdWindowHidden) app.dock?.hide()
   void loadLastRendererTermination()
   registerIpcHandlers()
   // Started before the window so the git spawns overlap the renderer boot.
   beginSessionRestore()
+  void folderIndex.list(sessionState.approvedRoots)
   createMainWindow()
-  app.on('second-instance', () => {
-    const existing = BrowserWindow.getAllWindows()[0]
-    if (existing == null) {
-      createMainWindow()
+  if (!startHidden) startClipboardWarmup()
+  for (const request of initialReviews) applyExternalReview(request)
+  app.on('second-instance', (_event, argv) => {
+    const request = findHorusReviewRequest(argv)
+    if (request != null) {
+      applyExternalReview(request)
       return
     }
-    if (existing.isMinimized()) existing.restore()
-    existing.show()
-    existing.focus()
+    revealMainWindow()
+    if (BrowserWindow.getAllWindows()[0] == null) createMainWindow()
   })
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow()

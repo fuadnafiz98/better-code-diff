@@ -18,14 +18,22 @@ export function resolveGitHubHref(href: string | undefined): string | undefined 
   return href
 }
 
+const EXTERNAL_HREF = /^(https?:|mailto:)/i
+
+export function isExternalMarkdownHref(href: string | undefined): boolean {
+  return href != null && EXTERNAL_HREF.test(href)
+}
+
 export const GitHubMarkdownContent = memo(function GitHubMarkdownContent({
   source,
   className,
-  variant = 'document'
+  variant = 'document',
+  hrefMode = 'github'
 }: {
   source: string
   className?: string
   variant?: 'document' | 'comment'
+  hrefMode?: 'github' | 'local'
 }): React.JSX.Element {
   const classes = [
     className,
@@ -39,11 +47,14 @@ export const GitHubMarkdownContent = memo(function GitHubMarkdownContent({
         rehypePlugins={[rehypeRaw, [rehypeSanitize, GITHUB_MARKDOWN_SCHEMA]]}
         components={{
           a: ({ href, children, ...props }) => {
-            const resolvedHref = resolveGitHubHref(href)
-            const external = resolvedHref?.startsWith('https://') === true
+            const resolvedHref = hrefMode === 'github' ? resolveGitHubHref(href) : href
+            const external = isExternalMarkdownHref(resolvedHref)
             return (
               <a {...props} href={resolvedHref}
-                {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}>
+                {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+                onClick={external || resolvedHref?.startsWith('#') === true
+                  ? undefined
+                  : (event) => { event.preventDefault() }}>
                 {children}
               </a>
             )

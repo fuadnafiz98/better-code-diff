@@ -1,6 +1,7 @@
 import type { CodeViewItem, FileDiffMetadata, SelectedLineRange } from '@pierre/diffs'
 
 import type { ReviewThread } from './ReviewComments'
+import { selectedRangeLastLine } from './reviewAnnotations'
 import { pathFromReviewItemId as pathFromItemId } from './reviewItems'
 
 // Immediate neighbors remain stable when unrelated lines are inserted nearby.
@@ -206,7 +207,7 @@ function reanchorAnchoredThread(
     && anchor.blobOid === nextAnchor.blobOid
     && anchor.beforeContextHash === nextAnchor.beforeContextHash
     && anchor.afterContextHash === nextAnchor.afterContextHash) return thread
-  return { ...thread, lineNumber: range.start, side: anchor.side, range, anchor: nextAnchor, orphaned: false }
+  return { ...thread, lineNumber: selectedRangeLastLine(range), side: anchor.side, range, anchor: nextAnchor, orphaned: false }
 }
 
 export function reanchorReviewThread(thread: ReviewThread, item: CodeViewItem<unknown> | null): ReviewThread {
@@ -263,7 +264,7 @@ export function attachReviewThreadToRange(
   if (anchor == null) return null
   return {
     ...thread,
-    lineNumber: range.start,
+    lineNumber: selectedRangeLastLine(range),
     side: anchor.side,
     range,
     anchor,

@@ -1,6 +1,8 @@
 import { parseDiffFromFile, parsePatchFiles, type CodeViewItem } from '@pierre/diffs'
 
-import type { FileComparison } from '../../shared/contracts'
+import type { FileComparison, FileImagePreview } from '../../shared/contracts'
+import { hasImagePreview, imagePreviewCacheKey } from '../../shared/imagePreview'
+import type { ReviewAnnotationMetadata } from './ReviewComments'
 
 export function reviewItemId(path: string): string {
   return `review:${path}`
@@ -10,8 +12,57 @@ export function pathFromReviewItemId(id: string): string {
   return id.startsWith('review:') ? id.slice('review:'.length) : id
 }
 
+export function imageReviewFile(path: string, image: FileImagePreview): {
+  name: string
+  contents: string
+  cacheKey: string
+} {
+  return {
+    name: path,
+    contents: '\u200b',
+    cacheKey: imagePreviewCacheKey(image)
+  }
+}
+
+export function createImageReviewItem(
+  path: string,
+  image: FileImagePreview
+): CodeViewItem<ReviewAnnotationMetadata> {
+  return {
+    id: reviewItemId(path),
+    type: 'file',
+    file: imageReviewFile(path, image),
+    annotations: [{
+      lineNumber: 1,
+      metadata: { kind: 'image', image }
+    }]
+  } as CodeViewItem<ReviewAnnotationMetadata>
+}
+
+export function applyImagePreviews<Metadata>(
+  items: readonly CodeViewItem<Metadata>[],
+  previews: ReadonlyMap<string, FileImagePreview>
+): CodeViewItem<Metadata>[] {
+  if (previews.size === 0) return items as CodeViewItem<Metadata>[]
+  let changed = false
+  const next = items.map((item) => {
+    const path = pathFromReviewItemId(item.id)
+    const image = previews.get(path)
+    if (image == null) return item
+    const cacheKey = imagePreviewCacheKey(image)
+    if (item.type === 'file' && item.file.cacheKey === cacheKey) return item
+    changed = true
+    return createImageReviewItem(path, image) as CodeViewItem<Metadata>
+  })
+  return changed ? next : items as CodeViewItem<Metadata>[]
+}
+
 export function createReviewItem<Metadata>(comparison: FileComparison): CodeViewItem<Metadata> | null {
-  if (comparison.binary || comparison.oversized) return null
+  if (comparison.oversized) return null
+  if (hasImagePreview(comparison.image)) {
+    return createImageReviewItem(comparison.path, comparison.image) as CodeViewItem<Metadata>
+  }
+  if (comparison.binary) return null
 
   if (comparison.mode === 'file' && comparison.newFile != null) {
     return { id: reviewItemId(comparison.path), type: 'file', file: comparison.newFile }
