@@ -7,10 +7,11 @@ import {
   useState
 } from 'react'
 
-import type { ContentSearchResult, RepositorySnapshot } from '../../shared/contracts'
+import type { ContentSearchResult, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
 import { createFileSearchIndex, rankFilePaths } from './fileSearch'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import { contentSearchDelay } from './contentSearchScheduler'
+import { reviewPathsForSnapshot } from './workspaceMode'
 
 const FILE_SEARCH_RESULT_LIMIT = 32
 
@@ -24,7 +25,8 @@ export interface RepositorySearchController {
 
 export function useRepositorySearch(
   snapshot: RepositorySnapshot | null,
-  onError: (message: string) => void
+  onError: (message: string) => void,
+  repositoryReview: Pick<RepositoryReview, 'files'> | null = null
 ): RepositorySearchController {
   const [query, setQuery] = useState('')
   const [contentResults, setContentResults] = useState<ContentSearchResult[]>([])
@@ -39,10 +41,15 @@ export function useRepositorySearch(
     () => searching ? createFileSearchIndex(snapshotPaths ?? []) : [],
     [searching, snapshotPaths]
   )
+  const priorityPaths = useMemo(() => {
+    if (snapshot == null) return undefined
+    const reviewPaths = reviewPathsForSnapshot(snapshot, repositoryReview)
+    return reviewPaths.length === 0 ? undefined : new Set(reviewPaths)
+  }, [repositoryReview, snapshot])
   const fileResults = useMemo(() => {
     if (snapshot == null || !searching) return []
-    return rankFilePaths(indexedPaths, deferredQuery, FILE_SEARCH_RESULT_LIMIT)
-  }, [deferredQuery, indexedPaths, searching, snapshot])
+    return rankFilePaths(indexedPaths, deferredQuery, FILE_SEARCH_RESULT_LIMIT, priorityPaths)
+  }, [deferredQuery, indexedPaths, priorityPaths, searching, snapshot])
 
   const changeQuery = useCallback((nextQuery: string) => {
     setQuery(nextQuery)

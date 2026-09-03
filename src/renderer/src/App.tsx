@@ -572,7 +572,6 @@ export function App({
   const commandPalette = useCommandPaletteLoader(setError)
   const [recentFiles, setRecentFiles] = useState<readonly string[]>([])
   const confirmation = useConfirm()
-  const search = useRepositorySearch(snapshot, setError)
   const closeOverlays = useCallback(() => {
     commandPalette.close()
     setSettingsOpen(false)
@@ -636,6 +635,7 @@ export function App({
     onWorkspaceViewChange: changeWorkspaceView,
     confirm: confirmation.confirm
   })
+  const search = useRepositorySearch(snapshot, setError, gitWorkflow.repositoryReview)
   const openPullRequestReview = gitWorkflow.openPullRequestReview
   const openWorkingTree = gitWorkflow.openWorkingTree
   const reviewWorlds = gitWorkflow.worlds

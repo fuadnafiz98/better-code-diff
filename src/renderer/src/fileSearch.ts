@@ -6,6 +6,7 @@ interface IndexedPath {
 interface RankedPath {
   path: string
   score: number
+  priority: boolean
 }
 
 function fuzzyPathScore(path: IndexedPath, normalizedQuery: string): number | null {
@@ -36,6 +37,7 @@ function fuzzyPathScore(path: IndexedPath, normalizedQuery: string): number | nu
 }
 
 function compareRankedPaths(left: RankedPath, right: RankedPath): number {
+  if (left.priority !== right.priority) return left.priority ? -1 : 1
   return left.score - right.score || (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
 }
 
@@ -76,12 +78,22 @@ export function createFileSearchIndex(paths: readonly string[]): IndexedPath[] {
   return paths.map((path) => ({ path, normalizedPath: path.toLowerCase() }))
 }
 
-export function rankFilePaths(paths: readonly IndexedPath[], query: string, limit = 80): string[] {
+export function rankFilePaths(
+  paths: readonly IndexedPath[],
+  query: string,
+  limit = 80,
+  priorityPaths?: ReadonlySet<string>
+): string[] {
   const normalizedQuery = query.trim().toLowerCase()
   const rankedPaths: RankedPath[] = []
   for (const indexedPath of paths) {
     const score = fuzzyPathScore(indexedPath, normalizedQuery)
-    if (score != null) addRankedPath(rankedPaths, { path: indexedPath.path, score }, limit)
+    if (score == null) continue
+    addRankedPath(rankedPaths, {
+      path: indexedPath.path,
+      score,
+      priority: priorityPaths?.has(indexedPath.path) === true
+    }, limit)
   }
   return rankedPaths.sort(compareRankedPaths).map((result) => result.path)
 }
