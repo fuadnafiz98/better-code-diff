@@ -247,6 +247,37 @@ test('closing a loading New tab cancels its request and releases its unused chec
   expect(result.current.worlds.some((world) => world.source === 'patch')).toBe(false)
 })
 
+test('a deep-linked pull request pops a New tab before the repository resolve returns', async () => {
+  const pending = deferred<RepositorySnapshot | null>()
+  const resolvePullRequestRepository = mock(() => pending.promise)
+  window.repository = {
+    resolvePullRequestRepository,
+    getPullRequestReview: async () => review(8),
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: () => () => {}
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow(workflowOptions()))
+
+  expect(result.current.activeWorld?.source).toBe('desk')
+  let request!: Promise<boolean>
+  act(() => {
+    request = result.current.openPullRequestFromLocator(review(8).pullRequest.url)
+  })
+
+  expect(result.current.activeWorld?.source).toBe('new')
+  expect(result.current.activeWorld?.source === 'new' ? result.current.activeWorld.pending : false)
+    .toBe(true)
+  expect(result.current.activeWorld?.source === 'new' ? result.current.activeWorld.locator : '')
+    .toBe(review(8).pullRequest.url)
+  expect(result.current.actionKey).toBe('resolve:pull-request')
+  expect(result.current.worlds.some((world) => world.source === 'desk')).toBe(true)
+
+  pending.resolve(repositorySnapshot)
+  await act(() => request)
+  expect(result.current.worlds.some((world) => world.source === 'patch')).toBe(true)
+})
+
 test('opening and navigating a patch does not advance the checkpoint', async () => {
   window.repository = {
     getPullRequestReview: async () => review(4),

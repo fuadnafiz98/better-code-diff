@@ -12,6 +12,8 @@ import type {
   TerminalExitEvent
 } from '../shared/contracts.js'
 import { IPC_CHANNELS } from '../shared/contracts.js'
+import { applyRestoreHintToDocument, parseRestoreHint, restoreHintFromArgv } from '../shared/sessionRestore.js'
+import { parseWorkspaceCache } from '../shared/workspaceCache.js'
 
 // The detail main can supply; the renderer-local half is measured here.
 type MainPerformanceDetail = Pick<
@@ -48,7 +50,16 @@ function countRendererDomNodes(root: RendererQueryRoot | undefined): number {
   return count
 }
 
+const restoreHint = restoreHintFromArgv(process.argv)
+  ?? parseRestoreHint(ipcRenderer.sendSync(IPC_CHANNELS.getRestoreHint))
+const cachedWorkspace = parseWorkspaceCache(ipcRenderer.sendSync(IPC_CHANNELS.getWorkspaceCache))
+const bootDocument = (globalThis as { document?: { documentElement?: { dataset: Record<string, string | undefined> } } }).document
+applyRestoreHintToDocument(bootDocument?.documentElement, restoreHint)
+
 const repositoryApi: RepositoryApi = {
+  restoreHint,
+  cachedWorkspace,
+  persistWorkspaceUi: (ui) => ipcRenderer.invoke(IPC_CHANNELS.persistWorkspaceUi, ui),
   getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
   listFolderCandidates: () => ipcRenderer.invoke(IPC_CHANNELS.listFolderCandidates),

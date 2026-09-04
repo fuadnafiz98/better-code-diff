@@ -132,6 +132,35 @@ function trimShikiThemesPlugin(): Plugin {
   }
 }
 
+function preloadBootChunkPlugin(): Plugin {
+  return {
+    name: 'horus:preload-boot',
+    transformIndexHtml: {
+      order: 'post',
+      handler(_html, context) {
+        if (context.bundle == null) return []
+        const tags: Array<{ tag: string; attrs: Record<string, string>; injectTo: 'head' }> = []
+        for (const file of Object.values(context.bundle)) {
+          if (file.type === 'chunk' && file.name === 'boot') {
+            tags.push({
+              tag: 'link',
+              attrs: { rel: 'modulepreload', crossorigin: '', href: `./${file.fileName}` },
+              injectTo: 'head'
+            })
+          } else if (file.type === 'asset' && file.fileName.endsWith('.css') && file.fileName.includes('boot-')) {
+            tags.push({
+              tag: 'link',
+              attrs: { rel: 'preload', as: 'style', href: `./${file.fileName}` },
+              injectTo: 'head'
+            })
+          }
+        }
+        return tags
+      }
+    }
+  }
+}
+
 function dropShikiWasmPlugin(): Plugin {
   const stubId = '\0horus:shiki-wasm-stub'
   return {
@@ -189,6 +218,7 @@ export default defineConfig({
         }
       }),
       contentSecurityPolicyPlugin(),
+      preloadBootChunkPlugin(),
       dropShikiWasmPlugin(),
       trimShikiThemesPlugin()
     ],

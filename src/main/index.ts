@@ -1,6 +1,5 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { readFile, writeFile } from 'node:fs/promises'
 
@@ -21,8 +20,30 @@ import { FolderIndex, resolveOpenableFolder } from './folderIndex.js'
 import { isPathWithinApprovedRoots, parseRemotes, pullRequestTargetsRemotes } from './repository.js'
 import { runCommand } from './gitCommands.js'
 import { RepositorySessionRegistry } from './repositorySessions.js'
-import { DEFAULT_SESSION_STATE, loadSessionState, saveSessionState, type SessionState } from './sessionStore.js'
+import {
+  effectiveLastRoot,
+  encodeRestoreHintArgument,
+  parseRestoreHint,
+  shouldRestoreLastFolder,
+  type SessionRestoreHint
+} from '../shared/sessionRestore.js'
+import {
+  comparisonWithoutOpenSession,
+  mergeWorkspaceCache,
+  parseWorkspaceUi,
+  type WorkspaceCache,
+  type WorkspaceUiState
+} from '../shared/workspaceCache.js'
+import { DEFAULT_SESSION_STATE, flushSessionState, loadSessionState, saveSessionState, type SessionState } from './sessionStore.js'
+import { flushWorkspaceCache, loadWorkspaceCache, saveWorkspaceCache } from './workspaceCacheStore.js'
+import { detectRepositoryKind, listRootSnapshot, resolveExistingRoot, rootsMatch } from './workspaceListing.js'
 import { TerminalService } from './terminalService.js'
+import {
+  revealCreatedWindow,
+  revealExistingWindow,
+  shouldHoldWindowHidden,
+  shouldRevealForReview
+} from './windowReveal.js'
 import { loadWindowState, saveWindowState } from './windowState.js'
 
 process.on('uncaughtException', (error) => {
@@ -47,6 +68,7 @@ const mainStartupOrigin = performance.now()
 const mainStartupMetrics: MainStartupMetrics = {
   appReady: null,
   windowCreated: null,
+  windowShown: null,
   restoreSettled: null
 }
 
@@ -86,7 +108,10 @@ let sessionState: SessionState = DEFAULT_SESSION_STATE
 // Held so the getSessionSnapshot handler can wait for it: the restore runs
 // alongside the renderer boot, and without the wait the renderer asks before
 // the first git call lands and falls back to the Welcome screen.
-let restoreLastSession: Promise<unknown> | null = null
+let restoreLastSession: Promise<unknown> = Promise.resolve(null)
+let workspaceCache: WorkspaceCache | null = null
+let persistWorkspaceTimer: ReturnType<typeof setTimeout> | null = null
+const WORKSPACE_CACHE_SAVE_DEBOUNCE_MS = 400
 let holdWindowHidden = startHidden
 let pendingOpenPullRequestUrl: string | null = null
 const queuedExternalReviews: HorusReviewRequest[] = []
@@ -100,13 +125,9 @@ function enqueueExternalReview(request: HorusReviewRequest): void {
 function revealMainWindow(): void {
   holdWindowHidden = false
   if (process.platform === 'darwin') app.dock?.show()
-  const window = BrowserWindow.getAllWindows()[0]
-  if (window == null || window.isDestroyed()) return
-  if (window.isMinimized()) window.restore()
-  if (!window.webContents.isLoadingMainFrame()) {
-    window.show()
-    window.focus()
-  }
+  const existing = BrowserWindow.getAllWindows()[0]
+  const window = existing == null || existing.isDestroyed() ? createMainWindow() : existing
+  revealExistingWindow(window)
 }
 
 function publishPendingOpenPullRequest(): void {
@@ -142,11 +163,12 @@ async function warmupPullRequest(url: string): Promise<void> {
 }
 
 function applyExternalReview(request: HorusReviewRequest): void {
+  if (shouldRevealForReview(request.intent)) {
+    pendingOpenPullRequestUrl = request.url
+    revealMainWindow()
+    publishPendingOpenPullRequest()
+  }
   void warmupPullRequest(request.url)
-  if (request.intent !== 'open') return
-  pendingOpenPullRequestUrl = request.url
-  revealMainWindow()
-  publishPendingOpenPullRequest()
 }
 
 function acceptExternalReview(value: string): void {
@@ -213,7 +235,34 @@ async function recordRendererTermination(details: RenderProcessGoneDetails): Pro
 
 function trackSnapshot(snapshot: RepositorySnapshot): RepositorySnapshot {
   repositorySessions.sync(snapshot)
+  persistWorkspaceFromSnapshot(snapshot)
   return snapshot
+}
+
+function rememberWorkspaceCache(next: WorkspaceCache): void {
+  workspaceCache = next
+  if (userDataPath === '') return
+  if (persistWorkspaceTimer != null) clearTimeout(persistWorkspaceTimer)
+  persistWorkspaceTimer = setTimeout(() => {
+    persistWorkspaceTimer = null
+    if (workspaceCache != null) void saveWorkspaceCache(userDataPath, workspaceCache)
+  }, WORKSPACE_CACHE_SAVE_DEBOUNCE_MS)
+}
+
+function persistWorkspaceFromSnapshot(
+  snapshot: RepositorySnapshot,
+  ui: WorkspaceUiState | null = null
+): void {
+  rememberWorkspaceCache(mergeWorkspaceCache(snapshot, ui, workspaceCache))
+}
+
+function flushPendingWorkspaceCache(): void {
+  if (persistWorkspaceTimer == null) return
+  clearTimeout(persistWorkspaceTimer)
+  persistWorkspaceTimer = null
+  if (workspaceCache != null && userDataPath !== '') {
+    void saveWorkspaceCache(userDataPath, workspaceCache)
+  }
 }
 
 function persistWindowGeometry(window: BrowserWindow): void {
@@ -258,11 +307,13 @@ function createMainWindow(): BrowserWindow {
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 17 },
     backgroundColor: WINDOW_BACKGROUND[sessionState.themeType],
+    paintWhenInitiallyHidden: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      additionalArguments: [encodeRestoreHintArgument(currentRestoreHint())]
     }
   })
   markMainStartup('windowCreated')
@@ -304,11 +355,18 @@ function createMainWindow(): BrowserWindow {
     }, delay)
   }
 
-  window.once('ready-to-show', () => {
-    if (holdWindowHidden) return
-    if (savedGeometry?.maximized === true) window.maximize()
-    window.show()
-  })
+  const tryReveal = (): void => {
+    if (revealCreatedWindow(window, {
+      holdHidden: holdWindowHidden,
+      maximize: savedGeometry?.maximized === true
+    })) {
+      markMainStartup('windowShown')
+    }
+  }
+  // Fallback if the immediate reveal below was skipped (background hold).
+  // Do not wait for this on a normal launch: it fires after the renderer
+  // bundle paints, which is later than a half dock-bounce.
+  window.once('ready-to-show', tryReveal)
   // Fires only when the renderer's beforeunload handler objected, which it does
   // while a draft is unsaved. preventDefault here means "ignore the objection
   // and close", so it is the discard branch.
@@ -375,6 +433,7 @@ function createMainWindow(): BrowserWindow {
   })
 
   loadRenderer()
+  tryReveal()
 
   return window
 }
@@ -400,9 +459,25 @@ async function collectPerformanceDetail(
 }
 
 async function openRepository(folderPath: string, activate = true): Promise<RepositorySnapshot> {
-  await restoreLastSession?.catch(() => undefined)
-  const snapshot = await repositorySessions.open(folderPath, activate)
+  const resolved = resolveExistingRoot(folderPath)
+  if (resolved == null) throw new Error('That folder is no longer on disk.')
+
+  const cached = workspaceCache != null && rootsMatch(workspaceCache.lastRoot, resolved)
+    ? workspaceCache
+    : null
+  const snapshot = cached != null
+    ? repositorySessions.hydrate({
+      ...cached.snapshot,
+      root: resolved,
+      kind: detectRepositoryKind(resolved)
+    }, activate)
+    : await repositorySessions.open(resolved, activate)
   rememberOpenedRoot(snapshot.root, activate)
+  if (cached != null) {
+    void repositorySessions.refreshActive().then((live) => {
+      if (live != null && live.root === repositorySessions.activeRoot) persistWorkspaceFromSnapshot(live)
+    })
+  }
   return snapshot
 }
 
@@ -452,10 +527,47 @@ async function resolvePullRequestRepository(value: unknown): Promise<RepositoryS
   return openRepository(folderPath, false)
 }
 
+function currentRestoreHint(): SessionRestoreHint {
+  const lastRoot = effectiveLastRoot(sessionState.lastRoot, workspaceCache?.lastRoot)
+  const folderPresent = lastRoot != null && resolveExistingRoot(lastRoot) != null
+  return parseRestoreHint({
+    lastRoot,
+    restoreLastFolder: sessionState.restoreLastFolder,
+    themeType: sessionState.themeType,
+    folderPresent,
+    restoring: shouldRestoreLastFolder({
+      startHidden,
+      restoreLastFolder: sessionState.restoreLastFolder,
+      lastRoot,
+      folderPresent
+    })
+  })
+}
+
 function registerIpcHandlers(): void {
+  ipcMain.on(IPC_CHANNELS.getRestoreHint, (event) => {
+    event.returnValue = currentRestoreHint()
+  })
+  ipcMain.on(IPC_CHANNELS.getWorkspaceCache, (event) => {
+    event.returnValue = currentRestoreHint().restoring ? workspaceCache : null
+  })
+  ipcMain.handle(IPC_CHANNELS.persistWorkspaceUi, (_event, raw: unknown) => {
+    const snapshot = repositorySessions.getActiveSnapshot()
+    const ui = parseWorkspaceUi(raw)
+    if (snapshot == null || ui == null) return
+    persistWorkspaceFromSnapshot(snapshot, ui)
+  })
   ipcMain.handle(IPC_CHANNELS.getSessionSnapshot, async () => {
+    const current = repositorySessions.getActiveSnapshot()
+    if (current != null) return current
     await restoreLastSession
-    return repositorySessions.getActiveSnapshot()
+    const live = repositorySessions.getActiveSnapshot()
+    if (live != null) return live
+    // Returning a cache JSON blob without hydrate made the renderer apply
+    // Makefile and call get-comparison with no session — Welcome + that toast.
+    const recovered = hydrateLastWorkspace()
+    if (recovered != null) startLiveRefresh(recovered.root)
+    return recovered
   })
   ipcMain.handle(IPC_CHANNELS.openFolder, async () => {
     const result = await dialog.showOpenDialog({
@@ -514,9 +626,14 @@ function registerIpcHandlers(): void {
     shell.showItemInFolder(candidate)
   })
   ipcMain.handle(IPC_CHANNELS.refresh, () => repositorySessions.requireActive().refresh().then(trackSnapshot))
-  ipcMain.handle(IPC_CHANNELS.getComparison, (_event, path: string) =>
-    repositorySessions.requireActive().getComparison(path)
-  )
+  ipcMain.handle(IPC_CHANNELS.getComparison, (_event, path: string) => {
+    const repository = repositorySessions.tryGetActive()
+    if (repository == null) {
+      const requested = typeof path === 'string' ? path : ''
+      return comparisonWithoutOpenSession(requested, workspaceCache?.fileText ?? null)
+    }
+    return repository.getComparison(path)
+  })
   ipcMain.handle(IPC_CHANNELS.saveWorkingFile, async (_event, request: unknown) => {
     const repository = repositorySessions.requireActive()
     const comparison = await repository.saveWorkingFile(request)
@@ -712,7 +829,7 @@ function applyDevelopmentDockIcon(): void {
 function rememberOpenedRoot(root: string, active = true): void {
   // A foreground open replaces the restore. A background PR resolution only
   // authorizes its checkout; it must not replace the folder restored next time.
-  if (active) restoreLastSession = null
+  if (active) restoreLastSession = Promise.resolve(null)
   const approvedRoots = sessionState.approvedRoots.includes(root)
     ? sessionState.approvedRoots
     : [...sessionState.approvedRoots, root]
@@ -722,16 +839,63 @@ function rememberOpenedRoot(root: string, active = true): void {
   void saveSessionState(userDataPath, sessionState)
 }
 
+function hydrateLastWorkspace(): RepositorySnapshot | null {
+  if (startHidden || !sessionState.restoreLastFolder) return null
+  const root = effectiveLastRoot(sessionState.lastRoot, workspaceCache?.lastRoot)
+  if (root == null) return null
+  const resolved = resolveExistingRoot(root)
+  if (resolved == null) return null
+  const current = repositorySessions.getActiveSnapshot()
+  if (current != null && rootsMatch(current.root, resolved)) return current
+
+  const diskCache = workspaceCache != null && rootsMatch(workspaceCache.lastRoot, resolved)
+    ? workspaceCache
+    : null
+  const snapshot = {
+    ...(diskCache?.snapshot ?? listRootSnapshot(resolved)),
+    root: resolved,
+    kind: detectRepositoryKind(resolved)
+  }
+  repositorySessions.hydrate(snapshot)
+  persistWorkspaceFromSnapshot(snapshot, diskCache == null
+    ? null
+    : {
+      selectedPath: diskCache.selectedPath,
+      workspaceView: diskCache.workspaceView,
+      fileText: diskCache.fileText
+    })
+  if (sessionState.lastRoot == null || !rootsMatch(sessionState.lastRoot, resolved)) {
+    const approvedRoots = sessionState.approvedRoots.includes(resolved)
+      ? sessionState.approvedRoots
+      : [...sessionState.approvedRoots, resolved]
+    sessionState = { ...sessionState, lastRoot: resolved, approvedRoots }
+    if (userDataPath !== '') void saveSessionState(userDataPath, sessionState)
+  }
+  return snapshot
+}
+
+function startLiveRefresh(root: string): void {
+  restoreLastSession = repositorySessions
+    .refreshActive()
+    .then((live) => {
+      if (live != null && live.root === repositorySessions.activeRoot) persistWorkspaceFromSnapshot(live)
+      return live
+    })
+    .catch((error) => {
+      console.warn(`Could not reopen ${root}:`, error)
+      return repositorySessions.getActiveSnapshot()
+    })
+    .finally(() => markMainStartup('restoreSettled'))
+}
+
 function beginSessionRestore(): void {
-  const root = sessionState.lastRoot
-  if (startHidden || !sessionState.restoreLastFolder || root == null || !existsSync(root)) {
+  const snapshot = hydrateLastWorkspace()
+  if (snapshot == null) {
+    restoreLastSession = Promise.resolve(null)
     markMainStartup('restoreSettled')
     return
   }
-  restoreLastSession = repositorySessions
-    .open(root)
-    .catch((error) => console.warn(`Could not reopen ${root}:`, error))
-    .finally(() => markMainStartup('restoreSettled'))
+  startLiveRefresh(snapshot.root)
 }
 
 app.whenReady().then(() => {
@@ -739,23 +903,22 @@ app.whenReady().then(() => {
   userDataPath = app.getPath('userData')
   repositorySessions.setPullRequestCacheDirectory(join(userDataPath, 'pr-cache'))
   sessionState = loadSessionState(userDataPath)
+  workspaceCache = loadWorkspaceCache(userDataPath)
   nativeTheme.themeSource = sessionState.themeType
   app.setAboutPanelOptions({ applicationName: PRODUCT_NAME })
-  applyDevelopmentDockIcon()
   const initialReviews = queuedExternalReviews.splice(0)
-  if (initialReviews.length > 0 && initialReviews.every((request) => request.intent === 'warmup')) {
-    holdWindowHidden = true
-  }
-  if (initialReviews.some((request) => request.intent === 'open')) holdWindowHidden = false
+  holdWindowHidden = shouldHoldWindowHidden(startHidden, initialReviews)
   if (startHidden || holdWindowHidden) app.dock?.hide()
-  void loadLastRendererTermination()
   registerIpcHandlers()
-  // Started before the window so the git spawns overlap the renderer boot.
-  beginSessionRestore()
-  void folderIndex.list(sessionState.approvedRoots)
+  // Half-bounce first. Hydrating 20k cached paths must not delay window.show()
+  // or the pending PR URL that Cmd+H / horus:// already queued.
   createMainWindow()
-  if (!startHidden) startClipboardWarmup()
   for (const request of initialReviews) applyExternalReview(request)
+  beginSessionRestore()
+  void loadLastRendererTermination()
+  applyDevelopmentDockIcon()
+  void folderIndex.list(sessionState.approvedRoots)
+  if (!startHidden) startClipboardWarmup()
   app.on('second-instance', (_event, argv) => {
     const request = findHorusReviewRequest(argv)
     if (request != null) {
@@ -763,7 +926,6 @@ app.whenReady().then(() => {
       return
     }
     revealMainWindow()
-    if (BrowserWindow.getAllWindows()[0] == null) createMainWindow()
   })
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
@@ -777,9 +939,17 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+let sessionFlushedOnQuit = false
+app.on('before-quit', (event) => {
   terminalService.killAll()
   // The Claude CLI and the codex app-server (with the user's MCP servers behind
   // it) are children of this process but are not killed with it.
   agentService.cancelAll()
+  if (sessionFlushedOnQuit) return
+  event.preventDefault()
+  flushPendingWorkspaceCache()
+  void Promise.all([flushSessionState(), flushWorkspaceCache()]).finally(() => {
+    sessionFlushedOnQuit = true
+    app.quit()
+  })
 })

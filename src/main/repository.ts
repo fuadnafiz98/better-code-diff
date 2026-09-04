@@ -67,6 +67,7 @@ import {
   selectOversizedDiffFiles,
   type RawPullRequestFile
 } from './patchBuilder.js'
+import { listRootSnapshot } from './workspaceListing.js'
 
 // Re-exported so the process, object-reading and patch primitives keep one import
 // site for callers and tests while living in their own modules.
@@ -286,6 +287,17 @@ const RIPGREP_EXCLUSION_ARGS = EXCLUDED_DIRECTORIES.flatMap((directory) => [
   `!${directory}/**`,
   '--glob',
   `!**/${directory}/**`
+])
+const RIPGREP_VISIBLE_FILE_ARGS = [
+  '--hidden',
+  '--no-ignore-vcs',
+  '--glob',
+  '!.git/**',
+  ...RIPGREP_EXCLUSION_ARGS
+]
+const GIT_IGNORED_EXCLUSION_PATHSPECS = EXCLUDED_DIRECTORIES.flatMap((directory) => [
+  `:(exclude,glob)${directory}/**`,
+  `:(exclude,glob)**/${directory}/**`
 ])
 
 // `file` is the materialized diff side, built once when the version is read.
@@ -530,6 +542,19 @@ function isExcludedPath(path: string): boolean {
   return separator > 0 && isExcludedDirectory(path.slice(0, separator))
 }
 
+function lastPathSegment(path: string): string {
+  const separator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return separator === -1 ? path : path.slice(separator + 1)
+}
+
+function isExcludedIgnoredPath(path: string): boolean {
+  return isExcludedPath(path) || EXCLUDED_DIRECTORY_SET.has(lastPathSegment(path))
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((path, index) => path === right[index])
+}
+
 function prepareVisiblePaths(buffer: Buffer): string[] {
   const paths: string[] = []
   for (const rawPath of splitNullDelimited(buffer)) {
@@ -540,19 +565,27 @@ function prepareVisiblePaths(buffer: Buffer): string[] {
 }
 
 // Tracked paths come from `ls-files`, untracked ones from the same status call
-// that produced the statuses. A file can appear in both when it is tracked and
-// also reported, so the set is deduplicated.
+// that produced the statuses, ignored ones from a second `ls-files` that skips
+// heavy generated directories. A file can appear in more than one list, so the
+// set is deduplicated.
 //
-// The build-output exclusion applies only to the untracked side. A repository that
-// commits its `dist/` is telling git those files matter; hiding them made them
-// unreviewable and made commit reviews disagree with their own patch, which never
-// carried the exclusion. Anything genuinely generated is already ignored, so git
-// never lists it as tracked.
-export function mergeVisiblePaths(trackedBuffer: Buffer, untrackedPaths: readonly string[]): string[] {
+// The build-output exclusion applies only to the untracked and ignored sides. A
+// repository that commits its `dist/` is telling git those files matter; hiding
+// them made them unreviewable and made commit reviews disagree with their own
+// patch, which never carried the exclusion.
+export function mergeVisiblePaths(
+  trackedBuffer: Buffer,
+  untrackedPaths: readonly string[],
+  ignoredPaths: readonly string[] = []
+): string[] {
   const seen = new Set<string>(splitNullDelimited(trackedBuffer))
   for (const rawPath of untrackedPaths) {
     const path = rawPath.replace(/^\.\//, '')
     if (!isExcludedPath(path)) seen.add(path)
+  }
+  for (const rawPath of ignoredPaths) {
+    const path = rawPath.replace(/^\.\//, '')
+    if (!isExcludedIgnoredPath(path)) seen.add(path)
   }
   return [...seen].sort(comparePaths)
 }
@@ -1102,7 +1135,12 @@ export class RepositoryService {
   #headFileCache = new Map<string, { promise: Promise<ReadVersion | null>; bytes: number }>()
   #headFileCacheBytes = 0
   #objectReader: GitObjectReader | null = null
-  #trackedPathsCache: { buffer: Buffer; untrackedPaths: string[]; paths: string[] } | null = null
+  #trackedPathsCache: {
+    buffer: Buffer
+    untrackedPaths: string[]
+    ignoredPaths: string[]
+    paths: string[]
+  } | null = null
   #folderPathsCache: { buffer: Buffer; paths: string[] } | null = null
   #workingFileCache = new Map<string, { read: WorkingFileRead; bytes: number }>()
   #workingFileCacheBytes = 0
@@ -1215,22 +1253,46 @@ export class RepositoryService {
     this.dispose()
     this.#kind = rootResult == null ? 'folder' : 'git'
     this.#root = rootResult?.stdout.toString('utf8').trim() || selectedRoot
-    return this.refresh()
+    const listing = listRootSnapshot(this.#root)
+    return this.hydrate({
+      ...listing,
+      root: this.#root,
+      kind: this.#kind
+    })
+  }
+
+  /** Paint a remembered tree without waiting on git status. */
+  hydrate(snapshot: RepositorySnapshot): RepositorySnapshot {
+    this.#kind = snapshot.kind
+    this.#root = snapshot.root
+    this.#setSnapshot(snapshot)
+    return snapshot
   }
 
   async refresh(): Promise<RepositorySnapshot> {
     const root = this.#requireRoot()
     if (this.#kind === 'folder') return this.#refreshFolder(root)
 
-    // Two spawns, not four: `status --porcelain=v2 --branch` reports the branch,
-    // the HEAD oid and the untracked set alongside the statuses, so `ls-files`
-    // only has to list what is tracked and the working tree is walked once.
-    const [trackedResult, statusResult] = await Promise.all([
+    // Three parallel spawns: `status --porcelain=v2 --branch` reports the branch,
+    // the HEAD oid and the untracked set; `ls-files --cached` lists tracked files;
+    // a second `ls-files` lists gitignored files outside heavy generated dirs.
+    const [trackedResult, statusResult, ignoredResult] = await Promise.all([
       this.#git(['ls-files', '--cached', '-z']),
-      this.#git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'])
+      this.#git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']),
+      this.#git([
+        'ls-files',
+        '--others',
+        '--ignored',
+        '--exclude-standard',
+        '-z',
+        '--',
+        '.',
+        ...GIT_IGNORED_EXCLUSION_PATHSPECS
+      ])
     ])
 
     const status = parsePorcelainV2Status(statusResult.stdout)
+    const ignoredPaths = splitNullDelimited(ignoredResult.stdout)
     const head = status.head
     const branch = status.branch || head?.slice(0, 8) || 'No commits'
     const snapshot: RepositorySnapshot = {
@@ -1239,7 +1301,7 @@ export class RepositoryService {
       kind: 'git',
       branch,
       head,
-      paths: this.#visiblePaths(trackedResult.stdout, status.untrackedPaths),
+      paths: this.#visiblePaths(trackedResult.stdout, status.untrackedPaths, ignoredPaths),
       statuses: status.statuses.filter((entry) => entry.status !== 'untracked' || !isExcludedPath(entry.path))
     }
 
@@ -1251,15 +1313,27 @@ export class RepositoryService {
   // common watcher tick. Re-splitting, re-filtering and re-sorting 100k paths for
   // that cost ~120 ms of blocked main process per tick. Cache repositories with
   // untracked files too; otherwise one draft file disabled the fast path.
-  #visiblePaths(trackedBuffer: Buffer, untrackedPaths: readonly string[]): string[] {
+  #visiblePaths(
+    trackedBuffer: Buffer,
+    untrackedPaths: readonly string[],
+    ignoredPaths: readonly string[]
+  ): string[] {
     const cached = this.#trackedPathsCache
-    if (cached != null && cached.buffer.equals(trackedBuffer)
-        && cached.untrackedPaths.length === untrackedPaths.length
-        && cached.untrackedPaths.every((path, index) => path === untrackedPaths[index])) {
+    if (
+      cached != null
+      && cached.buffer.equals(trackedBuffer)
+      && sameStringList(cached.untrackedPaths, untrackedPaths)
+      && sameStringList(cached.ignoredPaths, ignoredPaths)
+    ) {
       return cached.paths
     }
-    const paths = mergeVisiblePaths(trackedBuffer, untrackedPaths)
-    this.#trackedPathsCache = { buffer: trackedBuffer, untrackedPaths: [...untrackedPaths], paths }
+    const paths = mergeVisiblePaths(trackedBuffer, untrackedPaths, ignoredPaths)
+    this.#trackedPathsCache = {
+      buffer: trackedBuffer,
+      untrackedPaths: [...untrackedPaths],
+      ignoredPaths: [...ignoredPaths],
+      paths
+    }
     return paths
   }
 
@@ -1268,11 +1342,8 @@ export class RepositoryService {
       RIPGREP_EXECUTABLE,
       [
         '--files',
-        '--hidden',
         '--no-require-git',
-        '--glob',
-        '!.git/**',
-        ...RIPGREP_EXCLUSION_ARGS,
+        ...RIPGREP_VISIBLE_FILE_ARGS,
         '--null'
       ],
       root,
@@ -1313,12 +1384,31 @@ export class RepositoryService {
   async #loadComparison(path: string): Promise<FileComparison> {
     const root = this.#requireRoot()
     const snapshot = this.#requireSnapshot()
-    if (!this.#pathSet.has(path)) throw new Error('The selected path is not in the repository.')
+    if (!this.#pathSet.has(path)) {
+      const workingVersion = await this.#readWorkingFile(path, root)
+      if (workingVersion == null) {
+        throw new Error(`“${basename(path)}” is no longer in the folder.`)
+      }
+      return {
+        path,
+        mode: 'file',
+        status: 'unchanged',
+        oldFile: null,
+        newFile: workingVersion.binary || workingVersion.oversized ? null : workingVersion.file,
+        binary: Boolean(workingVersion.binary),
+        oversized: Boolean(workingVersion.oversized),
+        image: workingVersion.image == null ? null : { old: null, new: workingVersion.image }
+      }
+    }
 
     const status = this.#statusByPath.get(path)
     const oldPath = status?.previousPath ?? path
+    // Clean files and pre-status clicks only need the working copy. git show
+    // HEAD contended with the background status walk and made every preview wait.
     const [oldVersion, workingVersion] = await Promise.all([
-      snapshot.kind === 'git' ? this.#readHeadFile(oldPath, snapshot.head) : null,
+      snapshot.kind === 'git' && status != null
+        ? this.#readHeadFile(oldPath, snapshot.head)
+        : null,
       this.#readWorkingFile(path, root)
     ])
     const binary = Boolean(oldVersion?.binary || workingVersion?.binary)
@@ -1549,10 +1639,7 @@ export class RepositoryService {
           '--json',
           '--fixed-strings',
           '--smart-case',
-          '--hidden',
-          '--glob',
-          '!.git/**',
-          ...RIPGREP_EXCLUSION_ARGS,
+          ...RIPGREP_VISIBLE_FILE_ARGS,
           '--max-columns',
           '500',
           '--max-count',

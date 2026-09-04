@@ -25,6 +25,18 @@ export function firstTreePath(filePaths: readonly string[]): string | null {
 // so the answer is kept per input identity rather than computed twice.
 const directoryPathsByInput = new WeakMap<readonly string[], string[]>()
 
+export type TreeContentSyncMode = 'skip' | 'status' | 'reset'
+
+export function treeContentSyncMode(
+  applied: { paths: readonly string[]; statuses: unknown } | null,
+  nextPaths: readonly string[],
+  nextStatuses: unknown
+): TreeContentSyncMode {
+  if (applied?.paths === nextPaths && applied.statuses === nextStatuses) return 'skip'
+  if (applied?.paths === nextPaths) return 'status'
+  return 'reset'
+}
+
 export function getDirectoryPaths(filePaths: readonly string[]): string[] {
   const cached = directoryPathsByInput.get(filePaths)
   if (cached != null) return cached

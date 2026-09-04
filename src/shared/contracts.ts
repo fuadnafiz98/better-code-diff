@@ -1,3 +1,8 @@
+import type { SessionRestoreHint } from './sessionRestore.js'
+import type { WorkspaceCache, WorkspaceUiState } from './workspaceCache.js'
+
+export type { SessionRestoreHint, WorkspaceCache, WorkspaceUiState }
+
 export type RepositoryFileStatus =
   | 'added'
   | 'conflicted'
@@ -33,6 +38,7 @@ export interface RepositoryChangeEvent {
 export interface MainStartupMetrics {
   appReady: number | null
   windowCreated: number | null
+  windowShown: number | null
   restoreSettled: number | null
 }
 
@@ -512,6 +518,9 @@ export interface FolderPickerCatalog {
 }
 
 export interface RepositoryApi {
+  readonly restoreHint: SessionRestoreHint
+  readonly cachedWorkspace: WorkspaceCache | null
+  persistWorkspaceUi(ui: WorkspaceUiState): Promise<void>
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
   listFolderCandidates(): Promise<FolderPickerCatalog>
@@ -584,6 +593,9 @@ export interface RepositoryApi {
 }
 
 export const IPC_CHANNELS = {
+  getRestoreHint: 'repository:get-restore-hint',
+  getWorkspaceCache: 'repository:get-workspace-cache',
+  persistWorkspaceUi: 'repository:persist-workspace-ui',
   getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
   listFolderCandidates: 'repository:list-folder-candidates',

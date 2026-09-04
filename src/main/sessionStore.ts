@@ -60,3 +60,7 @@ export function saveSessionState(directory: string, state: SessionState): Promis
     })
   return pendingSave
 }
+
+export function flushSessionState(): Promise<void> {
+  return pendingSave
+}

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 
 import type { PullRequestReview } from '../shared/contracts.js'
 import { COMMAND_ABORTED_MESSAGE } from './gitCommands.js'
@@ -260,6 +260,15 @@ describe('mergeVisiblePaths', () => {
 
   it('keeps a file whose own name matches an excluded directory', () => {
     expect(mergeVisiblePaths(Buffer.alloc(0), ['dist', 'src/out'])).toEqual(['dist', 'src/out'])
+  })
+
+  it('merges gitignored files and drops ignored generated directories', () => {
+    expect(mergeVisiblePaths(Buffer.from('src/a.ts\0'), ['notes.txt'], [
+      '.env',
+      'node_modules/pkg/index.js',
+      'apps/web/node_modules',
+      'src/.env.local'
+    ])).toEqual(['.env', 'notes.txt', 'src/.env.local', 'src/a.ts'])
   })
 })
 
@@ -1063,6 +1072,7 @@ describe('RepositoryService', () => {
       await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 2\n', 'utf8')
 
       await repository.open(repositoryPath)
+      await repository.refresh()
       await repository.getComparison('value.ts')
       expect(repository.getHeadCacheStatsForTests()).toMatchObject({
         entries: 1,
@@ -1110,6 +1120,7 @@ describe('RepositoryService', () => {
       await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 2\n', 'utf8')
       await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 2\n', 'utf8')
       await repository.open(repositoryPath)
+      await repository.refresh()
 
       process.env.GIT_TRACE2_EVENT = tracePath
       const [first, second] = await Promise.all([
@@ -1175,13 +1186,37 @@ describe('RepositoryService', () => {
     }
   })
 
+  it('opens a folder from a shallow listing without waiting on git status', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-open-instant-'))
+    const repository = new RepositoryService()
+    const refresh = spyOn(repository, 'refresh')
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'readme.md'), 'hello\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'readme.md'), 'hello\nworld\n', 'utf8')
+
+      const snapshot = await repository.open(repositoryPath)
+
+      expect(refresh).not.toHaveBeenCalled()
+      expect(snapshot.kind).toBe('git')
+      expect(snapshot.paths).toContain('readme.md')
+      expect(snapshot.statuses).toEqual([])
+    } finally {
+      refresh.mockRestore()
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
   it('loads status, file comparisons, and ripgrep content results', async () => {
     const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-test-'))
 
     try {
       await runGit(repositoryPath, 'init', '--quiet')
       await writeFile(join(repositoryPath, 'tracked.txt'), 'original value\n', 'utf8')
-      await runGit(repositoryPath, 'add', 'tracked.txt')
+      await writeFile(join(repositoryPath, '.gitignore'), '.env\nnode_modules\n', 'utf8')
+      await runGit(repositoryPath, 'add', 'tracked.txt', '.gitignore')
       await runGit(
         repositoryPath,
         '-c',
@@ -1195,23 +1230,30 @@ describe('RepositoryService', () => {
       )
       await writeFile(join(repositoryPath, 'tracked.txt'), 'updated searchable value\n', 'utf8')
       await writeFile(join(repositoryPath, 'untracked.txt'), 'another searchable value\n', 'utf8')
+      await writeFile(join(repositoryPath, '.env'), 'SECRET=searchable-ignored\n', 'utf8')
+      await mkdir(join(repositoryPath, 'node_modules', 'pkg'), { recursive: true })
+      await writeFile(join(repositoryPath, 'node_modules', 'pkg', 'index.js'), 'ignored searchable\n', 'utf8')
       await mkdir(join(repositoryPath, '.next'))
       await writeFile(join(repositoryPath, '.next', 'generated.js'), 'generated searchable value\n', 'utf8')
 
       const repository = new RepositoryService()
       const snapshot = await repository.open(repositoryPath)
+      expect(snapshot.kind).toBe('git')
+      expect(snapshot.paths).toContain('tracked.txt')
+      expect(snapshot.paths).toContain('untracked.txt')
+      expect(snapshot.statuses).toEqual([])
+
       const refreshed = await repository.refresh()
       const comparison = await repository.getComparison('tracked.txt')
       const workingTreePatch = await repository.getWorkingTreePatch(['tracked.txt', 'untracked.txt'])
       const searchResults = await repository.searchContent('searchable')
 
-      expect(snapshot.kind).toBe('git')
-      expect(snapshot.paths).toEqual(['tracked.txt', 'untracked.txt'])
-      expect(refreshed.paths).toBe(snapshot.paths)
-      expect(snapshot.statuses).toEqual([
+      expect(refreshed.paths).toEqual(['.env', '.gitignore', 'tracked.txt', 'untracked.txt'])
+      expect(refreshed.statuses).toEqual([
         { path: 'tracked.txt', status: 'modified' },
         { path: 'untracked.txt', status: 'untracked' }
       ])
+      expect(snapshot.paths).not.toContain('node_modules/pkg/index.js')
       expect(comparison.oldFile?.contents).toBe('original value\n')
       expect(comparison.newFile?.contents).toBe('updated searchable value\n')
       expect(comparison.mode).toBe('diff')
@@ -1220,6 +1262,7 @@ describe('RepositoryService', () => {
       expect(workingTreePatch.omittedFiles).toEqual([])
       expect(workingTreePatch.patch).toContain(createNewFilePatch('untracked.txt', 'another searchable value\n'))
       expect(searchResults.map((result) => result.path).sort()).toEqual([
+        '.env',
         'tracked.txt',
         'untracked.txt'
       ])
@@ -1240,7 +1283,9 @@ describe('RepositoryService', () => {
       await commitIndex(repositoryPath, 'Add gitlink')
 
       const snapshot = await repository.open(repositoryPath)
-      expect(snapshot.paths).toContain('sub')
+      expect(snapshot.kind).toBe('git')
+      const refreshed = await repository.refresh()
+      expect(refreshed.paths).toContain('sub')
       const comparison = await repository.getComparison('sub')
       expect(comparison.oldFile).toBeNull()
       expect(comparison.newFile).toBeNull()
@@ -1265,6 +1310,13 @@ describe('RepositoryService', () => {
       expect(comparison.mode).toBe('file')
       expect(comparison.status).toBe('unchanged')
       expect(comparison.newFile?.contents).toBe('clean repository\n')
+
+      await repository.refresh()
+      const beforeSpawns = repository.getHeadCacheStatsForTests().objectReaderSpawns
+      const afterRefresh = await repository.getComparison('README.md')
+      expect(afterRefresh.mode).toBe('file')
+      expect(afterRefresh.newFile?.contents).toBe('clean repository\n')
+      expect(repository.getHeadCacheStatsForTests().objectReaderSpawns).toBe(beforeSpawns)
     } finally {
       repository.dispose()
       await rm(repositoryPath, { recursive: true, force: true })
@@ -1308,7 +1360,9 @@ describe('RepositoryService', () => {
       const head = (await runGitAllowingDifferences(repositoryPath, 'rev-parse', 'HEAD')).trim()
 
       const snapshot = await repository.open(repositoryPath)
-      expect(snapshot.paths).toContain('dist/app.js')
+      expect(snapshot.kind).toBe('git')
+      const refreshed = await repository.refresh()
+      expect(refreshed.paths).toContain('dist/app.js')
       const review = await repository.getCommitReview(head)
       expect(review.files.map((file) => file.path)).toEqual(['dist/app.js'])
       expect(review.patch).toContain('dist/app.js')
@@ -1328,13 +1382,17 @@ describe('RepositoryService', () => {
       await commitAll(repositoryPath, 'Initial commit')
 
       await repository.open(repositoryPath)
+      await repository.refresh()
       const before = await repository.getComparison('stable.ts')
+      expect(before.mode).toBe('file')
+      expect(before.oldFile).toBeNull()
 
       await writeFile(join(repositoryPath, 'other.ts'), 'export const other = 2\n', 'utf8')
       await commitAll(repositoryPath, 'Touch an unrelated file')
       await repository.refresh()
       const afterCommit = await repository.getComparison('stable.ts')
-      expect(afterCommit.oldFile?.cacheKey).toBe(before.oldFile?.cacheKey ?? '')
+      expect(afterCommit.oldFile).toBeNull()
+      expect(afterCommit.newFile?.cacheKey).toBe(before.newFile?.cacheKey ?? '')
 
       // A formatter that rewrites identical bytes must not invalidate a draft.
       await writeFile(join(repositoryPath, 'stable.ts'), 'export const value = 1\n', 'utf8')
@@ -1358,6 +1416,7 @@ describe('RepositoryService', () => {
       await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 2\n', 'utf8')
 
       await repository.open(repositoryPath)
+      await repository.refresh()
       repository.setSelfWriteObserver((path) => selfWrites.push(path))
       const before = repository.getSessionSnapshot()
       const comparison = await repository.getComparison('value.ts')
@@ -1389,7 +1448,8 @@ describe('RepositoryService', () => {
       await commitAll(repositoryPath, 'Initial commit')
       await writeFile(join(repositoryPath, 'b.ts'), 'export const b = 2\n', 'utf8')
 
-      const snapshot = await repository.open(repositoryPath)
+      await repository.open(repositoryPath)
+      const snapshot = await repository.refresh()
       expect(snapshot.statuses).toEqual([{ path: 'b.ts', status: 'modified' }])
       const comparison = await repository.getComparison('a.ts')
       await repository.saveWorkingFile({
@@ -1459,6 +1519,7 @@ describe('RepositoryService', () => {
 
       const repository = new RepositoryService()
       await repository.open(repositoryPath)
+      await repository.refresh()
       const workingTreePatch = await repository.getWorkingTreePatch(['generated.txt', 'huge.txt', 'new.txt'])
       const gitNewFilePatch = await runGitAllowingDifferences(
         repositoryPath,
@@ -1489,24 +1550,30 @@ describe('RepositoryService', () => {
       await mkdir(join(folderPath, 'dist'))
       await writeFile(join(folderPath, 'README.md'), 'ordinary folder\n', 'utf8')
       await writeFile(join(folderPath, 'src', 'value.ts'), 'export const searchable = true\n', 'utf8')
+      await writeFile(join(folderPath, '.gitignore'), '.env\n', 'utf8')
+      await writeFile(join(folderPath, '.env'), 'SECRET=searchable-ignored\n', 'utf8')
       await writeFile(join(folderPath, 'node_modules', 'dependency.js'), 'dependency searchable\n', 'utf8')
       await writeFile(join(folderPath, 'dist', 'bundle.js'), 'bundle searchable\n', 'utf8')
 
       const repository = new RepositoryService()
       const snapshot = await repository.open(folderPath)
+      expect(snapshot.kind).toBe('folder')
+      expect(snapshot.branch).toBeNull()
+      expect(snapshot.paths).toContain('README.md')
+      expect(snapshot.paths).toContain('src/value.ts')
+      expect(snapshot.paths).not.toContain('.env')
+      expect(snapshot.statuses).toEqual([])
+
       const refreshed = await repository.refresh()
       const comparison = await repository.getComparison('src/value.ts')
       const searchResults = await repository.searchContent('searchable')
 
-      expect(snapshot.kind).toBe('folder')
-      expect(snapshot.branch).toBeNull()
-      expect(snapshot.paths).toEqual(['README.md', 'src/value.ts'])
-      expect(refreshed.paths).toBe(snapshot.paths)
-      expect(snapshot.statuses).toEqual([])
+      expect(refreshed.paths).toEqual(['.env', '.gitignore', 'README.md', 'src/value.ts'])
+      expect(refreshed.statuses).toEqual([])
       expect(comparison.mode).toBe('file')
       expect(comparison.oldFile).toBeNull()
       expect(comparison.newFile?.contents).toBe('export const searchable = true\n')
-      expect(searchResults).toMatchObject([{ path: 'src/value.ts', line: 1 }])
+      expect(searchResults.map((result) => result.path).sort()).toEqual(['.env', 'src/value.ts'])
 
       repository.resetContentSearchMetricsForTests()
       const interrupted = repository.searchContent('searchable')
@@ -1910,5 +1977,54 @@ describe('parsePullRequestInboxResponse', () => {
     }))
     expect(sections.find((section) => section.key === 'review-requested')?.pullRequests).toHaveLength(1)
     expect(sections.find((section) => section.key === 'assigned')?.pullRequests).toHaveLength(0)
+  })
+})
+
+describe('RepositoryService.hydrate', () => {
+  it('opens a cached file from disk without waiting on git', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'horus-hydrate-')))
+    const repository = new RepositoryService()
+    try {
+      await writeFile(join(root, 'readme.md'), 'hello from cache\n', 'utf8')
+      const snapshot = {
+        root,
+        name: 'cached',
+        kind: 'folder' as const,
+        branch: null,
+        head: null,
+        paths: ['readme.md'],
+        statuses: []
+      }
+      expect(repository.hydrate(snapshot)).toEqual(snapshot)
+      expect(repository.getSessionSnapshot()).toEqual(snapshot)
+      const comparison = await repository.getComparison('readme.md')
+      expect(comparison.newFile?.contents).toBe('hello from cache\n')
+      expect(comparison.mode).toBe('file')
+    } finally {
+      repository.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('opens a vanished cached path as an empty file and names a path that was never listed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'horus-hydrate-missing-'))
+    const repository = new RepositoryService()
+    try {
+      repository.hydrate({
+        root,
+        name: 'cached',
+        kind: 'folder',
+        branch: null,
+        head: null,
+        paths: ['gone.ts'],
+        statuses: []
+      })
+      const vanished = await repository.getComparison('gone.ts')
+      expect(vanished.newFile).toBeNull()
+      await expect(repository.getComparison('never.ts')).rejects.toThrow('never.ts')
+    } finally {
+      repository.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

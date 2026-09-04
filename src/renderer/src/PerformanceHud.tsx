@@ -229,6 +229,7 @@ export const PerformanceHud = memo(function PerformanceHud(): React.JSX.Element 
                     <dl>
                       <div><dt>App ready</dt><dd>{formatStartupTiming(detail?.mainStartup.appReady)}</dd></div>
                       <div><dt>Window created</dt><dd>{formatStartupTiming(detail?.mainStartup.windowCreated)}</dd></div>
+                      <div><dt>Window shown</dt><dd>{formatStartupTiming(detail?.mainStartup.windowShown)}</dd></div>
                       <div><dt>Restore settled</dt><dd>{formatStartupTiming(detail?.mainStartup.restoreSettled)}</dd></div>
                     </dl>
                   </section>

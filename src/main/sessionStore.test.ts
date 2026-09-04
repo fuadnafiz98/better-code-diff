@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { DEFAULT_SESSION_STATE, loadSessionState, parseSessionState, saveSessionState } from './sessionStore.js'
+import { DEFAULT_SESSION_STATE, flushSessionState, loadSessionState, parseSessionState, saveSessionState } from './sessionStore.js'
 
 describe('parseSessionState', () => {
   it('reads a complete record', () => {
@@ -70,6 +70,22 @@ describe('loadSessionState', () => {
         restoreLastFolder: false,
         themeType: 'light'
       })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('flushes the in-flight write before quit', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'horus-session-flush-'))
+    try {
+      void saveSessionState(directory, {
+        lastRoot: '/work/quit',
+        approvedRoots: ['/work/quit'],
+        restoreLastFolder: true,
+        themeType: 'dark'
+      })
+      await flushSessionState()
+      expect(loadSessionState(directory).lastRoot).toBe('/work/quit')
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

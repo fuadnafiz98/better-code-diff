@@ -1,6 +1,30 @@
 import { describe, expect, it } from 'bun:test'
 
-import { firstTreePath, getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
+import {
+  firstTreePath,
+  getDirectoryPaths,
+  getTreeFollowBehavior,
+  orderPathsForTree,
+  treeContentSyncMode
+} from './treeExpansion'
+
+describe('treeContentSyncMode', () => {
+  const paths = ['src/a.ts', 'src/b.ts']
+  const statuses = [{ path: 'src/a.ts', status: 'modified' }]
+
+  it('skips work when the tree already has this content', () => {
+    expect(treeContentSyncMode({ paths, statuses }, paths, statuses)).toBe('skip')
+  })
+
+  it('updates decorations without resetting when only statuses change', () => {
+    const nextStatuses = [{ path: 'src/a.ts', status: 'added' }]
+    expect(treeContentSyncMode({ paths, statuses }, paths, nextStatuses)).toBe('status')
+  })
+
+  it('resets when the path list itself changes', () => {
+    expect(treeContentSyncMode({ paths, statuses }, [...paths, 'src/c.ts'], statuses)).toBe('reset')
+  })
+})
 
 describe('getTreeFollowBehavior', () => {
   it('centers the active file instantly when the review scroll drives the tree', () => {

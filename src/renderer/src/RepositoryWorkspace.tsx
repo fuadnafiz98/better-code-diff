@@ -22,7 +22,7 @@ import { useReviewLoadState, type ReviewLoadState } from './useReviewLoadState'
 import { useViewerSuspension } from './useViewerSuspension'
 import { formatKeybinding, type ReviewCommand } from './keybindings'
 import { useReviewShortcuts } from './useReviewShortcuts'
-import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree } from './treeExpansion'
+import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree, treeContentSyncMode } from './treeExpansion'
 import { FindBar } from './FindBar'
 import { WorkspaceCodeSkeleton } from './WorkspaceSkeleton'
 import { markRepositoryWorkspaceRender } from './reviewMetrics'
@@ -31,6 +31,7 @@ import { useFileEditing } from './useFileEditing'
 import { EditorStatusBar } from './editor/EditorStatusBar'
 import { useViewerContext } from './editor/ViewerProviders'
 import { reviewPathsForSnapshot, workspaceViewForTreePath } from './workspaceMode'
+import { copyWorkingFileContents } from './copyFilePath'
 import { getErrorMessage } from './repositoryApi'
 import {
   getLoadedDiffSurface,
@@ -456,7 +457,8 @@ function positionPortaledTreeMenu(
 function createTreeContextMenu(
   root: string,
   item: { path: string },
-  context: { close: () => void; anchorRect: { top: number; right: number; bottom: number; left: number } }
+  context: { close: () => void; anchorRect: { top: number; right: number; bottom: number; left: number } },
+  isFile: boolean
 ): HTMLElement {
   const menu = document.createElement('div')
   menu.dataset.horusTreeMenu = ''
@@ -476,6 +478,7 @@ function createTreeContextMenu(
   addAction('Copy relative path', () => void navigator.clipboard.writeText(item.path))
   const absolutePath = `${root.replace(/[/\\]$/, '')}/${item.path}`
   addAction('Copy absolute path', () => void navigator.clipboard.writeText(absolutePath))
+  if (isFile) addAction('Copy contents', () => void copyWorkingFileContents(item.path))
   addAction('Reveal in Finder', () => void window.repository?.revealPath(item.path))
 
   document.querySelector('[data-horus-tree-menu]')?.remove()
@@ -504,12 +507,19 @@ function useTreeContentSync(
   } | null>(null)
 
   useLayoutEffect(() => {
-    // Resetting the model collapses every directory, so identical content must not reset it.
     const applied = appliedTreeContentRef.current
-    if (applied?.paths === treePaths && applied.statuses === treeStatuses) return
+    const mode = treeContentSyncMode(applied, treePaths, treeStatuses)
+    if (mode === 'skip') return
     appliedTreeContentRef.current = { paths: treePaths, statuses: treeStatuses }
-    model.resetPaths(treePaths)
+    if (mode === 'reset') model.resetPaths(treePaths)
     model.setGitStatus(treeStatuses)
+    if (mode === 'status') {
+      for (const directoryPath of changedDirectoryPaths) {
+        const item = model.getItem(directoryPath)
+        if (item != null && 'expand' in item) item.expand()
+      }
+      return
+    }
     if (isGitRepository) {
       for (const directoryPath of [...directoryPaths].reverse()) {
         const item = model.getItem(directoryPath)
@@ -1183,7 +1193,9 @@ function useRepositoryExplorer({
         enabled: true,
         triggerMode: 'both',
         buttonVisibility: 'when-needed',
-        render: (item, context) => createTreeContextMenu(snapshot.root, item, context),
+        render: (item, context) => createTreeContextMenu(
+          snapshot.root, item, context, pathSet.has(item.path)
+        ),
         onClose: () => {
           document.querySelector('[data-horus-tree-menu]')?.remove()
         }

@@ -5,6 +5,7 @@ import type {
   RepositoryReview,
   RepositorySnapshot
 } from '../../shared/contracts'
+import { isPrematureSessionError } from '../../shared/sessionRestore'
 import { createComparisonCache } from './comparisonCache'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import type { WorkspaceView } from './AppView'
@@ -15,6 +16,9 @@ export interface ComparisonLoaderOptions {
   workspaceView: WorkspaceView
   /** Supplies the reading order the prefetch follows. */
   repositoryReview: RepositoryReview | null
+  initialComparison?: FileComparison | null
+  /** False until hydrate or open() has a live session. Cache paint alone is not enough. */
+  sessionReady?: boolean
   onError(message: string | null): void
 }
 
@@ -40,14 +44,24 @@ export function useComparisonLoader({
   selectedPath,
   workspaceView,
   repositoryReview,
+  initialComparison = null,
+  sessionReady = true,
   onError
 }: ComparisonLoaderOptions): ComparisonLoader {
-  const [comparison, setComparison] = useState<FileComparison | null>(null)
+  const [comparison, setComparison] = useState<FileComparison | null>(() =>
+    initialComparison?.path === selectedPath ? initialComparison : null
+  )
   const [loading, setLoading] = useState(false)
   const [revision, setRevision] = useState(0)
   const requestRef = useRef(0)
-  const lastPathRef = useRef<string | null>(null)
-  const [cache] = useState(createComparisonCache)
+  const lastPathRef = useRef<string | null>(
+    initialComparison?.path === selectedPath ? selectedPath : null
+  )
+  const [cache] = useState(() => {
+    const next = createComparisonCache()
+    if (initialComparison != null) next.set(initialComparison)
+    return next
+  })
 
   const save = useCallback((nextComparison: FileComparison) => {
     cache.set(nextComparison)
@@ -63,8 +77,12 @@ export function useComparisonLoader({
   const repositoryIdentity = snapshot == null
     ? null
     : `${snapshot.root}\0${snapshot.head ?? ''}\0${snapshot.branch ?? ''}`
+  const repositoryIdentityRef = useRef(repositoryIdentity)
+  const canFetchComparison = snapshot != null && sessionReady
 
   useEffect(() => {
+    if (repositoryIdentityRef.current === repositoryIdentity) return
+    repositoryIdentityRef.current = repositoryIdentity
     cache.clear()
   }, [cache, repositoryIdentity])
 
@@ -93,6 +111,12 @@ export function useComparisonLoader({
       onError(null)
       return
     }
+    // Cache paint can set Makefile before hydrate/open. Invoking then throws
+    // "Open a repository before using this action" and becomes a Welcome toast.
+    if (!canFetchComparison) {
+      setLoading(false)
+      return
+    }
     if (pathChanged) setLoading(true)
     onError(null)
     void requireRepositoryApi()
@@ -102,20 +126,23 @@ export function useComparisonLoader({
         if (requestRef.current === requestId) setComparison(nextComparison)
       })
       .catch((comparisonError: unknown) => {
-        if (requestRef.current === requestId) onError(getErrorMessage(comparisonError))
+        if (requestRef.current !== requestId) return
+        if (isPrematureSessionError(comparisonError)) return
+        onError(getErrorMessage(comparisonError))
       })
       .finally(() => {
         if (requestRef.current === requestId) setLoading(false)
       })
-  }, [cache, onError, revision, selectedPath, workspaceView])
+  }, [cache, canFetchComparison, onError, revision, selectedPath, workspaceView])
 
   // The next file in the review is the one a reader asks for next, so it is fetched
   // while the main thread is idle rather than on the click.
   const prefetchNeighbours = useEffectEvent((path: string): void => {
+    if (snapshot == null || !sessionReady) return
     const reviewFiles = repositoryReview?.files
     const neighbourPaths = reviewFiles != null
       ? reviewFiles.map((file) => file.path)
-      : snapshot?.kind === 'git' ? snapshot.statuses.map((status) => status.path) : null
+      : snapshot.kind === 'git' ? snapshot.statuses.map((status) => status.path) : null
     const index = neighbourPaths?.indexOf(path) ?? -1
     if (neighbourPaths == null || index < 0) return
     for (const neighbour of [neighbourPaths[index + 1], neighbourPaths[index - 1]]) {
@@ -130,10 +157,10 @@ export function useComparisonLoader({
   })
 
   useEffect(() => {
-    if (selectedPath == null || workspaceView !== 'file') return
+    if (selectedPath == null || workspaceView !== 'file' || !canFetchComparison) return
     const handle = window.requestIdleCallback(() => prefetchNeighbours(selectedPath))
     return () => window.cancelIdleCallback(handle)
-  }, [selectedPath, workspaceView])
+  }, [canFetchComparison, selectedPath, workspaceView])
 
   return { comparison, loading, save, invalidate, markRevision: setRevision }
 }

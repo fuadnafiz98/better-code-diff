@@ -36,20 +36,25 @@ export function useRepositorySearch(
   const deferredQuery = useDeferredValue(query)
   const hasSnapshot = snapshot != null
   const snapshotPaths = snapshot?.paths
+  const snapshotKind = snapshot?.kind
+  const snapshotStatuses = snapshotKind === 'git' ? snapshot?.statuses : undefined
   const searching = deferredQuery.trim() !== ''
   const indexedPaths = useMemo(
-    () => searching ? createFileSearchIndex(snapshotPaths ?? []) : [],
-    [searching, snapshotPaths]
+    () => createFileSearchIndex(snapshotPaths ?? []),
+    [snapshotPaths]
   )
   const priorityPaths = useMemo(() => {
-    if (snapshot == null) return undefined
-    const reviewPaths = reviewPathsForSnapshot(snapshot, repositoryReview)
+    if (snapshotKind == null) return undefined
+    const reviewPaths = reviewPathsForSnapshot(
+      { kind: snapshotKind, statuses: snapshotStatuses ?? [] },
+      repositoryReview
+    )
     return reviewPaths.length === 0 ? undefined : new Set(reviewPaths)
-  }, [repositoryReview, snapshot])
+  }, [repositoryReview, snapshotKind, snapshotStatuses])
   const fileResults = useMemo(() => {
-    if (snapshot == null || !searching) return []
+    if (!hasSnapshot || !searching) return []
     return rankFilePaths(indexedPaths, deferredQuery, FILE_SEARCH_RESULT_LIMIT, priorityPaths)
-  }, [deferredQuery, indexedPaths, priorityPaths, searching, snapshot])
+  }, [deferredQuery, hasSnapshot, indexedPaths, priorityPaths, searching])
 
   const changeQuery = useCallback((nextQuery: string) => {
     setQuery(nextQuery)

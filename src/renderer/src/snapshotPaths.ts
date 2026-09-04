@@ -27,3 +27,56 @@ export function samePathList(left: readonly string[], right: readonly string[]):
   }
   return true
 }
+
+export function sameStatusList(
+  left: readonly { path: string; status: string; previousPath?: string }[],
+  right: readonly { path: string; status: string; previousPath?: string }[]
+): boolean {
+  if (left === right) return true
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index += 1) {
+    const previous = left[index]!
+    const next = right[index]!
+    if (
+      previous.path !== next.path
+      || previous.status !== next.status
+      || previous.previousPath !== next.previousPath
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+export function retainSnapshotIdentity<T extends {
+  root: string
+  paths: readonly string[]
+  statuses: readonly { path: string; status: string; previousPath?: string }[]
+}>(previous: T | null | undefined, next: T): T {
+  if (previous == null || previous.root !== next.root) return next
+  const paths = samePathList(previous.paths, next.paths) ? previous.paths : next.paths
+  const statuses = sameStatusList(previous.statuses, next.statuses)
+    ? previous.statuses
+    : next.statuses
+  if (paths === next.paths && statuses === next.statuses) return next
+  return { ...next, paths, statuses }
+}
+
+export function snapshotLooksUnchanged<T extends {
+  root: string
+  name: string
+  kind: string
+  branch: string | null
+  head: string | null
+  paths: readonly string[]
+  statuses: readonly unknown[]
+}>(previous: T | null | undefined, next: T): boolean {
+  return previous != null
+    && previous.root === next.root
+    && previous.name === next.name
+    && previous.kind === next.kind
+    && previous.branch === next.branch
+    && previous.head === next.head
+    && previous.paths === next.paths
+    && previous.statuses === next.statuses
+}

@@ -139,6 +139,18 @@ export function createNewWorld(): NewWorld {
   }
 }
 
+export function newWorldHoldsReview(world: ReviewWorld | null | undefined): boolean {
+  return world?.source === 'new' && (world.pending || world.locator.trim() !== '')
+}
+
+export function initialWorldRegistry(snapshot: RepositorySnapshot | null): WorldRegistryState {
+  if (snapshot != null) {
+    return reduceWorldRegistry({ worlds: [], activeWorldId: null }, { type: 'open-desk', snapshot })
+  }
+  const world = createNewWorld()
+  return { worlds: [world], activeWorldId: world.worldId }
+}
+
 function workingTreeWorld(snapshot: RepositorySnapshot, previous?: DeskWorld): DeskWorld {
   return {
     source: 'desk',
@@ -360,7 +372,16 @@ export function reduceWorldRegistry(
   if (action.type === 'open-desk') {
     const worldId = `desk:${action.snapshot.root}`
     const existing = state.worlds.find((world): world is DeskWorld => world.worldId === worldId && world.source === 'desk')
-    return insertContentWorld(state, workingTreeWorld(action.snapshot, existing))
+    const desk = workingTreeWorld(action.snapshot, existing)
+    const active = state.worlds.find((world) => world.worldId === state.activeWorldId)
+    if (newWorldHoldsReview(active)) {
+      if (existing != null) {
+        const worlds = state.worlds.map((world) => world.worldId === worldId ? desk : world)
+        return { worlds, activeWorldId: state.activeWorldId }
+      }
+      return { worlds: [desk, ...state.worlds], activeWorldId: state.activeWorldId }
+    }
+    return insertContentWorld(state, desk)
   }
   if (action.type === 'sync-repository') {
     let changed = false
@@ -493,10 +514,7 @@ export function useReviewWorlds({
   onSelectPath,
   onWorkspaceViewChange
 }: UseReviewWorldsOptions) {
-  const [state, setState] = useState<WorldRegistryState>(() => {
-    const world = createNewWorld()
-    return { worlds: [world], activeWorldId: world.worldId }
-  })
+  const [state, setState] = useState<WorldRegistryState>(() => initialWorldRegistry(snapshot))
   const stateRef = useRef(state)
   const navigationRef = useRef(new Map<string, WorldNavigation>())
   const selectedPathRef = useRef(selectedPath)
@@ -510,15 +528,14 @@ export function useReviewWorlds({
   }, [selectedPath, state, workspaceView])
 
   const dispatch = useCallback((action: WorldRegistryAction) => {
-    setState((current) => {
-      const next = reduceWorldRegistry(current, action)
-      const bounded = actionMayChangeInactivePatchBudget(action.type)
-        ? boundInactivePatchPayloads(next, MAX_INACTIVE_PATCH_BYTES, (worldId) =>
-          worldViewCache.graphBytes(worldId))
-        : next
-      worldViewCache.sync(bounded)
-      return bounded
-    })
+    const next = reduceWorldRegistry(stateRef.current, action)
+    const bounded = actionMayChangeInactivePatchBudget(action.type)
+      ? boundInactivePatchPayloads(next, MAX_INACTIVE_PATCH_BYTES, (worldId) =>
+        worldViewCache.graphBytes(worldId))
+      : next
+    worldViewCache.sync(bounded)
+    stateRef.current = bounded
+    setState(bounded)
   }, [])
 
   useEffect(() => {
@@ -611,18 +628,17 @@ export function useReviewWorlds({
     return world.worldId
   }, [dispatch, onActivateSnapshot, restoreNavigation, saveActiveNavigation])
 
-  const updateNewWorldLocator = useCallback((locator: string) => {
-    const worldId = stateRef.current.activeWorldId
-    if (worldId != null) dispatch({ type: 'update-locator', worldId, locator })
+  const updateNewWorldLocator = useCallback((locator: string, worldId?: string) => {
+    const targetWorldId = worldId ?? stateRef.current.activeWorldId
+    if (targetWorldId != null) dispatch({ type: 'update-locator', worldId: targetWorldId, locator })
   }, [dispatch])
 
   const setNewWorldPending = useCallback((pending: boolean, pullRequestUrl = '', worldId?: string) => {
     const targetWorldId = worldId ?? stateRef.current.activeWorldId
-    const world = stateRef.current.worlds.find((candidate) => candidate.worldId === targetWorldId)
-    if (world?.source !== 'new') return
+    if (targetWorldId == null) return
     const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i.exec(pullRequestUrl.trim())
     const label = pending && match != null ? `#${match[2]} · ${match[1]}` : 'New tab'
-    dispatch({ type: 'set-new-pending', worldId: world.worldId, pending, label })
+    dispatch({ type: 'set-new-pending', worldId: targetWorldId, pending, label })
   }, [dispatch])
 
   const isWorldActive = useCallback((worldId: string | null | undefined) =>
@@ -646,8 +662,10 @@ export function useReviewWorlds({
       })
     }
     dispatch({ type: 'open-desk', snapshot: nextSnapshot })
-    onActivateSnapshot(nextSnapshot)
-    restoreNavigation(worldId)
+    if (stateRef.current.activeWorldId === worldId) {
+      onActivateSnapshot(nextSnapshot)
+      restoreNavigation(worldId)
+    }
     return worldId
   }, [dispatch, onActivateSnapshot, restoreNavigation, saveActiveNavigation])
 

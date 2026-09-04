@@ -8,6 +8,8 @@ import {
   createPatchWorld,
   createSinceWorld,
   findCollisionPaths,
+  initialWorldRegistry,
+  newWorldHoldsReview,
   reduceWorldRegistry,
   reviewPayloadBytes,
   worldHasActiveRepositorySession
@@ -358,4 +360,45 @@ test('local branch-compare and loading GitHub worlds stay outside the budget', (
   expect(state.worlds[0]).toBe(local)
   expect(state.worlds[1]).toBe(loading)
   expect(state.worlds[2]).toBe(active)
+})
+
+test('a cached snapshot starts on the desk world, not a New tab', () => {
+  const restored = snapshot()
+  const state = initialWorldRegistry(restored)
+  expect(state.worlds).toHaveLength(1)
+  expect(state.worlds[0]).toMatchObject({
+    source: 'desk',
+    worldId: 'desk:/repo',
+    label: 'repo',
+    root: '/repo'
+  })
+  expect(state.activeWorldId).toBe('desk:/repo')
+})
+
+test('no cache still starts on a New tab', () => {
+  const state = initialWorldRegistry(null)
+  expect(state.worlds).toHaveLength(1)
+  expect(state.worlds[0]?.source).toBe('new')
+})
+
+test('open-desk does not replace a pending pull-request New tab', () => {
+  const pending = { ...createNewWorld(), pending: true, label: '#9 · acme/app' }
+  const state = { worlds: [pending], activeWorldId: pending.worldId }
+  const next = reduceWorldRegistry(state, { type: 'open-desk', snapshot: snapshot() })
+
+  expect(newWorldHoldsReview(pending)).toBe(true)
+  expect(next.activeWorldId).toBe(pending.worldId)
+  expect(next.worlds.map((world) => world.source)).toEqual(['desk', 'new'])
+  expect(next.worlds[1]).toEqual(pending)
+})
+
+test('open-desk still replaces an empty Welcome New tab', () => {
+  const empty = createNewWorld()
+  const state = { worlds: [empty], activeWorldId: empty.worldId }
+  const next = reduceWorldRegistry(state, { type: 'open-desk', snapshot: snapshot() })
+
+  expect(newWorldHoldsReview(empty)).toBe(false)
+  expect(next.worlds).toHaveLength(1)
+  expect(next.worlds[0]?.source).toBe('desk')
+  expect(next.activeWorldId).toBe('desk:/repo')
 })

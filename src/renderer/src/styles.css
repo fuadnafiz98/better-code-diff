@@ -737,6 +737,9 @@ kbd { border: 1px solid var(--border-strong); border-radius: var(--corner-compac
 .workspace-opening-canvas { flex: 1; min-height: 0; background: var(--canvas); }
 .workspace.sidebar-hidden { grid-template-columns: 0 0 minmax(0, 1fr); }
 .sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--panel-subtle); }
+.cached-workspace-tree { margin: 0; padding: 8px 12px; list-style: none; overflow: auto; font: var(--font-ui); font-size: 12px; }
+.cached-workspace-tree button { display: block; width: 100%; padding: 3px 0; border: 0; background: transparent; color: var(--text); text-align: start; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.cached-workspace-tree button[aria-current="true"] { color: var(--accent); }
 .workspace.sidebar-hidden .sidebar { pointer-events: none; visibility: hidden; }
 /* The collapse itself is a single cut (Cmd+B is a 100+/day toggle), so the
    handle must not advertise a transition the layout does not perform. */

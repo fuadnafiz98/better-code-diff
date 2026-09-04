@@ -449,7 +449,10 @@ export function useGitWorkflow({
     selectInitialPath, setPatchExpectedFileCount, setPatchLoadStatus, snapshot])
 
   const openPullRequestFromLocator = useCallback(async (pullRequestUrl: string): Promise<boolean> => {
-    const originWorldId = activeReviewWorld?.worldId
+    const originWorldId = activeReviewWorld?.source === 'new'
+      ? activeReviewWorld.worldId
+      : openNewWorld()
+    updateNewWorldLocator(pullRequestUrl, originWorldId)
     setNewWorldPending(true, pullRequestUrl, originWorldId)
     setActionKey('resolve:pull-request')
     onError(null)
@@ -465,7 +468,7 @@ export function useGitWorkflow({
       if (isWorldActive(originWorldId)) {
         await requireRepositoryApi().activateRepository(repositorySnapshot.root)
       }
-      await openPullRequestReview(pullRequestUrl, repositorySnapshot, originWorldId ?? null)
+      await openPullRequestReview(pullRequestUrl, repositorySnapshot, originWorldId)
       return true
     } catch (error) {
       onError(getErrorMessage(error))
@@ -475,7 +478,7 @@ export function useGitWorkflow({
       setActionKey((current) => current === 'resolve:pull-request' ? null : current)
     }
   }, [activeReviewWorld, hasRepositoryRoot, hasWorld, isWorldActive, onError,
-    openPullRequestReview, setNewWorldPending])
+    openNewWorld, openPullRequestReview, setNewWorldPending, updateNewWorldLocator])
 
   const restoreReleasedWorld = useCallback((world: ReviewWorld | null | undefined): void => {
     if (world == null || world.source === 'new' || world.source === 'desk'

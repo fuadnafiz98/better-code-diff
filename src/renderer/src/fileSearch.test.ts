@@ -45,6 +45,15 @@ describe('rankFilePaths', () => {
     )
   })
 
+  it('filters 20k paths without waiting on git status', () => {
+    const paths = Array.from({ length: 20_000 }, (_, index) => `src/pkg-${index % 40}/file-${index}.ts`)
+    const index = createFileSearchIndex(paths)
+    const started = performance.now()
+    const results = rankFilePaths(index, 'file-199', 32)
+    expect(performance.now() - started).toBeLessThan(80)
+    expect(results[0]).toBe('src/pkg-39/file-199.ts')
+  })
+
   it('keeps review files first when the result set is bounded', () => {
     const reviewPaths = new Set(['src/z-review-file.ts'])
     const paths = [

@@ -1,3 +1,5 @@
+import type { FileComparison } from '../../shared/contracts'
+import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import { showToast } from './toast'
 
 export const COPY_FILE_PATH_CSS = `
@@ -76,4 +78,27 @@ export function syncCopyFilePathLifecycle(
 export function reportCopiedPath(path: string, copied: boolean): void {
   const name = path.split('/').at(-1) ?? path
   showToast(copied ? `Copied path · ${name}` : 'Could not copy path')
+}
+
+export function fileContentsToCopy(
+  comparison: Pick<FileComparison, 'newFile' | 'oldFile' | 'binary' | 'oversized'>
+): string | null {
+  if (comparison.binary || comparison.oversized) return null
+  return comparison.newFile?.contents ?? comparison.oldFile?.contents ?? null
+}
+
+export async function copyWorkingFileContents(path: string): Promise<void> {
+  const name = path.split('/').at(-1) ?? path
+  try {
+    const comparison = await requireRepositoryApi().getComparison(path)
+    const text = fileContentsToCopy(comparison)
+    if (text == null) {
+      showToast(comparison.binary ? `Cannot copy a binary file · ${name}` : 'Could not copy file contents')
+      return
+    }
+    const copied = await copyTextToClipboard(text)
+    showToast(copied ? `Copied contents · ${name}` : 'Could not copy file contents')
+  } catch (error) {
+    showToast(getErrorMessage(error) || 'Could not copy file contents')
+  }
 }
