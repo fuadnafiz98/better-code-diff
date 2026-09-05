@@ -1,7 +1,7 @@
 import type { SessionRestoreHint } from './sessionRestore.js'
-import type { WorkspaceCache, WorkspaceUiState } from './workspaceCache.js'
+import type { CachedFileText, WorkspaceCache, WorkspaceUiState } from './workspaceCache.js'
 
-export type { SessionRestoreHint, WorkspaceCache, WorkspaceUiState }
+export type { CachedFileText, SessionRestoreHint, WorkspaceCache, WorkspaceUiState }
 
 export type RepositoryFileStatus =
   | 'added'
@@ -25,6 +25,8 @@ export interface RepositorySnapshot {
   head: string | null
   paths: string[]
   statuses: RepositoryStatusEntry[]
+  /** `skeleton` is the bounded directory listing shown until git answers; `live` is the git snapshot. */
+  stage?: 'skeleton' | 'live'
 }
 
 export interface RepositoryChangeEvent {
@@ -272,6 +274,25 @@ export type PullRequestReviewProgress =
       requestId?: string
     }
   | {
+      // A review served from disk is revalidated in the background. When the head
+      // moved the refetched review supersedes everything already streamed.
+      kind: 'replace'
+      selector: string
+      review: PullRequestReview
+      root?: string
+      requestId?: string
+    }
+  | {
+      // Checks and mergeability are header garnish, so they ride a second `gh`
+      // call instead of holding the metadata hop that opens the review.
+      kind: 'checks'
+      selector: string
+      checks: PullRequestChecks | null
+      mergeable: string | null
+      root?: string
+      requestId?: string
+    }
+  | {
       kind: 'done'
       selector: string
       fileCount: number
@@ -361,6 +382,11 @@ export interface ContentSearchResult {
   line: number
   column: number
   preview: string
+}
+
+export interface MarkdownMediaPayload {
+  mimeType: string
+  bytes: Uint8Array
 }
 
 export type AgentProvider = 'claude' | 'codex'
@@ -454,6 +480,8 @@ export interface AgentRequestSubject {
   source: AgentSubjectSource
   baseOid: string | null
   headOid: string | null
+  pullRequestUrl?: string
+  workingBranch?: string
 }
 
 export interface AgentRequestSelection {
@@ -517,28 +545,56 @@ export interface FolderPickerCatalog {
   folders: FolderCandidate[]
 }
 
+export interface PullRequestFolderPreview {
+  root: string
+  name: string
+  displayPath: string
+  source: 'remembered' | 'matched'
+}
+
 export interface RepositoryApi {
   readonly restoreHint: SessionRestoreHint
   readonly cachedWorkspace: WorkspaceCache | null
   persistWorkspaceUi(ui: WorkspaceUiState): Promise<void>
+  /**
+   * The open file's contents, on their own channel: the selection and the view
+   * change far more often than the text does, and half a megabyte has no
+   * business riding along with two strings.
+   */
+  persistFileText(fileText: CachedFileText | null): Promise<void>
   getSessionSnapshot(): Promise<RepositorySnapshot | null>
   openFolder(): Promise<RepositorySnapshot | null>
+  chooseFolder(): Promise<string | null>
   listFolderCandidates(): Promise<FolderPickerCatalog>
   openPickedFolder(path: string): Promise<RepositorySnapshot>
   openPath(path: string): Promise<RepositorySnapshot>
   activateRepository(root: string): Promise<RepositorySnapshot>
   releaseRepository(root: string): Promise<void>
-  resolvePullRequestRepository(pullRequestUrl: string): Promise<RepositorySnapshot | null>
+  previewPullRequestFolder(pullRequestUrl: string): Promise<PullRequestFolderPreview | null>
+  resolvePullRequestRepository(
+    pullRequestUrl: string,
+    preferredRoot?: string | null
+  ): Promise<RepositorySnapshot | null>
   getPendingExternalPullRequest(): Promise<string | null>
-  onOpenExternalPullRequest(listener: (url: string) => void): () => void
+  /**
+   * `root` is the local checkout the main process already resolved for this URL,
+   * or null when it has not found one. Passing it back on the open call turns the
+   * renderer's own resolution into a lookup.
+   */
+  onOpenExternalPullRequest(listener: (url: string, root: string | null) => void): () => void
   readClipboardText(type?: string): Promise<string>
   revealPath(path: string): Promise<void>
   refresh(): Promise<RepositorySnapshot>
   getComparison(path: string): Promise<FileComparison>
   saveWorkingFile(request: WorkingFileSaveRequest): Promise<FileComparison>
   getWorkingTreePatch(paths: string[]): Promise<WorkingTreePatch>
-  searchContent(query: string): Promise<ContentSearchResult[]>
+  /**
+   * `forOpenPath` asks for a second, wider pass over that one file so the diff can
+   * mark every hit in it; the repository-wide list stays short.
+   */
+  searchContent(query: string, forOpenPath?: string | null): Promise<ContentSearchResult[]>
   cancelContentSearch(): void
+  getMarkdownMedia(url: string): Promise<MarkdownMediaPayload>
   getGitIntegration(): Promise<GitIntegrationSnapshot>
   getPullRequestInbox(): Promise<PullRequestInboxSnapshot>
   getClosedPullRequests(): Promise<PullRequestSummary[]>
@@ -596,13 +652,16 @@ export const IPC_CHANNELS = {
   getRestoreHint: 'repository:get-restore-hint',
   getWorkspaceCache: 'repository:get-workspace-cache',
   persistWorkspaceUi: 'repository:persist-workspace-ui',
+  persistFileText: 'repository:file-text',
   getSessionSnapshot: 'repository:get-session-snapshot',
   openFolder: 'repository:open-folder',
+  chooseFolder: 'repository:choose-folder',
   listFolderCandidates: 'repository:list-folder-candidates',
   openPickedFolder: 'repository:open-picked-folder',
   openPath: 'repository:open-path',
   activateRepository: 'repository:activate',
   releaseRepository: 'repository:release',
+  previewPullRequestFolder: 'repository:preview-pull-request-folder',
   resolvePullRequestRepository: 'repository:resolve-pull-request',
   getPendingExternalPullRequest: 'app:get-pending-external-pull-request',
   openExternalPullRequest: 'app:open-external-pull-request',
@@ -614,6 +673,7 @@ export const IPC_CHANNELS = {
   getWorkingTreePatch: 'repository:get-working-tree-patch',
   searchContent: 'repository:search-content',
   cancelContentSearch: 'repository:cancel-content-search',
+  getMarkdownMedia: 'repository:get-markdown-media',
   getGitIntegration: 'repository:get-git-integration',
   getPullRequestInbox: 'repository:get-pull-request-inbox',
   getClosedPullRequests: 'repository:get-closed-pull-requests',

@@ -9,15 +9,24 @@ import {
   IPC_CHANNELS,
   type MainStartupMetrics,
   type PerformanceMetricsDetail,
+  type PullRequestFolderPreview,
   type RendererTermination,
   type RepositorySnapshot
 } from '../shared/contracts.js'
+import { displayUserPath, folderNameFromPath } from '../shared/folderPath.js'
 import { findHorusReviewRequest, HORUS_PROTOCOL, parseHorusReviewUrl, type HorusReviewRequest } from '../shared/horusUrl.js'
-import { extractGitHubPullRequestUrl, normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
+import {
+  extractGitHubPullRequestUrl,
+  githubRepoSlugFromPullRequestUrl,
+  normalizeGitHubPullRequestUrl
+} from '../shared/pullRequestUrl.js'
 import { AgentService, coalesceAgentTextEvents } from './agentService.js'
 import { parseAgentAskRequest } from './agentRequest.js'
 import { FolderIndex, resolveOpenableFolder } from './folderIndex.js'
+import { loadMarkdownMedia } from './markdownMedia.js'
 import { isPathWithinApprovedRoots, parseRemotes, pullRequestTargetsRemotes } from './repository.js'
+import { PullRequestRootResolver } from './pullRequestRoots.js'
+import { clipboardWarmupDecision, warmupCooledDown } from './pullRequestWarmup.js'
 import { runCommand } from './gitCommands.js'
 import { RepositorySessionRegistry } from './repositorySessions.js'
 import {
@@ -29,12 +38,26 @@ import {
 } from '../shared/sessionRestore.js'
 import {
   comparisonWithoutOpenSession,
+  EMPTY_WORKSPACE_CACHE_STORE,
+  lastWorkspaceCache,
   mergeWorkspaceCache,
+  parseCachedFileText,
   parseWorkspaceUi,
+  rememberWorkspaceCacheEntry,
+  workspaceCacheForRoot,
   type WorkspaceCache,
+  type WorkspaceCacheStore,
   type WorkspaceUiState
 } from '../shared/workspaceCache.js'
-import { DEFAULT_SESSION_STATE, flushSessionState, loadSessionState, saveSessionState, type SessionState } from './sessionStore.js'
+import {
+  DEFAULT_SESSION_STATE,
+  flushSessionState,
+  loadSessionState,
+  rememberPullRequestFolder,
+  rememberedPullRequestFolder,
+  saveSessionState,
+  type SessionState
+} from './sessionStore.js'
 import { flushWorkspaceCache, loadWorkspaceCache, saveWorkspaceCache } from './workspaceCacheStore.js'
 import { detectRepositoryKind, listRootSnapshot, resolveExistingRoot, rootsMatch } from './workspaceListing.js'
 import { TerminalService } from './terminalService.js'
@@ -52,8 +75,10 @@ process.on('uncaughtException', (error) => {
 
 const PRODUCT_NAME = 'Horus'
 const startHidden = process.env.HORUS_BACKGROUND === '1'
-const CLIPBOARD_WARMUP_MS = 800
+const CLIPBOARD_WARMUP_MS = 2_000
 const WARMUP_COOLDOWN_MS = 60_000
+// How long the open request waits for the checkout before it goes without one.
+const EXTERNAL_REVIEW_ROOT_DEADLINE_MS = 150
 const remoteDebuggingPort = process.env.HORUS_REMOTE_DEBUGGING_PORT?.trim()
 if (remoteDebuggingPort != null && remoteDebuggingPort !== '') {
   app.commandLine.appendSwitch('remote-debugging-port', remoteDebuggingPort)
@@ -109,11 +134,13 @@ let sessionState: SessionState = DEFAULT_SESSION_STATE
 // alongside the renderer boot, and without the wait the renderer asks before
 // the first git call lands and falls back to the Welcome screen.
 let restoreLastSession: Promise<unknown> = Promise.resolve(null)
-let workspaceCache: WorkspaceCache | null = null
+let sessionRestoreStarted = false
+let workspaceCacheStore: WorkspaceCacheStore = EMPTY_WORKSPACE_CACHE_STORE
 let persistWorkspaceTimer: ReturnType<typeof setTimeout> | null = null
-const WORKSPACE_CACHE_SAVE_DEBOUNCE_MS = 400
+const WORKSPACE_CACHE_SAVE_DEBOUNCE_MS = 1_000
 let holdWindowHidden = startHidden
 let pendingOpenPullRequestUrl: string | null = null
+let pendingOpenPullRequestRoot: string | null = null
 const queuedExternalReviews: HorusReviewRequest[] = []
 const warmupFlights = new Map<string, Promise<void>>()
 const recentlyWarmedAt = new Map<string, number>()
@@ -135,58 +162,93 @@ function publishPendingOpenPullRequest(): void {
   if (url == null) return
   for (const window of BrowserWindow.getAllWindows()) {
     if (window.isDestroyed() || window.webContents.isLoadingMainFrame()) continue
-    window.webContents.send(IPC_CHANNELS.openExternalPullRequest, url)
+    window.webContents.send(IPC_CHANNELS.openExternalPullRequest, url, pendingOpenPullRequestRoot)
   }
+}
+
+/**
+ * Resolves the checkout and starts the review fetch without opening a repository
+ * or refreshing one. A warmup used to open the repository it had just found,
+ * which put a full refresh — and, on a big tree, an ignored-file walk — behind
+ * every pull request URL that touched the clipboard.
+ */
+async function primePullRequest(url: string): Promise<void> {
+  const root = await pullRequestRoots.resolve(url, 'quick')
+  if (root == null) return
+  // No session means no service to hold the flight, and opening one here is the
+  // storm this path exists to avoid. The renderer opens it a moment later and
+  // starts the same fetch itself.
+  const repository = repositorySessions.tryGet(root)
+  if (repository == null) return
+  // Warmup intent: the flight is started but not claimed, so the reader who joins it
+  // a moment later can still cancel it by closing the tab.
+  await repository.getPullRequestReview(url, undefined, `warmup:${url}`, 'warmup')
 }
 
 async function warmupPullRequest(url: string): Promise<void> {
   const inFlight = warmupFlights.get(url)
   if (inFlight != null) return inFlight
-  const warmedAt = recentlyWarmedAt.get(url)
-  if (warmedAt != null && Date.now() - warmedAt < WARMUP_COOLDOWN_MS) return
+  const now = Date.now()
+  if (!warmupCooledDown({ lastWarmedAt: recentlyWarmedAt.get(url), now, cooldownMs: WARMUP_COOLDOWN_MS })) return
+  // Cooled down before the work, not after it: a URL with no local checkout used
+  // to re-probe every folder on the machine on every clipboard change.
+  recentlyWarmedAt.set(url, now)
 
-  const work = (async () => {
-    try {
-      const matchingRoot = await findPullRequestRoot(url)
-      if (matchingRoot == null) return
-      const snapshot = await openRepository(matchingRoot, false)
-      await repositorySessions.require(snapshot.root).getPullRequestReview(url, undefined, `warmup:${url}`)
-      recentlyWarmedAt.set(url, Date.now())
-    } catch (error) {
+  const work = primePullRequest(url)
+    .catch((error: unknown) => {
       console.warn(`Could not warm pull request ${url}:`, error)
-    }
-  })().finally(() => {
-    if (warmupFlights.get(url) === work) warmupFlights.delete(url)
-  })
+    })
+    .finally(() => {
+      if (warmupFlights.get(url) === work) warmupFlights.delete(url)
+    })
   warmupFlights.set(url, work)
   return work
 }
 
-function applyExternalReview(request: HorusReviewRequest): void {
-  if (shouldRevealForReview(request.intent)) {
-    pendingOpenPullRequestUrl = request.url
-    revealMainWindow()
-    publishPendingOpenPullRequest()
+async function applyExternalReview(request: HorusReviewRequest): Promise<void> {
+  if (!shouldRevealForReview(request.intent)) {
+    await warmupPullRequest(request.url)
+    return
   }
-  void warmupPullRequest(request.url)
+  pendingOpenPullRequestUrl = request.url
+  pendingOpenPullRequestRoot = null
+  revealMainWindow()
+  // The renderer has to resolve the checkout before it can ask for the review, so
+  // the answer rides along with the open request. Bounded: a resolution that has
+  // to walk the folder catalog must not hold the tab back.
+  pendingOpenPullRequestRoot = await Promise.race([
+    pullRequestRoots.resolve(request.url, 'quick').catch(() => null),
+    delay(EXTERNAL_REVIEW_ROOT_DEADLINE_MS).then(() => null)
+  ])
+  publishPendingOpenPullRequest()
+  void primePullRequest(request.url).catch((error: unknown) => {
+    console.warn(`Could not prime pull request ${request.url}:`, error)
+  })
 }
 
 function acceptExternalReview(value: string): void {
   const request = parseHorusReviewUrl(value)
   if (request == null) return
-  if (app.isReady()) applyExternalReview(request)
+  if (app.isReady()) void applyExternalReview(request)
   else enqueueExternalReview(request)
 }
 
 function startClipboardWarmup(): void {
   let seen = clipboard.readText()
-  setInterval(() => {
-    const text = clipboard.readText()
-    if (text === seen) return
-    seen = text
-    const url = extractGitHubPullRequestUrl(text)
-    if (url != null) void warmupPullRequest(url)
-  }, CLIPBOARD_WARMUP_MS)
+  // Nothing on screen means nobody is about to press Cmd+H, and a hidden Horus
+  // that scans on every copied URL is a background process burning a core.
+  const pollClipboard = (): void => {
+    const decision = clipboardWarmupDecision({
+      text: clipboard.readText(),
+      seen,
+      windowVisible: BrowserWindow.getAllWindows().some((window) => !window.isDestroyed() && window.isVisible())
+    })
+    seen = decision.seen
+    if (decision.url != null) void warmupPullRequest(decision.url)
+  }
+  setInterval(pollClipboard, CLIPBOARD_WARMUP_MS)
+  app.on('browser-window-focus', pollClipboard)
+  app.on('activate', pollClipboard)
 }
 
 const launchRequest = findHorusReviewRequest(process.argv)
@@ -198,6 +260,12 @@ app.on('open-url', (event, url) => {
 // Only the installed app owns horus://. A `bun run dev` registration would
 // steal the scheme from ~/Applications/Horus.app and break Raycast.
 if (app.isPackaged) app.setAsDefaultProtocolClient(HORUS_PROTOCOL)
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, milliseconds)
+  })
+}
 
 function rendererDiagnosticsPath(): string {
   return join(app.getPath('userData'), 'renderer-terminations.json')
@@ -233,19 +301,27 @@ async function recordRendererTermination(details: RenderProcessGoneDetails): Pro
   ).catch((error) => console.error('Could not persist renderer termination diagnostics:', error))
 }
 
+// `rootsMatch` resolves symlinks, so a cache written under one spelling of a
+// path is still found when the folder is reopened under another.
+function cachedWorkspaceForRoot(root: string): WorkspaceCache | null {
+  return workspaceCacheStore.entries.find((entry) => rootsMatch(entry.lastRoot, root)) ?? null
+}
+
 function trackSnapshot(snapshot: RepositorySnapshot): RepositorySnapshot {
   repositorySessions.sync(snapshot)
   persistWorkspaceFromSnapshot(snapshot)
   return snapshot
 }
 
+// Nothing here touches the disk: the write is debounced so a burst of publishes
+// costs one file, and it never runs on the tick that produced the snapshot.
 function rememberWorkspaceCache(next: WorkspaceCache): void {
-  workspaceCache = next
+  workspaceCacheStore = rememberWorkspaceCacheEntry(workspaceCacheStore, next)
   if (userDataPath === '') return
   if (persistWorkspaceTimer != null) clearTimeout(persistWorkspaceTimer)
   persistWorkspaceTimer = setTimeout(() => {
     persistWorkspaceTimer = null
-    if (workspaceCache != null) void saveWorkspaceCache(userDataPath, workspaceCache)
+    void saveWorkspaceCache(userDataPath, workspaceCacheStore)
   }, WORKSPACE_CACHE_SAVE_DEBOUNCE_MS)
 }
 
@@ -253,16 +329,15 @@ function persistWorkspaceFromSnapshot(
   snapshot: RepositorySnapshot,
   ui: WorkspaceUiState | null = null
 ): void {
-  rememberWorkspaceCache(mergeWorkspaceCache(snapshot, ui, workspaceCache))
+  const previous = workspaceCacheForRoot(workspaceCacheStore, snapshot.root)
+  rememberWorkspaceCache(mergeWorkspaceCache(snapshot, ui, previous))
 }
 
 function flushPendingWorkspaceCache(): void {
   if (persistWorkspaceTimer == null) return
   clearTimeout(persistWorkspaceTimer)
   persistWorkspaceTimer = null
-  if (workspaceCache != null && userDataPath !== '') {
-    void saveWorkspaceCache(userDataPath, workspaceCache)
-  }
+  if (userDataPath !== '') void saveWorkspaceCache(userDataPath, workspaceCacheStore)
 }
 
 function persistWindowGeometry(window: BrowserWindow): void {
@@ -459,22 +534,23 @@ async function collectPerformanceDetail(
 }
 
 async function openRepository(folderPath: string, activate = true): Promise<RepositorySnapshot> {
+  // The one `realpath` of the open path. `repositorySessions.open` is told the
+  // path is already resolved so it does not repeat it, and the cache lookup and
+  // the kind probe both work off this value.
   const resolved = resolveExistingRoot(folderPath)
   if (resolved == null) throw new Error('That folder is no longer on disk.')
 
-  const cached = workspaceCache != null && rootsMatch(workspaceCache.lastRoot, resolved)
-    ? workspaceCache
-    : null
+  const cached = cachedWorkspaceForRoot(resolved)
   const snapshot = cached != null
     ? repositorySessions.hydrate({
       ...cached.snapshot,
       root: resolved,
       kind: detectRepositoryKind(resolved)
     }, activate)
-    : await repositorySessions.open(resolved, activate)
+    : await repositorySessions.open(resolved, activate, true)
   rememberOpenedRoot(snapshot.root, activate)
   if (cached != null) {
-    void repositorySessions.refreshActive().then((live) => {
+    void repositorySessions.refresh(snapshot.root).then((live) => {
       if (live != null && live.root === repositorySessions.activeRoot) persistWorkspaceFromSnapshot(live)
     })
   }
@@ -488,31 +564,107 @@ function requireRepositoryRoot(value: unknown): string {
   return value
 }
 
-async function findPullRequestRoot(pullRequestUrl: string): Promise<string | null> {
-  const candidates = [...new Set([...repositorySessions.roots, ...sessionState.approvedRoots])]
-  const matches = await Promise.all(candidates.map(async (root) => {
-    if (await stat(root).catch(() => null) == null) return false
-    try {
-      const openRepository = repositorySessions.tryGet(root)
-      const remotes = openRepository == null
-        ? parseRemotes(await runCommand('git', ['-C', root, 'remote', '-v']))
-        : await openRepository.getRemotes()
-      return pullRequestTargetsRemotes(remotes, pullRequestUrl)
-    } catch {
-      return false
-    }
-  }))
-  return candidates.find((_root, index) => matches[index]) ?? null
+async function remotesForRoot(root: string): Promise<ReturnType<typeof parseRemotes>> {
+  if (await stat(root).catch(() => null) == null) return []
+  const openRepository = repositorySessions.tryGet(root)
+  if (openRepository != null) return openRepository.getRemotes()
+  // Probing folders for a pull request's checkout is speculative work: it must
+  // never take a spawn slot from the repository the user is looking at.
+  const remotes = await runCommand(
+    'git',
+    ['-C', root, 'remote', '-v'],
+    undefined,
+    [],
+    undefined,
+    undefined,
+    'background'
+  )
+  return parseRemotes(remotes)
 }
 
-async function resolvePullRequestRepository(value: unknown): Promise<RepositorySnapshot | null> {
+const pullRequestRoots = new PullRequestRootResolver({
+  rememberedRoot: (slug) => rememberedPullRequestFolder(sessionState, slug),
+  openRoots: () => repositorySessions.roots,
+  approvedRoots: () => sessionState.approvedRoots,
+  catalogRoots: async () => (await folderIndex.list(sessionState.approvedRoots)).folders
+    .map((folder) => folder.path),
+  remotesFor: remotesForRoot
+})
+
+function rememberPullRequestCheckout(pullRequestUrl: string, root: string): void {
+  const slug = githubRepoSlugFromPullRequestUrl(pullRequestUrl)
+  if (slug == null) return
+  const next = rememberPullRequestFolder(sessionState, slug, root)
+  if (next === sessionState) return
+  sessionState = next
+  if (userDataPath !== '') void saveSessionState(userDataPath, sessionState)
+}
+
+async function openChosenPullRequestFolder(
+  pullRequestUrl: string,
+  folderPath: string
+): Promise<RepositorySnapshot> {
+  if (resolveExistingRoot(folderPath) == null) {
+    throw new Error('That folder is no longer on disk.')
+  }
+  const remotes = await remotesForRoot(folderPath)
+  const repositorySlug = githubRepoSlugFromPullRequestUrl(pullRequestUrl)
+    ?? new URL(pullRequestUrl).pathname.split('/').slice(1, 3).join('/')
+  if (!pullRequestTargetsRemotes(remotes, pullRequestUrl)) {
+    throw new Error(`The selected folder is not a checkout of ${repositorySlug}.`)
+  }
+  rememberPullRequestCheckout(pullRequestUrl, folderPath)
+  return openRepository(folderPath, false)
+}
+
+// A chip under the URL field. It reports what is already known and starts
+// nothing: probing every folder on the machine to label a suggestion was a third
+// of the git spawns behind Cmd+H.
+async function previewPullRequestFolder(value: unknown): Promise<PullRequestFolderPreview | null> {
+  if (typeof value !== 'string') throw new Error('Pull request URL must be text.')
+  const pullRequestUrl = normalizeGitHubPullRequestUrl(value) ?? extractGitHubPullRequestUrl(value)
+  if (pullRequestUrl == null) return null
+  const slug = githubRepoSlugFromPullRequestUrl(pullRequestUrl)
+  const remembered = slug == null ? null : rememberedPullRequestFolder(sessionState, slug)
+  if (remembered != null && await stat(remembered).catch(() => null) != null) {
+    return pullRequestFolderPreview(remembered, 'remembered')
+  }
+  const resolution = pullRequestRoots.pending(pullRequestUrl)
+  const root = resolution == null ? null : await resolution
+  return root == null ? null : pullRequestFolderPreview(root, 'matched')
+}
+
+function pullRequestFolderPreview(
+  root: string,
+  source: PullRequestFolderPreview['source']
+): PullRequestFolderPreview {
+  return {
+    root,
+    name: folderNameFromPath(root),
+    displayPath: displayUserPath(root, folderIndex.home),
+    source
+  }
+}
+
+async function resolvePullRequestRepository(
+  value: unknown,
+  preferredRoot?: unknown
+): Promise<RepositorySnapshot | null> {
   if (typeof value !== 'string') throw new Error('Pull request URL must be text.')
   const pullRequestUrl = normalizeGitHubPullRequestUrl(value)
   if (pullRequestUrl == null) throw new Error('Enter a full GitHub pull request URL.')
-  const matchingRoot = await findPullRequestRoot(pullRequestUrl)
-  if (matchingRoot != null) return openRepository(matchingRoot, false)
+  if (typeof preferredRoot === 'string' && preferredRoot !== '') {
+    if (!isAbsolute(preferredRoot)) throw new Error('Project folder must be an absolute path.')
+    return openChosenPullRequestFolder(pullRequestUrl, preferredRoot)
+  }
+  const matchingRoot = await pullRequestRoots.resolve(pullRequestUrl)
+  if (matchingRoot != null) {
+    rememberPullRequestCheckout(pullRequestUrl, matchingRoot)
+    return openRepository(matchingRoot, false)
+  }
 
-  const repositorySlug = new URL(pullRequestUrl).pathname.split('/').slice(1, 3).join('/')
+  const repositorySlug = githubRepoSlugFromPullRequestUrl(pullRequestUrl)
+    ?? new URL(pullRequestUrl).pathname.split('/').slice(1, 3).join('/')
   const result = await dialog.showOpenDialog({
     title: `Select the local checkout for ${repositorySlug}`,
     message: `Select the local checkout for ${repositorySlug}.`,
@@ -520,15 +672,50 @@ async function resolvePullRequestRepository(value: unknown): Promise<RepositoryS
   })
   const folderPath = result.filePaths[0]
   if (result.canceled || folderPath == null) return null
-  const remotes = parseRemotes(await runCommand('git', ['-C', folderPath, 'remote', '-v']))
-  if (!pullRequestTargetsRemotes(remotes, pullRequestUrl)) {
-    throw new Error(`The selected folder is not a checkout of ${repositorySlug}.`)
-  }
-  return openRepository(folderPath, false)
+  return openChosenPullRequestFolder(pullRequestUrl, folderPath)
 }
 
+async function chooseFolder(): Promise<string | null> {
+  const result = await dialog.showOpenDialog({
+    title: 'Choose project folder',
+    properties: ['openDirectory']
+  })
+  const folderPath = result.filePaths[0]
+  if (result.canceled || folderPath == null) return null
+  return folderPath
+}
+
+// The hint is asked for on the window's `additionalArguments`, on the sync
+// get-restore-hint channel and again on get-workspace-cache; each miss costs an
+// `existsSync` + `realpathSync` on the last root. Nothing but these four inputs
+// can change the answer, so identity on them is enough to reuse it.
+let restoreHintCache: {
+  sessionState: SessionState
+  store: WorkspaceCacheStore
+  pendingUrl: string | null
+  hint: SessionRestoreHint
+} | null = null
+
 function currentRestoreHint(): SessionRestoreHint {
-  const lastRoot = effectiveLastRoot(sessionState.lastRoot, workspaceCache?.lastRoot)
+  const cached = restoreHintCache
+  if (cached != null
+    && cached.sessionState === sessionState
+    && cached.store === workspaceCacheStore
+    && cached.pendingUrl === pendingOpenPullRequestUrl) {
+    return cached.hint
+  }
+  const hint = computeRestoreHint()
+  restoreHintCache = {
+    sessionState,
+    store: workspaceCacheStore,
+    pendingUrl: pendingOpenPullRequestUrl,
+    hint
+  }
+  return hint
+}
+
+function computeRestoreHint(): SessionRestoreHint {
+  const lastRoot = effectiveLastRoot(sessionState.lastRoot, workspaceCacheStore.lastRoot)
   const folderPresent = lastRoot != null && resolveExistingRoot(lastRoot) != null
   return parseRestoreHint({
     lastRoot,
@@ -540,7 +727,10 @@ function currentRestoreHint(): SessionRestoreHint {
       restoreLastFolder: sessionState.restoreLastFolder,
       lastRoot,
       folderPresent
-    })
+    }),
+    // A launch that is itself a Cmd+H tells the renderer to preload the review
+    // viewer rather than whichever chunk the cached desk last used.
+    pendingPullRequestUrl: pendingOpenPullRequestUrl
   })
 }
 
@@ -549,7 +739,9 @@ function registerIpcHandlers(): void {
     event.returnValue = currentRestoreHint()
   })
   ipcMain.on(IPC_CHANNELS.getWorkspaceCache, (event) => {
-    event.returnValue = currentRestoreHint().restoring ? workspaceCache : null
+    event.returnValue = currentRestoreHint().restoring
+      ? lastWorkspaceCache(workspaceCacheStore)
+      : null
   })
   ipcMain.handle(IPC_CHANNELS.persistWorkspaceUi, (_event, raw: unknown) => {
     const snapshot = repositorySessions.getActiveSnapshot()
@@ -557,9 +749,17 @@ function registerIpcHandlers(): void {
     if (snapshot == null || ui == null) return
     persistWorkspaceFromSnapshot(snapshot, ui)
   })
+  ipcMain.handle(IPC_CHANNELS.persistFileText, (_event, raw: unknown) => {
+    const snapshot = repositorySessions.getActiveSnapshot()
+    if (snapshot == null) return
+    persistWorkspaceFromSnapshot(snapshot, { fileText: parseCachedFileText(raw) })
+  })
   ipcMain.handle(IPC_CHANNELS.getSessionSnapshot, async () => {
     const current = repositorySessions.getActiveSnapshot()
     if (current != null) return current
+    // The restore runs on the tick after the window is shown; a renderer that
+    // gets its question in first starts it instead of racing it.
+    beginSessionRestore()
     await restoreLastSession
     const live = repositorySessions.getActiveSnapshot()
     if (live != null) return live
@@ -578,6 +778,7 @@ function registerIpcHandlers(): void {
     if (result.canceled || folderPath == null) return null
     return openRepository(folderPath)
   })
+  ipcMain.handle(IPC_CHANNELS.chooseFolder, () => chooseFolder())
   ipcMain.handle(IPC_CHANNELS.listFolderCandidates, () => folderIndex.list(sessionState.approvedRoots))
   ipcMain.handle(IPC_CHANNELS.openPickedFolder, async (_event, folderPath: unknown) => {
     const resolved = await resolveOpenableFolder(folderPath, {
@@ -599,9 +800,18 @@ function registerIpcHandlers(): void {
     repositorySessions.activate(requireRepositoryRoot(root)))
   ipcMain.handle(IPC_CHANNELS.releaseRepository, (_event, root: unknown) =>
     repositorySessions.release(requireRepositoryRoot(root)))
-  ipcMain.handle(IPC_CHANNELS.resolvePullRequestRepository, (_event, pullRequestUrl: unknown) =>
-    resolvePullRequestRepository(pullRequestUrl))
-  ipcMain.handle(IPC_CHANNELS.getPendingExternalPullRequest, () => pendingOpenPullRequestUrl)
+  ipcMain.handle(IPC_CHANNELS.previewPullRequestFolder, (_event, pullRequestUrl: unknown) =>
+    previewPullRequestFolder(pullRequestUrl))
+  ipcMain.handle(IPC_CHANNELS.resolvePullRequestRepository, (_event, pullRequestUrl: unknown, preferredRoot: unknown) =>
+    resolvePullRequestRepository(pullRequestUrl, preferredRoot))
+  // Handed over once. Left in place it reopened the pull request on every
+  // renderer reload, including the ones an automatic recovery triggers.
+  ipcMain.handle(IPC_CHANNELS.getPendingExternalPullRequest, () => {
+    const url = pendingOpenPullRequestUrl
+    pendingOpenPullRequestUrl = null
+    pendingOpenPullRequestRoot = null
+    return url
+  })
   ipcMain.handle(IPC_CHANNELS.readClipboardText, (_event, type: unknown) => {
     if (type == null) return clipboard.readText()
     if (typeof type !== 'string' || type === '' || type.length > 200) {
@@ -630,7 +840,10 @@ function registerIpcHandlers(): void {
     const repository = repositorySessions.tryGetActive()
     if (repository == null) {
       const requested = typeof path === 'string' ? path : ''
-      return comparisonWithoutOpenSession(requested, workspaceCache?.fileText ?? null)
+      return comparisonWithoutOpenSession(
+        requested,
+        lastWorkspaceCache(workspaceCacheStore)?.fileText ?? null
+      )
     }
     return repository.getComparison(path)
   })
@@ -644,10 +857,14 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.getWorkingTreePatch, (_event, paths: unknown) =>
     repositorySessions.requireActive().getWorkingTreePatch(paths)
   )
-  ipcMain.handle(IPC_CHANNELS.searchContent, (_event, query: string) =>
-    repositorySessions.requireActive().searchContent(query)
+  ipcMain.handle(IPC_CHANNELS.searchContent, (_event, query: string, forOpenPath: unknown) =>
+    repositorySessions.requireActive().searchContent(
+      query,
+      typeof forOpenPath === 'string' ? forOpenPath : null
+    )
   )
   ipcMain.on(IPC_CHANNELS.cancelContentSearch, () => repositorySessions.cancelActiveContentSearch())
+  ipcMain.handle(IPC_CHANNELS.getMarkdownMedia, (_event, url: unknown) => loadMarkdownMedia(url))
   ipcMain.handle(IPC_CHANNELS.getGitIntegration, () => repositorySessions.requireActive().getGitIntegration())
   ipcMain.handle(IPC_CHANNELS.getPullRequestInbox, () => repositorySessions.requireActive().getPullRequestInbox())
   ipcMain.handle(IPC_CHANNELS.getClosedPullRequests, () => repositorySessions.requireActive().getClosedPullRequests())
@@ -674,7 +891,13 @@ function registerIpcHandlers(): void {
       if (!sender.isDestroyed()) sender.send(IPC_CHANNELS.agentEvent, agentEvent)
     })
     try {
-      await agentService.ask(parsedRequest, snapshot.root, stream.emit)
+      const reviewContext = await repository.prepareAgentReview(parsedRequest.subject)
+      const context = reviewContext === ''
+        ? parsedRequest.context
+        : parsedRequest.context === ''
+          ? reviewContext
+          : `${parsedRequest.context}\n\n${reviewContext}`
+      await agentService.ask({ ...parsedRequest, context }, snapshot.root, stream.emit)
     } finally {
       stream.flush()
     }
@@ -841,16 +1064,14 @@ function rememberOpenedRoot(root: string, active = true): void {
 
 function hydrateLastWorkspace(): RepositorySnapshot | null {
   if (startHidden || !sessionState.restoreLastFolder) return null
-  const root = effectiveLastRoot(sessionState.lastRoot, workspaceCache?.lastRoot)
+  const root = effectiveLastRoot(sessionState.lastRoot, workspaceCacheStore.lastRoot)
   if (root == null) return null
   const resolved = resolveExistingRoot(root)
   if (resolved == null) return null
   const current = repositorySessions.getActiveSnapshot()
   if (current != null && rootsMatch(current.root, resolved)) return current
 
-  const diskCache = workspaceCache != null && rootsMatch(workspaceCache.lastRoot, resolved)
-    ? workspaceCache
-    : null
+  const diskCache = cachedWorkspaceForRoot(resolved)
   const snapshot = {
     ...(diskCache?.snapshot ?? listRootSnapshot(resolved)),
     root: resolved,
@@ -889,6 +1110,8 @@ function startLiveRefresh(root: string): void {
 }
 
 function beginSessionRestore(): void {
+  if (sessionRestoreStarted) return
+  sessionRestoreStarted = true
   const snapshot = hydrateLastWorkspace()
   if (snapshot == null) {
     restoreLastSession = Promise.resolve(null)
@@ -903,7 +1126,7 @@ app.whenReady().then(() => {
   userDataPath = app.getPath('userData')
   repositorySessions.setPullRequestCacheDirectory(join(userDataPath, 'pr-cache'))
   sessionState = loadSessionState(userDataPath)
-  workspaceCache = loadWorkspaceCache(userDataPath)
+  workspaceCacheStore = loadWorkspaceCache(userDataPath)
   nativeTheme.themeSource = sessionState.themeType
   app.setAboutPanelOptions({ applicationName: PRODUCT_NAME })
   const initialReviews = queuedExternalReviews.splice(0)
@@ -913,8 +1136,10 @@ app.whenReady().then(() => {
   // Half-bounce first. Hydrating 20k cached paths must not delay window.show()
   // or the pending PR URL that Cmd+H / horus:// already queued.
   createMainWindow()
-  for (const request of initialReviews) applyExternalReview(request)
-  beginSessionRestore()
+  for (const request of initialReviews) void applyExternalReview(request)
+  // Hydrating the cached workspace — up to 25,000 paths — runs after the window
+  // has been handed to the compositor, not in the same tick as its creation.
+  setImmediate(beginSessionRestore)
   void loadLastRendererTermination()
   applyDevelopmentDockIcon()
   void folderIndex.list(sessionState.approvedRoots)

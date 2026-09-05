@@ -70,6 +70,19 @@ describe('FolderPicker', () => {
     expect(onSelect).toHaveBeenCalledWith('/Users/me/Developer/personal/echo')
   })
 
+  test('the picked row waits ~80ms before it spins, so a fast open never blinks', async () => {
+    mockRepository()
+    const { rerender } = render(<FolderPicker recentFolders={recents} openingPath={null}
+      onClose={() => {}} onSelect={() => {}} onUseExisting={() => {}} />)
+    await screen.findByRole('option', { name: /instranslate/ })
+
+    rerender(<FolderPicker recentFolders={recents} openingPath={recents[0]!.path}
+      onClose={() => {}} onSelect={() => {}} onUseExisting={() => {}} />)
+    expect(document.querySelector('.spin')).toBeNull()
+
+    await waitFor(() => expect(document.querySelector('.spin')).toBeTruthy())
+  })
+
   test('Enter opens the highlighted folder', async () => {
     mockRepository()
     const onSelect = mock(() => {})

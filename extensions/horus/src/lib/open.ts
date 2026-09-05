@@ -17,9 +17,12 @@ export async function openHorusPullRequest(...candidates: Array<string | undefin
     await showHUD('Paste a GitHub pull request URL')
     return
   }
+  // The deep link goes out first: closing the Raycast window is a round trip Horus
+  // does not need to wait behind before it starts resolving the checkout.
+  const delivery = sendToHorus(url, 'open')
   await closeMainWindow({ clearRootSearch: true })
   try {
-    await sendToHorus(url, 'open')
+    await delivery
   } catch (error) {
     await showHUD(error instanceof Error ? error.message : 'Could not open Horus')
   }

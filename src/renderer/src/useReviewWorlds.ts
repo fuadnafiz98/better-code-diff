@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type {
+  PullRequestChecks,
   PullRequestReviewProgress,
   RepositoryReview,
   RepositorySnapshot,
   RepositoryStatusEntry
 } from '../../shared/contracts'
+import { githubRepoSlugFromPullRequestUrl } from '../../shared/pullRequestUrl'
 import type { WorkspaceView } from './AppView'
 import type { ReviewCheckpoint, SinceReview } from './reviewCheckpoints'
 import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
@@ -23,6 +25,7 @@ export interface NewWorld {
   label: string
   locator: string
   pending: boolean
+  repositoryRoot: string | null
 }
 
 export interface DeskWorld {
@@ -92,10 +95,16 @@ type WorldRegistryAction =
   | { type: 'reset'; world: NewWorld }
   | { type: 'new-tab'; world: NewWorld }
   | { type: 'update-locator'; worldId: string; locator: string }
+  | { type: 'update-repository-root'; worldId: string; root: string | null }
   | { type: 'set-new-pending'; worldId: string; pending: boolean; label: string }
   | { type: 'open-desk'; snapshot: RepositorySnapshot }
   | { type: 'sync-repository'; snapshot: RepositorySnapshot }
-  | { type: 'open-patch'; world: PatchWorld; originWorldId: string | null }
+  | {
+      type: 'open-patch'
+      world: PatchWorld
+      originWorldId: string | null
+      supersedesWorldId?: string | null
+    }
   | { type: 'open-since'; world: SinceWorld }
   | {
       type: 'append-patch-page'
@@ -104,7 +113,15 @@ type WorldRegistryAction =
       progress: Extract<PullRequestReviewProgress, { kind: 'files' }>
     }
   | { type: 'replace-patch'; worldId: string; generation: number; review: RepositoryReview }
+  | { type: 'replace-patch-head'; worldId: string; generation: number; review: RepositoryReview }
   | { type: 'set-patch-expected-file-count'; worldId: string; generation: number; fileCount: number }
+  | {
+      type: 'set-patch-checks'
+      worldId: string
+      generation: number
+      checks: PullRequestChecks | null
+      mergeable: string | null
+    }
   | {
       type: 'restore-since-patch'
       worldId: string
@@ -135,7 +152,8 @@ export function createNewWorld(): NewWorld {
     worldId: `new:${newWorldSequence}`,
     label: 'New tab',
     locator: '',
-    pending: false
+    pending: false,
+    repositoryRoot: null
   }
 }
 
@@ -169,9 +187,13 @@ function repositoryLabel(review: RepositoryReview, fallback: string): string {
   return match?.[1] ?? fallback
 }
 
+/** What a patch world is *of*, independent of the commits it was opened at. */
+export function patchReviewIdentity(review: RepositoryReview): string {
+  return review.kind === 'github' ? review.pullRequest.url : review.id
+}
+
 export function patchWorldId(review: RepositoryReview): string {
-  const identity = review.kind === 'github' ? review.pullRequest.url : review.id
-  return `patch:${identity}:${review.baseOid}:${review.headOid}`
+  return `patch:${patchReviewIdentity(review)}:${review.baseOid}:${review.headOid}`
 }
 
 function patchWorldLabel(snapshot: RepositorySnapshot, review: RepositoryReview): string {
@@ -239,10 +261,15 @@ export function createSinceWorld(
 function insertContentWorld(
   state: WorldRegistryState,
   world: ReviewWorld,
-  originWorldId = state.activeWorldId
+  originWorldId = state.activeWorldId,
+  supersedesWorldId: string | null = null
 ): WorldRegistryState {
+  // A superseded tab that is in front stays in front: `activeWorldId` must never
+  // be left pointing at the world this replaced.
   const focus = state.activeWorldId === originWorldId
-  const existingIndex = state.worlds.findIndex((candidate) => candidate.worldId === world.worldId)
+    || (supersedesWorldId != null && state.activeWorldId === supersedesWorldId)
+  const existingIndex = state.worlds.findIndex((candidate) => candidate.worldId === world.worldId
+    || (supersedesWorldId != null && candidate.worldId === supersedesWorldId))
   if (existingIndex >= 0) {
     const worlds = [...state.worlds]
     worlds[existingIndex] = world
@@ -339,6 +366,7 @@ const PAYLOAD_AFFECTING_ACTIONS: ReadonlySet<WorldRegistryAction['type']> = new 
   'open-since',
   'append-patch-page',
   'replace-patch',
+  'replace-patch-head',
   'restore-since-patch',
   'set-patch-status',
   'focus',
@@ -358,8 +386,22 @@ export function reduceWorldRegistry(
     return { worlds: [...state.worlds, action.world], activeWorldId: action.world.worldId }
   }
   if (action.type === 'update-locator') {
+    const worlds = state.worlds.map((world) => {
+      if (world.worldId !== action.worldId || world.source !== 'new') return world
+      const previousSlug = githubRepoSlugFromPullRequestUrl(world.locator)
+      const nextSlug = githubRepoSlugFromPullRequestUrl(action.locator)
+      const keepFolder = previousSlug == null || nextSlug == null || previousSlug === nextSlug
+      return {
+        ...world,
+        locator: action.locator,
+        repositoryRoot: keepFolder ? world.repositoryRoot : null
+      }
+    })
+    return { ...state, worlds }
+  }
+  if (action.type === 'update-repository-root') {
     const worlds = state.worlds.map((world) => world.worldId === action.worldId && world.source === 'new'
-      ? { ...world, locator: action.locator }
+      ? { ...world, repositoryRoot: action.root }
       : world)
     return { ...state, worlds }
   }
@@ -396,7 +438,7 @@ export function reduceWorldRegistry(
     return changed ? { ...state, worlds } : state
   }
   if (action.type === 'open-patch') {
-    return insertContentWorld(state, action.world, action.originWorldId)
+    return insertContentWorld(state, action.world, action.originWorldId, action.supersedesWorldId ?? null)
   }
   if (action.type === 'open-since') {
     return insertContentWorld(state, action.world)
@@ -427,10 +469,42 @@ export function reduceWorldRegistry(
           }
         : world)
   }
+  if (action.type === 'replace-patch-head') {
+    // The pull request was force pushed while it was open. The tab keeps its id —
+    // the loader that is still running holds it — but everything derived from the
+    // commits it was opened at is replaced.
+    return updatePatchWorld(state, action.worldId, action.generation, (world) =>
+      patchReviewIdentity(action.review) === patchReviewIdentity(world.review)
+        ? {
+            ...world,
+            baseOid: action.review.baseOid,
+            headOid: action.review.headOid,
+            review: action.review,
+            patchPages: action.review.patch === '' ? [] : [action.review.patch],
+            patchLength: action.review.patch.length
+          }
+        : world)
+  }
   if (action.type === 'set-patch-expected-file-count') {
     return updatePatchWorld(state, action.worldId, action.generation, (world) =>
       world.review.kind === 'github'
         ? { ...world, review: { ...world.review, expectedFileCount: action.fileCount } }
+        : world)
+  }
+  if (action.type === 'set-patch-checks') {
+    return updatePatchWorld(state, action.worldId, action.generation, (world) =>
+      world.review.kind === 'github'
+        ? {
+            ...world,
+            review: {
+              ...world.review,
+              pullRequest: {
+                ...world.review.pullRequest,
+                checks: action.checks,
+                mergeable: action.mergeable
+              }
+            }
+          }
         : world)
   }
   if (action.type === 'restore-since-patch') {
@@ -633,6 +707,11 @@ export function useReviewWorlds({
     if (targetWorldId != null) dispatch({ type: 'update-locator', worldId: targetWorldId, locator })
   }, [dispatch])
 
+  const updateNewWorldRepositoryRoot = useCallback((root: string | null, worldId?: string) => {
+    const targetWorldId = worldId ?? stateRef.current.activeWorldId
+    if (targetWorldId != null) dispatch({ type: 'update-repository-root', worldId: targetWorldId, root })
+  }, [dispatch])
+
   const setNewWorldPending = useCallback((pending: boolean, pullRequestUrl = '', worldId?: string) => {
     const targetWorldId = worldId ?? stateRef.current.activeWorldId
     if (targetWorldId == null) return
@@ -695,6 +774,18 @@ export function useReviewWorlds({
       loading ? 'loading' : 'ready',
       requestId
     )
+    // A world id carries the commits the tab was opened at, and a force push
+    // moves them under a tab that stays open. Identity — the pull request URL —
+    // is what "already open" means, so reopening it takes over that tab instead
+    // of stacking a second one beside it.
+    const superseded = stateRef.current.worlds.find((candidate) => candidate.source === 'patch'
+      && candidate.worldId !== world.worldId
+      && patchReviewIdentity(candidate.review) === patchReviewIdentity(review))
+    if (superseded != null) {
+      const navigation = navigationRef.current.get(superseded.worldId)
+      navigationRef.current.delete(superseded.worldId)
+      if (navigation != null) navigationRef.current.set(world.worldId, navigation)
+    }
     if (!navigationRef.current.has(world.worldId)) {
       navigationRef.current.set(world.worldId, {
         selectedPath: review.files[0]?.path ?? null,
@@ -703,7 +794,8 @@ export function useReviewWorlds({
       })
     }
     const focus = stateRef.current.activeWorldId === originWorldId
-    dispatch({ type: 'open-patch', world, originWorldId })
+      || stateRef.current.activeWorldId === superseded?.worldId
+    dispatch({ type: 'open-patch', world, originWorldId, supersedesWorldId: superseded?.worldId ?? null })
     if (focus) {
       onActivateSnapshot(repositorySnapshot)
       restoreNavigation(world.worldId)
@@ -798,6 +890,12 @@ export function useReviewWorlds({
     review: RepositoryReview
   ) => dispatch({ type: 'replace-patch', worldId, generation, review }), [dispatch])
 
+  const replacePatchHead = useCallback((
+    worldId: string,
+    generation: number,
+    review: RepositoryReview
+  ) => dispatch({ type: 'replace-patch-head', worldId, generation, review }), [dispatch])
+
   const setPatchLoadStatus = useCallback((
     worldId: string,
     generation: number,
@@ -810,6 +908,13 @@ export function useReviewWorlds({
     generation: number,
     fileCount: number
   ) => dispatch({ type: 'set-patch-expected-file-count', worldId, generation, fileCount }), [dispatch])
+
+  const setPatchChecks = useCallback((
+    worldId: string,
+    generation: number,
+    checks: PullRequestChecks | null,
+    mergeable: string | null
+  ) => dispatch({ type: 'set-patch-checks', worldId, generation, checks, mergeable }), [dispatch])
 
   const restoreSincePatch = useCallback((
     worldId: string,
@@ -853,6 +958,7 @@ export function useReviewWorlds({
     focusDesk,
     openNewWorld,
     updateNewWorldLocator,
+    updateNewWorldRepositoryRoot,
     setNewWorldPending,
     isWorldActive,
     hasWorld,
@@ -861,8 +967,10 @@ export function useReviewWorlds({
     openPatchWorld,
     openSinceWorld,
     appendPatchPage,
+    replacePatchHead,
     replacePatchReview,
     restoreSincePatch,
+    setPatchChecks,
     setPatchExpectedFileCount,
     setPatchLoadStatus,
     closeWorld,
@@ -873,8 +981,10 @@ export function useReviewWorlds({
     reset
   }), [activeNavigation?.reviewScrollTop, activeReview, activeWorld, appendPatchPage, closeWorld,
     cycleWorld, focusDesk, focusWorld, openDeskWorld, openNewWorld, openPatchWorld, openSinceWorld,
-    hasRepositoryRoot, hasWorld, isWorldActive, rememberReviewScroll, replacePatchReview, reset,
+    hasRepositoryRoot, hasWorld, isWorldActive, rememberReviewScroll, replacePatchHead,
+    replacePatchReview, reset,
     restoreSincePatch,
-    selectInitialPath, setPatchExpectedFileCount, setPatchLoadStatus,
-    setNewWorldPending, state.worlds, syncRepositorySnapshot, updateNewWorldLocator])
+    selectInitialPath, setPatchChecks, setPatchExpectedFileCount, setPatchLoadStatus,
+    setNewWorldPending, state.worlds, syncRepositorySnapshot, updateNewWorldLocator,
+    updateNewWorldRepositoryRoot])
 }

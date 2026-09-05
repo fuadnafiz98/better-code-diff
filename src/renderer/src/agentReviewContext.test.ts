@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
-import { agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
+import { agentContextLabel, agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
 import { createPatchWorld } from './useReviewWorlds'
 
 const snapshot: RepositorySnapshot = {
@@ -73,10 +73,22 @@ describe('formatAgentReviewContext', () => {
       repositoryName: 'repo-a',
       source: 'patch',
       baseOid: 'base-1092',
-      headOid: 'head-1092'
+      headOid: 'head-1092',
+      pullRequestUrl: 'https://github.com/example/repo/pull/1092',
+      workingBranch: 'main'
     })
     expect(context).toContain('Repository root: /repo-a')
+    expect(context).toContain('Current branch: main')
     expect(context).toContain('Base revision: base-1092')
     expect(context).toContain('Head revision: head-1092')
+    expect(context).toContain('Do not fetch them')
+  })
+})
+
+describe('agentContextLabel', () => {
+  test('names the pull request inside its local checkout', () => {
+    const review = githubReview(1)
+    const world = createPatchWorld(snapshot, review, 1, 'ready')
+    expect(agentContextLabel(world, review)).toBe('#1092 in repo-a')
   })
 })

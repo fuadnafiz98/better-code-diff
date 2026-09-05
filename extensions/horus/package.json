@@ -2,7 +2,7 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "horus",
   "title": "Horus",
-  "description": "Paste a GitHub pull request URL to open it in Horus. Copying or typing the URL starts the review in the background so Enter is ready.",
+  "description": "Paste a GitHub pull request URL to open it in Horus. Typing the URL starts the review in the background so Enter is ready.",
   "icon": "icon.png",
   "author": "fuadnafiz98",
   "categories": [
@@ -58,14 +58,6 @@
         "pr",
         "github"
       ]
-    },
-    {
-      "name": "warmup-clipboard",
-      "title": "Warm Clipboard Pull Request",
-      "subtitle": "Horus",
-      "description": "When a GitHub pull request URL is copied, start loading it in Horus",
-      "mode": "no-view",
-      "interval": "10s"
     }
   ],
   "dependencies": {

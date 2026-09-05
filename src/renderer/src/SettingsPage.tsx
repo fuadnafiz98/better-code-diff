@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { flushSync } from 'react-dom'
 import { IconBraces, IconFileCode, IconGear, IconReload, IconX } from '@pierre/icons'
+import './SettingsPage.css'
 
 import { SelectControl } from './SelectControl'
 

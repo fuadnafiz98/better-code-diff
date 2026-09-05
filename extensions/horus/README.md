@@ -1,6 +1,6 @@
 # Horus for Raycast
 
-Paste a GitHub pull request URL in Raycast to open it in Horus. Copying the URL starts the review in the background so Enter does not wait on a cold fetch.
+Paste a GitHub pull request URL in Raycast to open it in Horus. Typing the URL starts the review in the background so Enter does not wait on a cold fetch.
 
 ## Install
 
@@ -29,4 +29,11 @@ The shortest enable path: paste any GitHub PR URL, click the gear on the **Use w
 | **Open in Horus** | Fallback / hotkey command. Uses the pasted URL, or the clipboard. |
 | **Open Pull Request** | Search bar if you want to edit the URL first. |
 | **Open Clipboard Pull Request** | Clipboard only. Bind this to a hotkey. |
-| **Warm Clipboard Pull Request** | Every 10 seconds, start loading a copied PR URL without focusing Horus. |
+
+Horus watches the clipboard itself while its window is on screen, so there is no
+background Raycast command: a copied PR URL is warmed by the app that is already
+running, and a hidden Horus stays idle.
+
+Warming only reaches a Horus that is already running — typing a URL in **Open
+Pull Request** never launches the app. Opening one does: a running Horus is
+reached through `horus://`, a cold one through `open -a Horus`.

@@ -1,30 +1,17 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import type { DiffLineAnnotation, FileContents, LineAnnotation, SelectedLineRange } from '@pierre/diffs'
-import { File, MultiFileDiff, useVirtualizer, Virtualizer } from '@pierre/diffs/react'
 import type { Editor } from '@pierre/diffs/edit'
-import {
-  IconCodeSearch,
-  IconFile,
-  IconFileCode,
-  IconRefresh,
-  IconWarningOctogonFill
-} from '@pierre/icons'
-
-import type { ContentSearchResult, FileComparison } from '../../shared/contracts'
-import { hasImagePreview } from '../../shared/imagePreview'
-import { ImageDiffPreview } from './ImageDiffPreview'
+import type { FileComparison } from '../../shared/contracts'
+import { DiffCodeView } from './DiffCodeView'
+import { DiffStateScreen } from './DiffStateScreen'
+import { diffSurfaceState } from './diffSurfaceState'
 import { MarkdownFilePreview } from './MarkdownFilePreview'
 import { markdownPreviewSource, markdownSurface, type DocumentView } from './documentView'
 import { MarkdownSplitResizer } from './MarkdownSplitResizer'
 import type { AgentSelection } from './agentAttachments'
 import type { DiffStyle } from './AppView'
-import { LIVE_CODE_FONT_SIZE_PROPERTY, LIVE_CODE_LINE_HEIGHT_PROPERTY } from './codeZoom'
-import { reportCopiedPath, syncCopyFilePathLifecycle } from './copyFilePath'
-import { syncDragGuideLifecycle } from './dragSelection'
-import { syncSplitDiffResizeLifecycle } from './splitDiffResize'
-import { syncReviewCaretLifecycle } from './reviewCaret'
-import { SELECTION_ACTION_CSS, VIEWER_BASE_CSS } from './viewerCss'
 import { contentSearchMarkers, markersEqual, type EditorMarker } from './editor/markers'
+import { useSearchResults } from './searchResultsStore'
 import {
   createSelectionActionElement,
   selectionLineRange,
@@ -32,7 +19,7 @@ import {
 } from './editor/selectionAction'
 import { useViewerContext, type EditorAnnotations } from './editor/ViewerProviders'
 import { createDiffAnnotation, createFileAnnotation, selectedRangeLastLine } from './reviewAnnotations'
-import { CODE_FONTS, getEditorThemeType, INTERFACE_FONTS, type AppPreferences } from './preferences'
+import type { AppPreferences } from './preferences'
 import {
   DraftComment,
   ReviewThreadCard,
@@ -40,45 +27,9 @@ import {
   type ReviewThread
 } from './ReviewComments'
 import { markRendererStartup } from './startupMetrics'
-import { BackToTopButton, BACK_TO_TOP_THRESHOLD, preferredScrollBehavior } from './BackToTopButton'
 import { showToast } from './toast'
-
-const DIFF_OPTIONS = {
-  diffIndicators: 'bars' as const,
-  lineDiffType: 'word-alt' as const,
-  stickyHeader: true,
-  tokenizeMaxLineLength: 2_000,
-  enableLineSelection: true,
-  enableGutterUtility: true,
-  lineHoverHighlight: 'number' as const
-}
-const INTERACTION_CSS = `
-  ${VIEWER_BASE_CSS}
-  ${SELECTION_ACTION_CSS}
-
-  /* The polygon this used to carry fitted |a|^n + |b|^n = 1 at n≈1.82 — flatter
-     than a circle, i.e. a bevel, not a squircle — and clip-path clips the outline,
-     so the button had no visible keyboard focus. corner-shape in VIEWER_BASE_CSS
-     draws the real thing and leaves the ring alone. */
-  button[data-expand-button][data-expand-button] {
-    cursor: pointer;
-    color: var(--text-secondary);
-  }
-
-  [data-separator-wrapper] {
-    min-height: 30px;
-  }
-
-  [data-unmodified-lines] {
-    color: var(--muted);
-    font-family: var(--diffs-header-font-family);
-    font-size: 11px;
-  }
-`
-export interface ContentSearchState {
-  query: string
-  results: readonly ContentSearchResult[]
-}
+// Search results are published by the command palette, not threaded through the
+// workspace: the tree and the viewer must not re-render while the reader types.
 
 export interface DiffSurfaceProps {
   comparison: FileComparison | null
@@ -87,7 +38,6 @@ export interface DiffSurfaceProps {
   preferences: AppPreferences
   editMode: 'read' | 'edit' | 'preview'
   documentView: DocumentView
-  contentSearch?: ContentSearchState
   getEditor(): Editor<ReviewAnnotationMetadata> | null
   onDraftFileChange(file: FileContents): void
   onEditorAttach(editor: Editor<ReviewAnnotationMetadata>): void
@@ -103,41 +53,6 @@ export interface DiffSurfaceProps {
 const NO_THREADS: ReviewThread[] = []
 
 type DiffContentsProps = Omit<DiffSurfaceProps, 'threadsByPath'> & { threads: ReviewThread[] }
-
-function VirtualizedBackToTop(): React.JSX.Element {
-  const virtualizer = useVirtualizer()
-  const [visible, setVisible] = useState(false)
-
-  useEffect(() => {
-    const currentVirtualizer = virtualizer
-    if (currentVirtualizer == null) return
-    const root = currentVirtualizer.getRoot()
-    if (!(root instanceof HTMLElement)) return
-    // Scroll fires per frame while a long review is flung; reading scrollTop
-    // there costs a layout flush, so the read is coalesced into one rAF.
-    let frame: number | null = null
-    const measure = (): void => {
-      frame = null
-      setVisible(currentVirtualizer.getScrollTop() > BACK_TO_TOP_THRESHOLD)
-    }
-    const handleScroll = (): void => {
-      if (frame == null) frame = requestAnimationFrame(measure)
-    }
-    root.addEventListener('scroll', handleScroll, { passive: true })
-    measure()
-    return () => {
-      if (frame != null) cancelAnimationFrame(frame)
-      root.removeEventListener('scroll', handleScroll)
-    }
-  }, [virtualizer])
-
-  return (
-    <BackToTopButton
-      visible={visible}
-      onClick={() => virtualizer?.scrollTo({ top: 0, behavior: preferredScrollBehavior() })}
-    />
-  )
-}
 
 /**
  * Owns the review-comment cursor for one file: which lines are selected, the
@@ -253,7 +168,6 @@ function DiffContents({
   preferences,
   editMode,
   documentView,
-  contentSearch,
   getEditor,
   onDraftFileChange,
   onEditorAttach,
@@ -272,13 +186,6 @@ function DiffContents({
     fileAnnotations,
     diffAnnotations
   } = useReviewComments(comparisonPath, threads, setThreadsByPath)
-  const codeStyle = useMemo(() => ({
-    '--diffs-font-family': CODE_FONTS[preferences.codeFont].fontFamily,
-    '--diffs-header-font-family': INTERFACE_FONTS[preferences.interfaceFont].fontFamily,
-    '--diffs-font-size': `var(${LIVE_CODE_FONT_SIZE_PROPERTY}, ${preferences.codeFontSize}px)`,
-    '--diffs-line-height': `var(${LIVE_CODE_LINE_HEIGHT_PROPERTY}, ${preferences.codeLineHeight}px)`,
-    '--diffs-font-features': '"calt" 1, "liga" 1'
-  }) as CSSProperties, [preferences])
 
   // The editor remaps annotation coordinates as the document changes and hands
   // back the whole authoritative collection. Ignoring it left comment cards on
@@ -364,11 +271,12 @@ function DiffContents({
 
   // Markers re-anchor themselves as the document changes, so they only have to
   // be pushed when the provider's own input changes.
+  const activeSearch = useSearchResults()
   const searchMarkers = useMemo<EditorMarker[]>(
-    () => contentSearch == null || comparisonPath == null
+    () => comparisonPath == null
       ? []
-      : contentSearchMarkers(contentSearch.results, comparisonPath, contentSearch.query),
-    [comparisonPath, contentSearch]
+      : contentSearchMarkers(activeSearch.results, comparisonPath, activeSearch.query),
+    [activeSearch, comparisonPath]
   )
   const appliedMarkersRef = useRef<EditorMarker[]>([])
   useEffect(() => {
@@ -385,26 +293,6 @@ function DiffContents({
     return () => window.cancelAnimationFrame(frame)
   }, [editMode, getEditor, searchMarkers])
 
-  const interactionOptions = useMemo(() => ({
-    enableLineSelection: DIFF_OPTIONS.enableLineSelection,
-    enableGutterUtility: DIFF_OPTIONS.enableGutterUtility,
-    lineHoverHighlight: DIFF_OPTIONS.lineHoverHighlight,
-    onLineSelectionEnd: (range: SelectedLineRange | null) => {
-      if (range == null) {
-        setReviewCursor({ path: comparisonPath, selectedLines: null, draftRange: null })
-        return
-      }
-      beginComment(range)
-    },
-    onGutterUtilityClick: beginComment,
-    onPostRender: (node: HTMLElement, _instance: unknown, phase: string) => {
-      syncDragGuideLifecycle(node, phase, beginComment)
-      syncSplitDiffResizeLifecycle(node, phase)
-      syncCopyFilePathLifecycle(node, phase, reportCopiedPath)
-      syncReviewCaretLifecycle(node, phase)
-    }
-  }), [beginComment, comparisonPath, setReviewCursor])
-
   const renderFileAnnotation = useCallback(
     (annotation: LineAnnotation<ReviewAnnotationMetadata>) => renderReviewAnnotation(annotation.metadata),
     [renderReviewAnnotation]
@@ -417,57 +305,9 @@ function DiffContents({
   const editorOptions = viewer?.editorOptions
   const editing = editMode === 'edit'
 
-  // `theme` is deliberately absent: the worker pool resolves it and re-renders
-  // every instance on a switch, so repeating it here only bought a second full
-  // DOM rebuild through the wrapper's forceRender path. `themeType` stays —
-  // it colours the chrome and is applied from cached CSS.
-  const fileOptions = useMemo(() => ({
-    themeType: getEditorThemeType(preferences.editorTheme),
-    overflow: preferences.wordWrap ? 'wrap' as const : 'scroll' as const,
-    stickyHeader: DIFF_OPTIONS.stickyHeader,
-    tokenizeMaxLineLength: DIFF_OPTIONS.tokenizeMaxLineLength,
-    disableFileHeader: true,
-    disableLineNumbers: !preferences.showLineNumbers,
-    unsafeCSS: INTERACTION_CSS,
-    ...interactionOptions
-  }), [interactionOptions, preferences.editorTheme, preferences.showLineNumbers, preferences.wordWrap])
-
-  const diffOptions = useMemo(() => ({
-    ...DIFF_OPTIONS,
-    ...interactionOptions,
-    themeType: getEditorThemeType(preferences.editorTheme),
-    overflow: preferences.wordWrap ? 'wrap' as const : 'scroll' as const,
-    disableLineNumbers: !preferences.showLineNumbers,
-    diffStyle,
-    hunkSeparators: 'line-info-basic' as const,
-    // Folded context is unreachable text: while editing, every line has to be
-    // there to be typed in. The fold preference comes back on exit.
-    expandUnchanged: editing || !preferences.foldUnchanged,
-    collapsedContextThreshold: 4,
-    unsafeCSS: INTERACTION_CSS
-  }), [diffStyle, editing, interactionOptions, preferences.editorTheme, preferences.foldUnchanged,
-    preferences.showLineNumbers, preferences.wordWrap])
-
-  if (loading) return <div className="diff-state"><IconRefresh className="spin" /><span>Loading comparison…</span></div>
-  if (comparison == null) return <div className="diff-state"><IconCodeSearch /><span>Select a file in the explorer</span></div>
-  if (hasImagePreview(comparison.image)) {
-    return (
-      <div className="diff-scroll image-diff-scroll">
-        <ImageDiffPreview image={comparison.image} status={comparison.status} />
-      </div>
-    )
-  }
-  if (comparison.binary || comparison.oversized) {
-    return (
-      <div className="diff-state">
-        {comparison.binary ? <IconFile /> : <IconWarningOctogonFill />}
-        <strong>{comparison.binary ? 'Binary file' : 'Large file'}</strong>
-        <span>{comparison.binary ? 'Text diff is not available.' : 'Files larger than 2 MB are not rendered yet.'}</span>
-      </div>
-    )
-  }
-  if (comparison.oldFile == null && comparison.newFile == null) {
-    return <div className="diff-state"><IconFileCode /><span>No renderable file contents</span></div>
+  const state = diffSurfaceState(comparison, loading)
+  if (state !== 'code' || comparison == null) {
+    return <DiffStateScreen state={state} comparison={comparison} />
   }
 
   const surface = markdownSurface(comparison, editMode, documentView)
@@ -476,42 +316,23 @@ function DiffContents({
     return <MarkdownFilePreview source={previewText} />
   }
 
-  let codeView
-  if (comparison.mode === 'file' && comparison.newFile != null) {
-    codeView = (
-      <Virtualizer className="diff-scroll editor-scroll" contentClassName="diff-content editor-content">
-        <File<ReviewAnnotationMetadata>
-          file={comparison.newFile}
-          edit={editing}
-          editorOptions={editorOptions}
-          options={fileOptions}
-          selectedLines={selectedLines}
-          lineAnnotations={fileAnnotations}
-          renderAnnotation={renderFileAnnotation}
-          className="pierre-diff editor-file"
-          style={codeStyle}
-        />
-        <VirtualizedBackToTop />
-      </Virtualizer>
-    )
-  } else {
-    const sharedDiffProps = {
-      options: diffOptions,
-      edit: editing,
-      editorOptions,
-      selectedLines,
-      lineAnnotations: diffAnnotations,
-      renderAnnotation: renderDiffAnnotation,
-      className: 'pierre-diff',
-      style: codeStyle
-    }
-    const diff = comparison.oldFile != null && comparison.newFile != null
-      ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={comparison.newFile} {...sharedDiffProps} />
-      : comparison.oldFile != null
-        ? <MultiFileDiff<ReviewAnnotationMetadata> oldFile={comparison.oldFile} newFile={null} {...sharedDiffProps} />
-        : <MultiFileDiff<ReviewAnnotationMetadata> oldFile={null} newFile={comparison.newFile!} {...sharedDiffProps} />
-    codeView = <Virtualizer className="diff-scroll" contentClassName="diff-content">{diff}<VirtualizedBackToTop /></Virtualizer>
-  }
+  const codeView = (
+    <DiffCodeView
+      comparison={comparison}
+      comparisonPath={comparisonPath}
+      editing={editing}
+      diffStyle={diffStyle}
+      preferences={preferences}
+      editorOptions={editorOptions}
+      selectedLines={selectedLines}
+      fileAnnotations={fileAnnotations}
+      diffAnnotations={diffAnnotations}
+      renderFileAnnotation={renderFileAnnotation}
+      renderDiffAnnotation={renderDiffAnnotation}
+      beginComment={beginComment}
+      setReviewCursor={setReviewCursor}
+    />
+  )
 
   if (surface === 'split' && previewText != null) {
     return (

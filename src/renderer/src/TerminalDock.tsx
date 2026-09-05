@@ -20,6 +20,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
+import './TerminalDock.css'
 
 import type { TerminalSession } from '../../shared/contracts'
 import type { EditorThemeType } from './preferences'

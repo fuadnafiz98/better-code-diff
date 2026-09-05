@@ -1,9 +1,17 @@
+import { normalizeGitHubPullRequestUrl } from './pullRequestUrl.js'
+
 export interface SessionRestoreHint {
   lastRoot: string | null
   restoreLastFolder: boolean
   themeType: 'dark' | 'light'
   folderPresent: boolean
   restoring: boolean
+  /**
+   * Set when the launch itself is a Cmd+H: the window is about to show a pull
+   * request, so the renderer preloads the review viewer instead of the cached
+   * desk's own chunk.
+   */
+  pendingPullRequestUrl: string | null
 }
 
 export const RESTORE_HINT_ARG_PREFIX = '--horus-restore='
@@ -13,7 +21,8 @@ export const EMPTY_RESTORE_HINT: SessionRestoreHint = {
   restoreLastFolder: true,
   themeType: 'dark',
   folderPresent: false,
-  restoring: false
+  restoring: false,
+  pendingPullRequestUrl: null
 }
 
 export function shouldRestoreLastFolder(input: {
@@ -27,7 +36,14 @@ export function shouldRestoreLastFolder(input: {
 
 export function parseRestoreHint(raw: unknown): SessionRestoreHint {
   if (typeof raw !== 'object' || raw == null) return EMPTY_RESTORE_HINT
-  const { lastRoot, restoreLastFolder, themeType, folderPresent, restoring } = raw as Record<string, unknown>
+  const {
+    lastRoot,
+    restoreLastFolder,
+    themeType,
+    folderPresent,
+    restoring,
+    pendingPullRequestUrl
+  } = raw as Record<string, unknown>
   const parsedLastRoot = typeof lastRoot === 'string' && lastRoot !== '' ? lastRoot : null
   const parsedRestore = typeof restoreLastFolder === 'boolean' ? restoreLastFolder : true
   const parsedPresent = parsedLastRoot != null && folderPresent === true
@@ -36,7 +52,10 @@ export function parseRestoreHint(raw: unknown): SessionRestoreHint {
     restoreLastFolder: parsedRestore,
     themeType: themeType === 'light' ? 'light' : 'dark',
     folderPresent: parsedPresent,
-    restoring: restoring === true && parsedPresent && parsedRestore
+    restoring: restoring === true && parsedPresent && parsedRestore,
+    pendingPullRequestUrl: normalizeGitHubPullRequestUrl(
+      typeof pendingPullRequestUrl === 'string' ? pendingPullRequestUrl : ''
+    )
   }
 }
 

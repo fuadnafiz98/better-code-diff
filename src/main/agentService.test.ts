@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { AgentStreamEvent } from '../shared/contracts.js'
-import { coalesceAgentTextEvents, getClaudeAccessConfig } from './agentService.js'
+import { coalesceAgentTextEvents, composeAgentPrompt, getClaudeAccessConfig } from './agentService.js'
 
 describe('getClaudeAccessConfig', () => {
   test('allows Bash in a write-blocked review sandbox', () => {
@@ -31,6 +31,16 @@ describe('getClaudeAccessConfig', () => {
 
     expect(config.permissionMode).toBe('bypassPermissions')
     expect(config.allowDangerouslySkipPermissions).toBe(true)
+  })
+})
+
+describe('composeAgentPrompt', () => {
+  test('tells the agent to use the loaded review instead of GitHub', () => {
+    const prompt = composeAgentPrompt('Explain this change', 'Repository root: /repo-a')
+    expect(prompt).toContain('Do not fetch remotes')
+    expect(prompt).toContain('mermaid')
+    expect(prompt).toContain('Repository root: /repo-a')
+    expect(prompt).not.toContain('Use repository search and Git commands')
   })
 })
 

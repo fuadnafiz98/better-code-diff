@@ -6,11 +6,17 @@ import { useFileTree } from '@pierre/trees/react'
 
 import type { FileComparison, PullRequestReviewComment, PullRequestReviewEvent, RepositoryChangeEvent, RepositoryFileStatus, RepositoryReview, RepositorySnapshot } from '../../shared/contracts'
 import { isMarkdownPath } from '../../shared/markdownPreview'
-import { DiffToolbar, type DiffStyle, type FileEditControls, type WorkspaceView } from './AppView'
+import type { DiffStyle, FileEditControls, WorkspaceView } from './AppView'
+import { DiffToolbar } from './DiffToolbar'
 import { Explorer } from './Explorer'
 import { getEditorThemeType, type AppPreferences } from './preferences'
 import { SidebarResizer } from './SidebarResizer'
-import { PullRequestReviewBar } from './PullRequestReviewBar'
+import { ReviewStatusBar } from './ReviewStatusBar'
+import { ReviewFinishBar } from './ReviewFinishBar'
+import { ConversationErrorBar } from './ConversationErrorBar'
+import { EditConflictBar } from './WorkspaceNoticeBars'
+import { useViewerChunkPreload } from './useViewerChunkPreload'
+import { reviewToolbarComparison, reviewToolbarTitle } from './reviewHeaderModel'
 import { ReviewCheckpointBar } from './ReviewCheckpointBar'
 import type { ReviewCheckpoint } from './reviewCheckpoints'
 import type { ReviewAnnotationMetadata, ReviewThread } from './ReviewComments'
@@ -22,29 +28,33 @@ import { useReviewLoadState, type ReviewLoadState } from './useReviewLoadState'
 import { useViewerSuspension } from './useViewerSuspension'
 import { formatKeybinding, type ReviewCommand } from './keybindings'
 import { useReviewShortcuts } from './useReviewShortcuts'
-import { getDirectoryPaths, getTreeFollowBehavior, orderPathsForTree, treeContentSyncMode } from './treeExpansion'
+import {
+  getDirectoryPaths,
+  getTreeFollowBehavior,
+  orderPathsForTree,
+  treeContentSyncMode,
+  type AppliedTreeContent
+} from './treeExpansion'
 import { FindBar } from './FindBar'
 import { WorkspaceCodeSkeleton } from './WorkspaceSkeleton'
-import { markRepositoryWorkspaceRender } from './reviewMetrics'
+import { setExplorerRevealHandler } from './explorerReveal'
+import { markWorkspaceRender } from './workspaceRenderMetric'
 import { useCodeZoomGesture } from './useCodeZoomGesture'
 import { useFileEditing } from './useFileEditing'
 import { EditorStatusBar } from './editor/EditorStatusBar'
 import { useViewerContext } from './editor/ViewerProviders'
+import { retainReviewItems } from './reviewItems'
+import { applyReviewFileFilter, EMPTY_REVIEW_FILE_FILTER } from './reviewFileFilter'
+import { useReviewDraft } from './useReviewDraft'
 import { reviewPathsForSnapshot, workspaceViewForTreePath } from './workspaceMode'
 import { copyWorkingFileContents } from './copyFilePath'
-import { getErrorMessage } from './repositoryApi'
 import {
   getLoadedDiffSurface,
   getLoadedMultiFileReview,
-  preloadDiffSurface,
-  preloadMultiFileReview,
-  preloadWorkspaceViewer,
   subscribeDiffSurface,
   subscribeMultiFileReview
 } from './workspaceBoot'
 import { markRendererStartup } from './startupMetrics'
-
-import type { ContentSearchState } from './DiffSurface'
 
 type TreeFileStatus = Exclude<RepositoryFileStatus, 'conflicted'>
 
@@ -207,8 +217,6 @@ export interface RepositoryWorkspaceProps {
   collisionPaths: ReadonlySet<string>
   initialReviewScrollTop: number
   onReviewScrollPositionChange(scrollTop: number): void
-  /** Repository search state, surfaced as inline hint markers while editing. */
-  contentSearch?: ContentSearchState
   onSelectPath(path: string): void
   onDiffStyleChange(style: DiffStyle): void
   onWorkspaceViewChange(view: WorkspaceView): void
@@ -248,6 +256,10 @@ interface RepositoryReviewHeaderProps {
   pullRequestReviewMessage: string | null
   inlineCommentCount: number
   orphanedCommentCount: number
+  reviewComposerExpanded: boolean
+  reviewComposerBody: string
+  onReviewComposerExpandedChange(expanded: boolean): void
+  onReviewComposerBodyChange(body: string): void
   onClosePullRequestReview(): void
   onSetReviewCheckpoint(): void
   onOpenSinceReview(): void
@@ -282,6 +294,10 @@ function RepositoryReviewHeader({
   pullRequestReviewMessage,
   inlineCommentCount,
   orphanedCommentCount,
+  reviewComposerExpanded,
+  reviewComposerBody,
+  onReviewComposerExpandedChange,
+  onReviewComposerBodyChange,
   onClosePullRequestReview,
   onSetReviewCheckpoint,
   onOpenSinceReview,
@@ -304,8 +320,8 @@ function RepositoryReviewHeader({
         diffStyle={diffStyle}
         workspaceView={workspaceView}
         reviewFileCount={reviewFileCount}
-        reviewTitle={repositoryReview == null ? undefined : repositoryReview.kind === 'github' ? `#${repositoryReview.pullRequest.number} ${repositoryReview.pullRequest.title}` : repositoryReview.title}
-        reviewComparison={repositoryReview == null ? undefined : repositoryReview.kind === 'github' ? `${repositoryReview.pullRequest.baseRefName} → ${repositoryReview.pullRequest.headRefName}` : `${repositoryReview.baseRefName} → ${repositoryReview.headRefName}`}
+        reviewTitle={reviewToolbarTitle(repositoryReview)}
+        reviewComparison={reviewToolbarComparison(repositoryReview)}
         wordWrap={wordWrap}
         foldUnchanged={foldUnchanged}
         fileEdit={fileEdit}
@@ -327,27 +343,20 @@ function RepositoryReviewHeader({
           onOpenSince={onOpenSinceReview}
         />
       ) : null}
-      {repositoryReview?.kind === 'github' && repositoryReview.pullRequest.state === 'OPEN' && reviewWorldSource === 'patch' ? (
-        <PullRequestReviewBar
-          submitting={submittingPullRequestReview}
-          message={pullRequestReviewMessage}
-          inlineCommentCount={inlineCommentCount}
-          orphanedCommentCount={orphanedCommentCount}
-          viewerCanSubmitDecision={repositoryReview.viewerCanSubmitDecision}
-          onOpen={onOpenReviewSummary}
-          onSubmit={onSubmitPullRequestReview}
-        />
-      ) : repositoryReview?.kind === 'github' && reviewWorldSource === 'since' ? (
-        <div className="review-bar pr-review-readonly" role="status">
-          File-level changes since the checkpoint. Return to the Patch world to submit a review.
-        </div>
-      ) : repositoryReview?.kind === 'github' ? (
-        <div className="review-bar pr-review-readonly" role="status">
-          This pull request is {repositoryReview.pullRequest.state.toLowerCase()}. Review submission is disabled.
-        </div>
-      ) : repositoryReview?.kind === 'local' ? (
-        <div className="review-bar pr-review-readonly" role="status">Local branch review. Comments stay local and can be copied from the review summary.</div>
-      ) : null}
+      <ReviewStatusBar
+        review={repositoryReview}
+        reviewWorldSource={reviewWorldSource}
+        submitting={submittingPullRequestReview}
+        message={pullRequestReviewMessage}
+        inlineCommentCount={inlineCommentCount}
+        orphanedCommentCount={orphanedCommentCount}
+        expanded={reviewComposerExpanded}
+        body={reviewComposerBody}
+        onExpandedChange={onReviewComposerExpandedChange}
+        onBodyChange={onReviewComposerBodyChange}
+        onOpen={onOpenReviewSummary}
+        onSubmit={onSubmitPullRequestReview}
+      />
     </>
   )
 }
@@ -366,16 +375,13 @@ function useReviewPaths(
 function useReviewTreeData(
   snapshot: RepositorySnapshot,
   repositoryReview: RepositoryReview | null,
-  reviewPaths: readonly string[],
+  treePaths: readonly string[],
   threadsByPath: Record<string, ReviewThread[]>,
   reviewWorldSource: RepositoryWorkspaceProps['reviewWorldSource']
 ) {
   // Both source arrays are already memoized, so identity is the whole test the
   // tree needs. Joining them into multi-megabyte keys on every render was the
   // most expensive thing this component did on a large repository.
-  const treePaths = reviewWorldSource === 'desk' && repositoryReview == null
-    ? snapshot.paths
-    : reviewPaths
   const treeStatuses = useMemo<Array<{ path: string; status: TreeFileStatus }>>(
     () => reviewWorldSource === 'desk' && repositoryReview == null
       ? snapshot.statuses.map((status) => ({ path: status.path, status: toTreeStatus(status.status) }))
@@ -495,23 +501,21 @@ function createTreeContextMenu(
 // only reset when the content behind it actually changed.
 function useTreeContentSync(
   model: FileTreeModel,
+  root: string,
   isGitRepository: boolean,
   treePaths: readonly string[],
   treeStatuses: readonly { path: string; status: TreeFileStatus }[],
   directoryPaths: readonly string[],
   changedDirectoryPaths: readonly string[]
 ): void {
-  const appliedTreeContentRef = useRef<{
-    paths: readonly string[]
-    statuses: readonly { path: string; status: TreeFileStatus }[]
-  } | null>(null)
+  const appliedTreeContentRef = useRef<AppliedTreeContent | null>(null)
 
   useLayoutEffect(() => {
     const applied = appliedTreeContentRef.current
-    const mode = treeContentSyncMode(applied, treePaths, treeStatuses)
+    const mode = treeContentSyncMode(applied, root, treePaths, treeStatuses)
     if (mode === 'skip') return
-    appliedTreeContentRef.current = { paths: treePaths, statuses: treeStatuses }
-    if (mode === 'reset') model.resetPaths(treePaths)
+    appliedTreeContentRef.current = { root, paths: treePaths, statuses: treeStatuses }
+    if (mode !== 'status') model.resetPaths(treePaths)
     model.setGitStatus(treeStatuses)
     if (mode === 'status') {
       for (const directoryPath of changedDirectoryPaths) {
@@ -521,9 +525,11 @@ function useTreeContentSync(
       return
     }
     if (isGitRepository) {
-      for (const directoryPath of [...directoryPaths].reverse()) {
-        const item = model.getItem(directoryPath)
-        if (item != null && 'collapse' in item) item.collapse()
+      if (mode === 'reset') {
+        for (const directoryPath of [...directoryPaths].reverse()) {
+          const item = model.getItem(directoryPath)
+          if (item != null && 'collapse' in item) item.collapse()
+        }
       }
       for (const directoryPath of changedDirectoryPaths) {
         const item = model.getItem(directoryPath)
@@ -536,7 +542,7 @@ function useTreeContentSync(
       const item = model.getItem(directoryPath)
       if (item != null && 'expand' in item) item.expand()
     }
-  }, [changedDirectoryPaths, directoryPaths, isGitRepository, model, treePaths, treeStatuses])
+  }, [changedDirectoryPaths, directoryPaths, isGitRepository, model, root, treePaths, treeStatuses])
 
 }
 
@@ -623,7 +629,6 @@ interface RepositoryDiffPanelProps {
   reviewCommand: { command: ReviewCommand; path: string; revision: number } | null
   surfaceComparison: FileComparison | null
   surfaceLoading: boolean
-  contentSearch?: ContentSearchState
   editMode: 'edit' | 'preview' | 'read'
   documentView: FileEditControls['documentView']
   onDraftFileChange(file: FileContents): void
@@ -656,6 +661,10 @@ function useRepositoryReviewHeader({
   pullRequestReviewMessage,
   inlineCommentCount,
   orphanedCommentCount,
+  reviewComposerExpanded,
+  reviewComposerBody,
+  onReviewComposerExpandedChange,
+  onReviewComposerBodyChange,
   onClosePullRequestReview,
   onSetReviewCheckpoint,
   onOpenSinceReview,
@@ -686,6 +695,10 @@ function useRepositoryReviewHeader({
   pullRequestReviewMessage: string | null
   inlineCommentCount: number
   orphanedCommentCount: number
+  reviewComposerExpanded: boolean
+  reviewComposerBody: string
+  onReviewComposerExpandedChange(expanded: boolean): void
+  onReviewComposerBodyChange(body: string): void
   onClosePullRequestReview(): void
   onSetReviewCheckpoint(): void
   onOpenSinceReview(): void
@@ -724,6 +737,10 @@ function useRepositoryReviewHeader({
     pullRequestReviewMessage,
     inlineCommentCount,
     orphanedCommentCount,
+    reviewComposerExpanded,
+    reviewComposerBody,
+    onReviewComposerExpandedChange,
+    onReviewComposerBodyChange,
     onClosePullRequestReview,
     onSetReviewCheckpoint,
     onOpenSinceReview,
@@ -742,6 +759,10 @@ function useRepositoryReviewHeader({
     inlineCommentCount,
     orphanedCommentCount,
     isFilePreview,
+    reviewComposerBody,
+    reviewComposerExpanded,
+    onReviewComposerBodyChange,
+    onReviewComposerExpandedChange,
     isGitRepository,
     onClosePullRequestReview,
     onSetReviewCheckpoint,
@@ -813,7 +834,6 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
   reviewCommand,
   surfaceComparison,
   surfaceLoading,
-  contentSearch,
   editMode,
   documentView,
   onDraftFileChange,
@@ -836,39 +856,14 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
     getLoadedMultiFileReview
   )
 
-  useEffect(() => {
-    let active = true
-    // Current view first so the first paint is not waiting on the other chunk,
-    // then warm the sibling so file ↔ review does not flash the code skeleton.
-    void preloadWorkspaceViewer(workspaceView)
-      .then(async () => {
-        if (!active) return
-        if (workspaceView === 'multi') await preloadDiffSurface()
-        else await preloadMultiFileReview()
-      })
-      .catch((error: unknown) => {
-        if (active) onError(getErrorMessage(error))
-      })
-    return () => { active = false }
-  }, [onError, workspaceView])
+  useViewerChunkPreload(workspaceView, onError)
 
   return (
     <section ref={surfaceRef} className={`diff-panel ${isFilePreview ? 'file-preview-mode' : ''}`} id="repository-diff">
       <RepositoryReviewHeader {...header} />
       <FindBar />
-      {conflict != null ? (
-        <div className="review-bar pr-review-readonly" role="alert">
-          {conflict.path} changed on disk while you were editing it.
-          <button className="bar-button" type="button" onClick={onKeepDraft}>Keep my draft</button>
-          <button className="bar-button" type="button" onClick={onReloadFromDisk}>Reload from disk</button>
-        </div>
-      ) : null}
-      {conversationUnavailable != null ? (
-        <div className="review-bar pr-review-readonly" role="alert">
-          {conversationUnavailable}
-          <button className="bar-button" type="button" onClick={onRetryConversation}>Retry</button>
-        </div>
-      ) : null}
+      <EditConflictBar conflict={conflict} onKeepDraft={onKeepDraft} onReloadFromDisk={onReloadFromDisk} />
+      <ConversationErrorBar message={conversationUnavailable} onRetry={onRetryConversation} />
       {patchLoadError == null ? null : (
         <div className="multi-file-error" role="alert">{patchLoadError}</div>
       )}
@@ -912,13 +907,28 @@ const RepositoryDiffPanel = memo(function RepositoryDiffPanel({
         DiffSurface == null ? <WorkspaceCodeSkeleton /> : (
             <DiffSurface comparison={surfaceComparison} loading={surfaceLoading} diffStyle={diffStyle}
               preferences={viewerPreferences} editMode={editMode} documentView={documentView}
-              contentSearch={contentSearch} getEditor={getEditor}
+              getEditor={getEditor}
               onDraftFileChange={onDraftFileChange} onEditorAttach={onEditorAttach}
               onEditorBlur={onEditorBlur}
               onAttachToAgent={onAttachToAgent}
               threadsByPath={threadsByPath} setThreadsByPath={setThreadsByPath} />
         )
       )}
+      <ReviewFinishBar
+        visible={workspaceView === 'multi'}
+        review={header.repositoryReview}
+        reviewWorldSource={header.reviewWorldSource}
+        submitting={header.submittingPullRequestReview}
+        message={header.pullRequestReviewMessage}
+        inlineCommentCount={header.inlineCommentCount}
+        orphanedCommentCount={header.orphanedCommentCount}
+        expanded={header.reviewComposerExpanded}
+        body={header.reviewComposerBody}
+        onExpandedChange={header.onReviewComposerExpandedChange}
+        onBodyChange={header.onReviewComposerBodyChange}
+        onOpen={header.onOpenReviewSummary}
+        onSubmit={header.onSubmitPullRequestReview}
+      />
       {showStatusBar ? (
         <EditorStatusBar
           mode={editMode}
@@ -1208,7 +1218,8 @@ function useRepositoryExplorer({
     model.scrollToPath(path, { focus: false, offset })
   }, [model])
 
-  useTreeContentSync(model, snapshot.kind === 'git', explorerPaths, explorerStatuses, directoryPaths, changedDirectoryPaths)
+  useTreeContentSync(model, snapshot.root, snapshot.kind === 'git', explorerPaths, explorerStatuses,
+    directoryPaths, changedDirectoryPaths)
 
   useLayoutEffect(() => {
     if (selectedPath == null) return
@@ -1229,6 +1240,21 @@ function useRepositoryExplorer({
     scrollTreeToPath(path, followBehavior.offset)
   }, [consumeInstantTreeFollowTarget, model, pathSet, scrollTreeToPath, visibleMultiFilePathRef])
 
+  // ⌘P offers directories as rows; choosing one has to move the explorer to it,
+  // which means opening every ancestor first — the tree cannot scroll to a row
+  // that is not rendered.
+  const revealPath = useCallback((path: string) => {
+    for (const directoryPath of collectDirectoryPaths([path])) {
+      const item = model.getItem(directoryPath)
+      if (item != null && 'expand' in item) item.expand()
+    }
+    const item = model.getItem(path)
+    if (item != null && 'expand' in item) item.expand()
+    scrollTreeToPath(path, 'nearest')
+  }, [model, scrollTreeToPath])
+
+  useEffect(() => setExplorerRevealHandler(revealPath), [revealPath])
+
   return { model, explorerPaths, activateTreeRow, handleVisibleMultiFilePathChange }
 }
 
@@ -1237,7 +1263,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   preferences, onAttachToAgent, onPreferencesChange, repositoryReview, reviewWorldSource,
   reviewCheckpoint, checkpointChangedFileCount, checkpointRemovedFileCount, reviewReady,
   sinceRemovedPaths, sinceUncertainPaths,
-  repositoryChange, contentSearch, onSelectPath,
+  repositoryChange, onSelectPath,
   collisionPaths, initialReviewScrollTop, onReviewScrollPositionChange,
   onDiffStyleChange, onWorkspaceViewChange, onClosePullRequestReview, onSetReviewCheckpoint,
   onOpenSinceReview, submittingPullRequestReview,
@@ -1245,10 +1271,29 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
   patchLoadError, reviewWorldId, sidebarVisible, onSidebarToggle, onBranchesOpen
 }: RepositoryWorkspaceProps): React.JSX.Element {
   useLayoutEffect(() => markRendererStartup('explorerCommitted'), [])
-  useEffect(markRepositoryWorkspaceRender)
+  useEffect(markWorkspaceRender)
   const isFilePreview = workspaceView === 'file' && comparison?.mode === 'file'
   const reviewIdentity = repositoryReviewIdentity(repositoryReview)
   const reviewPaths = useReviewPaths(snapshot, repositoryReview)
+  const {
+    fileFilter,
+    setFileFilter,
+    composerExpanded: reviewComposerExpanded,
+    setComposerExpanded: setReviewComposerExpanded,
+    composerBody: reviewComposerBody,
+    setComposerBody: setReviewComposerBody
+  } = useReviewDraft(reviewIdentity)
+  const treeSourcePaths = reviewWorldSource === 'desk' && repositoryReview == null
+    ? snapshot.paths
+    : reviewPaths
+  const visibleTreePaths = useMemo(
+    () => applyReviewFileFilter(treeSourcePaths, fileFilter),
+    [fileFilter, treeSourcePaths]
+  )
+  const visibleReviewPaths = useMemo(
+    () => applyReviewFileFilter(reviewPaths, fileFilter),
+    [fileFilter, reviewPaths]
+  )
   const { threadsByPath, setThreadsByPath, viewedFiles, setViewedFiles, load: reviewLoad } =
     useRepositoryReviewSession({
       root: snapshot.root,
@@ -1275,7 +1320,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     scrollTopRef: multiFileScrollTopRef,
     visiblePathRef: visibleMultiFilePathRef
   } = useReviewNavigation({
-    paths: reviewPaths,
+    paths: visibleReviewPaths,
     workspaceView,
     initialScrollTop: initialReviewScrollTop,
     markInstantTreeFollowTarget,
@@ -1304,8 +1349,19 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     onError
   })
   const { treePaths, treeStatuses, reviewComments, orphanedCommentCount } =
-    useReviewTreeData(snapshot, repositoryReview, reviewPaths, threadsByPath, reviewWorldSource)
+    useReviewTreeData(snapshot, repositoryReview, visibleTreePaths, threadsByPath, reviewWorldSource)
   const reviewPathSet = useMemo(() => new Set(reviewPaths), [reviewPaths])
+  const visibleReviewLoadState = useMemo(() => {
+    const items = retainReviewItems(reviewLoad.loadState.items, visibleReviewPaths)
+    return items === reviewLoad.loadState.items
+      ? reviewLoad.loadState
+      : { ...reviewLoad.loadState, items }
+  }, [reviewLoad.loadState, visibleReviewPaths])
+  useEffect(() => {
+    if (selectedPath == null) return
+    if (visibleReviewPaths.includes(selectedPath) || !reviewPaths.includes(selectedPath)) return
+    setFileFilter(EMPTY_REVIEW_FILE_FILTER)
+  }, [reviewPaths, selectedPath, setFileFilter, visibleReviewPaths])
   const fileExtension = selectedPath?.split('.').at(-1)?.toUpperCase()
   const viewerPreferences = useViewerPreferences(preferences, codeZoom)
   // Releasing the viewer would destroy the edit session and every unsaved draft
@@ -1363,7 +1419,7 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     isFilePreview,
     diffStyle,
     workspaceView,
-    reviewFileCount: reviewPaths.length,
+    reviewFileCount: visibleReviewPaths.length,
     repositoryReview,
     reviewWorldSource,
     reviewCheckpoint,
@@ -1376,6 +1432,10 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
     pullRequestReviewMessage,
     inlineCommentCount: reviewComments.length,
     orphanedCommentCount,
+    reviewComposerExpanded,
+    reviewComposerBody,
+    onReviewComposerExpandedChange: setReviewComposerExpanded,
+    onReviewComposerBodyChange: setReviewComposerBody,
     onClosePullRequestReview,
     onSetReviewCheckpoint,
     onOpenSinceReview,
@@ -1393,7 +1453,9 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
       <Explorer filePaths={explorerPaths} model={model} themeType={getEditorThemeType(preferences.editorTheme)}
         sidebarVisible={sidebarVisible} onSidebarToggle={onSidebarToggle} sidebarShortcut={sidebarShortcut}
         isGit={snapshot.kind === 'git'} branchName={snapshot.kind === 'git' ? snapshot.branch : null}
-        onBranchesOpen={onBranchesOpen} onRowActivate={activateTreeRow} />
+        onBranchesOpen={onBranchesOpen} onRowActivate={activateTreeRow}
+        fileFilter={fileFilter} onFileFilterChange={setFileFilter}
+        unfilteredFileCount={treeSourcePaths.length} />
       <SidebarResizer />
       <RepositoryDiffPanel
         surfaceRef={codeZoom.surfaceRef}
@@ -1409,11 +1471,11 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         workspaceView={workspaceView}
         reviewWorldId={reviewWorldId}
         reviewSessionRevision={reviewSessionRevision}
-        reviewPaths={reviewPaths}
+        reviewPaths={visibleReviewPaths}
         diffStyle={diffStyle}
         viewerPreferences={viewerPreferences}
         repositoryReview={repositoryReview}
-        reviewLoadState={reviewLoad.loadState}
+        reviewLoadState={visibleReviewLoadState}
         reviewLoading={reviewLoad.loading}
         reviewTargetPathCount={reviewLoad.targetPathCount}
         onLoadMoreReviewFiles={reviewLoad.loadMoreFiles}
@@ -1438,7 +1500,6 @@ const RepositoryWorkspace = memo(function RepositoryWorkspace({
         reviewCommand={reviewCommand}
         surfaceComparison={surfaceComparison}
         surfaceLoading={surfaceLoading}
-        contentSearch={contentSearch}
         editMode={fileEditing.activeSession?.mode ?? 'read'}
         documentView={selectedPath != null && isMarkdownPath(selectedPath)
           ? fileEditing.controls.documentView

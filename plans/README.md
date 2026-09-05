@@ -13,4 +13,5 @@ keep-mounted last-3 Activity in `worldViewCache` /
 
 | Document | Scope | Status |
 | --- | --- | --- |
+| [perf-instant-plan.md](perf-instant-plan.md) | Instant-perf program: main git path (ignored walk, watcher self-retrigger, open() snapshot), renderer boot, Cmd+P palette, Cmd+H PR open, sessions/cache, hardening. Executor-sliced into waves/tracks with in-file status table. | ACTIVE — Wave 1 in progress |
 | [grok-github-fast.md](../grok-github-fast.md) | GitHub working-set replica, revised after critique. SQLite social-state cache, GitHub line map, cheap-signal skip, poller-first. Not executor-sliced. Diagrams: [`grok-github-fast.html`](../grok-github-fast.html). | PLAN — deferred |

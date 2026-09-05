@@ -1,0 +1,81 @@
+/* The terminal dock is lazily imported (App.tsx) and joins the xterm stylesheet
+   this module already loads. */
+/* The project terminal is one docked surface. It occupies layout space instead
+   of covering the diff, while the renderer stays mounted when the dock hides so
+   running commands and scrollback remain intact. */
+.terminal-dock {
+  height: var(--terminal-panel-height);
+  min-height: 0;
+  position: absolute;
+  z-index: var(--z-chrome);
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  contain: layout paint style;
+  border-top: 1px solid var(--border-strong);
+  background: var(--panel);
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+  /* One duration across all three, so no part of the travel happens unseen. */
+  transition: opacity var(--duration-base) var(--ease-out), transform var(--duration-base) var(--ease-out), visibility var(--duration-base) allow-discrete, content-visibility var(--duration-base) allow-discrete;
+}
+.terminal-resizer {
+  height: 9px;
+  position: absolute;
+  z-index: var(--z-raised);
+  top: -5px;
+  right: 0;
+  left: 0;
+  cursor: row-resize;
+  touch-action: none;
+  outline: 0;
+}
+.terminal-resizer::after { content: ""; height: 1px; position: absolute; top: 4px; right: 0; left: 0; background: transparent; }
+.terminal-resizer:hover::after, .terminal-resizer:focus-visible::after, .terminal-resizing .terminal-resizer::after { background: color-mix(in srgb, var(--accent) 82%, transparent); }
+.terminal-resizing, .terminal-resizing * { cursor: row-resize !important; user-select: none !important; }
+.terminal-header {
+  height: 38px;
+  min-width: 0;
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr) minmax(150px, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.terminal-title { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.terminal-title > svg { width: var(--icon-md); height: var(--icon-md); color: var(--muted); }
+.terminal-title strong { color: var(--text); font-size: var(--text-sm); font-weight: var(--weight-bold); }
+.terminal-status { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--status-success-text); }
+.terminal-status.starting { background: var(--accent); animation: terminal-status-pulse 1.1s ease-in-out infinite; }
+.terminal-status.exited { background: var(--faint); }
+.terminal-status.failed { background: var(--status-danger-text); }
+.terminal-shell { min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.terminal-context { min-width: 0; overflow: hidden; color: var(--faint); font-family: var(--font-mono); font-size: var(--text-3xs); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.terminal-actions button { width: var(--control-height); height: var(--control-height); display: grid; place-items: center; border: 0; border-radius: var(--corner-control); padding: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.terminal-actions button:hover:not(:disabled) { background: var(--control-fill-hover); color: var(--text); }
+.terminal-actions svg { width: var(--icon-md); height: var(--icon-md); }
+.terminal-surface { min-width: 0; min-height: 0; flex: 1; position: relative; overflow: hidden; padding: 7px 9px 8px 11px; background: var(--surface-input); }
+.terminal-viewport, .terminal-viewport > .xterm { width: 100%; height: 100%; }
+.terminal-viewport .xterm { padding: 0; }
+.terminal-viewport .xterm-viewport { background: var(--surface-input) !important; scrollbar-color: var(--border-strong) transparent; scrollbar-width: thin; }
+.terminal-error { position: absolute; right: 12px; bottom: 8px; left: 12px; overflow: hidden; color: var(--danger-message); font-family: var(--font-mono); font-size: var(--text-2xs); text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+@media (max-width: 900px) {
+  .terminal-header { grid-template-columns: minmax(0, 1fr) auto; }
+  .terminal-context { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .terminal-dock {
+    transform: none !important;
+    transition-property: opacity, visibility !important;
+    transition-duration: var(--duration-base) !important;
+    transition-timing-function: ease !important;
+  }
+  .terminal-status.starting { animation: status-pulse 1.6s ease-in-out infinite !important; animation-duration: 1.6s !important; animation-iteration-count: infinite !important; }
+}

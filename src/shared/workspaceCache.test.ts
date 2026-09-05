@@ -3,17 +3,24 @@ import { describe, expect, it } from 'bun:test'
 import type { RepositorySnapshot } from './contracts.js'
 import { sessionWorkspaceStage } from './sessionRestore.js'
 import {
+  EMPTY_WORKSPACE_CACHE_STORE,
   MAX_CACHED_FILE_CHARS,
   MAX_CACHED_PATHS,
+  MAX_WORKSPACE_CACHE_SLOTS,
   cachedFileTextFromComparison,
+  cachedFileTextIdentity,
   capWorkspaceCache,
   comparisonFromCachedText,
   comparisonWithoutOpenSession,
   idleFileComparison,
   initialWorkspacePaint,
+  lastWorkspaceCache,
   mergeWorkspaceCache,
   parseWorkspaceCache,
-  parseWorkspaceUi
+  parseWorkspaceCacheStore,
+  parseWorkspaceUi,
+  rememberWorkspaceCacheEntry,
+  workspaceCacheForRoot
 } from './workspaceCache.js'
 
 const snapshot = (paths: string[] = ['src/a.ts', 'src/b.ts']): RepositorySnapshot => ({
@@ -169,5 +176,92 @@ describe('parseWorkspaceUi', () => {
       workspaceView: 'multi',
       fileText: { path: 'src/b.ts', text: 'b' }
     })
+  })
+
+  it('leaves the cached text alone when the update does not carry any', () => {
+    const ui = parseWorkspaceUi({ selectedPath: 'src/a.ts', workspaceView: 'file' })
+    expect(ui).toEqual({ selectedPath: 'src/a.ts', workspaceView: 'file' })
+    expect(mergeWorkspaceCache(snapshot(), ui, cache).fileText)
+      .toEqual({ path: 'src/a.ts', text: 'export const a = 1\n' })
+  })
+})
+
+describe('cachedFileTextIdentity', () => {
+  it('changes only when the file contents change', () => {
+    const comparison = comparisonFromCachedText({ path: 'src/a.ts', text: 'one' })!
+    expect(cachedFileTextIdentity(comparison)).toBe(cachedFileTextIdentity({ ...comparison }))
+    expect(cachedFileTextIdentity({
+      ...comparison,
+      newFile: { ...comparison.newFile!, cacheKey: 'moved' }
+    })).not.toBe(cachedFileTextIdentity(comparison))
+    expect(cachedFileTextIdentity(idleFileComparison('src/a.ts'))).toBeNull()
+    expect(cachedFileTextIdentity(null)).toBeNull()
+  })
+})
+
+describe('workspace cache store', () => {
+  const other = { ...cache, lastRoot: '/work/other', snapshot: { ...snapshot(), root: '/work/other' } }
+
+  it('reads a version 1 file as a single slot', () => {
+    const store = parseWorkspaceCacheStore(cache)
+    expect(store.lastRoot).toBe(cache.lastRoot)
+    expect(store.entries).toEqual([cache])
+    expect(lastWorkspaceCache(store)).toEqual(cache)
+  })
+
+  it('returns the empty store for anything it cannot read', () => {
+    expect(parseWorkspaceCacheStore(null)).toEqual(EMPTY_WORKSPACE_CACHE_STORE)
+    expect(parseWorkspaceCacheStore({ version: 9 })).toEqual(EMPTY_WORKSPACE_CACHE_STORE)
+    expect(parseWorkspaceCacheStore({ version: 2, lastRoot: '/gone', entries: [{ nope: true }] }))
+      .toEqual({ version: 2, lastRoot: null, entries: [] })
+  })
+
+  it('keeps both repositories so alternating between them never repaints a skeleton', () => {
+    const store = rememberWorkspaceCacheEntry(rememberWorkspaceCacheEntry(
+      EMPTY_WORKSPACE_CACHE_STORE,
+      cache
+    ), other)
+
+    expect(store.lastRoot).toBe(other.lastRoot)
+    expect(workspaceCacheForRoot(store, cache.lastRoot)).toEqual(cache)
+    expect(workspaceCacheForRoot(store, other.lastRoot)).toEqual(other)
+    expect(workspaceCacheForRoot(store, '/never/opened')).toBeNull()
+  })
+
+  it('drops the least recently opened entry past the slot cap', () => {
+    let store = EMPTY_WORKSPACE_CACHE_STORE
+    const roots: string[] = []
+    for (let index = 0; index < MAX_WORKSPACE_CACHE_SLOTS + 2; index += 1) {
+      const root = `/work/repo-${index}`
+      roots.push(root)
+      store = rememberWorkspaceCacheEntry(store, {
+        ...cache,
+        lastRoot: root,
+        snapshot: { ...snapshot(), root }
+      })
+    }
+
+    expect(store.entries).toHaveLength(MAX_WORKSPACE_CACHE_SLOTS)
+    expect(store.entries.map((entry) => entry.lastRoot)).toEqual([...roots].reverse().slice(0, 3))
+    expect(workspaceCacheForRoot(store, roots[0]!)).toBeNull()
+  })
+
+  it('moves a repository back to the front when it is opened again', () => {
+    const store = rememberWorkspaceCacheEntry(
+      rememberWorkspaceCacheEntry(rememberWorkspaceCacheEntry(EMPTY_WORKSPACE_CACHE_STORE, cache), other),
+      cache
+    )
+
+    expect(store.entries.map((entry) => entry.lastRoot)).toEqual([cache.lastRoot, other.lastRoot])
+    expect(store.lastRoot).toBe(cache.lastRoot)
+  })
+
+  it('survives the round trip through parse', () => {
+    const store = rememberWorkspaceCacheEntry(
+      rememberWorkspaceCacheEntry(EMPTY_WORKSPACE_CACHE_STORE, cache),
+      other
+    )
+    const onDisk = JSON.stringify(store)
+    expect(parseWorkspaceCacheStore(JSON.parse(onDisk))).toEqual(store)
   })
 })

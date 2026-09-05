@@ -44,9 +44,9 @@ describe('PullRequestContext', () => {
     expect(screen.queryByText('reviewer')).toBeNull()
   })
 
-  test('renders GitHub details and tables instead of raw markup', () => {
+  test('renders GitHub details and tables instead of raw markup', async () => {
     render(<PullRequestContext conversation={conversation} />)
-    const disclosure = screen.getByText('Files reviewed').closest('details')
+    const disclosure = (await screen.findByText('Files reviewed')).closest('details')
 
     expect(disclosure).not.toBeNull()
     expect(within(disclosure!).getByRole('table')).toBeTruthy()

@@ -1,68 +1,33 @@
-import { memo } from 'react'
-import ReactMarkdown from 'react-markdown'
-import rehypeRaw from 'rehype-raw'
-import rehypeSanitize, { defaultSchema, type Options as SanitizeSchema } from 'rehype-sanitize'
-import remarkGfm from 'remark-gfm'
+import { lazy, memo, Suspense } from 'react'
 
-const GITHUB_MARKDOWN_SCHEMA: SanitizeSchema = {
-  ...defaultSchema,
-  tagNames: [...(defaultSchema.tagNames ?? []), 'details', 'summary'],
-  attributes: {
-    ...defaultSchema.attributes,
-    details: [...(defaultSchema.attributes?.details ?? []), 'open']
-  }
-}
+import { githubMarkdownClassName, type GitHubMarkdownProps } from './githubMarkdown'
 
-export function resolveGitHubHref(href: string | undefined): string | undefined {
-  if (href?.startsWith('/') === true) return `https://github.com${href}`
-  return href
-}
+const GitHubMarkdownRenderer = lazy(() => import('./GitHubMarkdownRenderer'))
 
-const EXTERNAL_HREF = /^(https?:|mailto:)/i
-
-export function isExternalMarkdownHref(href: string | undefined): boolean {
-  return href != null && EXTERNAL_HREF.test(href)
-}
-
-export const GitHubMarkdownContent = memo(function GitHubMarkdownContent({
+/** What a reader sees while the renderer chunk is in flight: the source itself. */
+export function GitHubMarkdownFallback({
   source,
   className,
-  variant = 'document',
-  hrefMode = 'github'
-}: {
-  source: string
-  className?: string
-  variant?: 'document' | 'comment'
-  hrefMode?: 'github' | 'local'
-}): React.JSX.Element {
-  const classes = [
-    className,
-    'gh-markdown',
-    variant === 'comment' ? 'comment' : null
-  ].filter((value): value is string => value != null && value !== '').join(' ')
+  variant = 'document'
+}: GitHubMarkdownProps): React.JSX.Element {
   return (
-    <div className={classes}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, GITHUB_MARKDOWN_SCHEMA]]}
-        components={{
-          a: ({ href, children, ...props }) => {
-            const resolvedHref = hrefMode === 'github' ? resolveGitHubHref(href) : href
-            const external = isExternalMarkdownHref(resolvedHref)
-            return (
-              <a {...props} href={resolvedHref}
-                {...(external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
-                onClick={external || resolvedHref?.startsWith('#') === true
-                  ? undefined
-                  : (event) => { event.preventDefault() }}>
-                {children}
-              </a>
-            )
-          }
-        }}
-      >
-        {source}
-      </ReactMarkdown>
+    <div className={githubMarkdownClassName(className, variant)}>
+      <pre className="github-markdown-fallback">{source}</pre>
     </div>
+  )
+}
+
+/**
+ * Pull request bodies, review comments and markdown previews are the only
+ * surfaces that need the remark/rehype pipeline, and none of them is on the
+ * boot path — so it loads on first use and the raw text holds the space.
+ */
+export const GitHubMarkdownContent = memo(function GitHubMarkdownContent(
+  props: GitHubMarkdownProps
+): React.JSX.Element {
+  return (
+    <Suspense fallback={<GitHubMarkdownFallback {...props} />}>
+      <GitHubMarkdownRenderer {...props} />
+    </Suspense>
   )
 })

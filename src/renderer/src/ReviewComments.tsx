@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SelectedLineRange } from '@pierre/diffs'
+import './ReviewComments.css'
 
 import type { FileImagePreview, RemoteReviewThread } from '../../shared/contracts'
 import type { ReviewCommentAnchor } from './reviewThreadAnchors'

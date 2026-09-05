@@ -1,21 +1,26 @@
 import { readFileSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 export type WindowThemeType = 'dark' | 'light'
+
+export const MAX_PULL_REQUEST_FOLDERS = 40
+const GITHUB_SLUG_PART = /^[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?$/
 
 export interface SessionState {
   lastRoot: string | null
   approvedRoots: string[]
   restoreLastFolder: boolean
   themeType: WindowThemeType
+  pullRequestFolders: Record<string, string>
 }
 
 export const DEFAULT_SESSION_STATE: SessionState = {
   lastRoot: null,
   approvedRoots: [],
   restoreLastFolder: true,
-  themeType: 'dark'
+  themeType: 'dark',
+  pullRequestFolders: {}
 }
 
 const FILE_NAME = 'last-session.json'
@@ -23,7 +28,7 @@ let pendingSave: Promise<void> = Promise.resolve()
 
 export function parseSessionState(raw: unknown): SessionState {
   if (typeof raw !== 'object' || raw == null) return DEFAULT_SESSION_STATE
-  const { lastRoot, approvedRoots, restoreLastFolder, themeType } = raw as Record<string, unknown>
+  const { lastRoot, approvedRoots, restoreLastFolder, themeType, pullRequestFolders } = raw as Record<string, unknown>
   const parsedLastRoot = typeof lastRoot === 'string' && lastRoot !== '' ? lastRoot : null
   return {
     lastRoot: parsedLastRoot,
@@ -33,8 +38,56 @@ export function parseSessionState(raw: unknown): SessionState {
     restoreLastFolder: typeof restoreLastFolder === 'boolean'
       ? restoreLastFolder
       : DEFAULT_SESSION_STATE.restoreLastFolder,
-    themeType: themeType === 'light' ? 'light' : 'dark'
+    themeType: themeType === 'light' ? 'light' : 'dark',
+    pullRequestFolders: parsePullRequestFolders(pullRequestFolders)
   }
+}
+
+export function rememberedPullRequestFolder(state: SessionState, slug: string): string | null {
+  return state.pullRequestFolders[slug.toLowerCase()] ?? null
+}
+
+export function rememberPullRequestFolder(
+  state: SessionState,
+  slug: string,
+  root: string
+): SessionState {
+  const normalized = slug.toLowerCase()
+  if (!isGithubRepoSlug(normalized) || !isAbsolute(root)) return state
+  if (state.pullRequestFolders[normalized] === root) return state
+  const pullRequestFolders = { ...state.pullRequestFolders }
+  delete pullRequestFolders[normalized]
+  pullRequestFolders[normalized] = root
+  const keys = Object.keys(pullRequestFolders)
+  if (keys.length > MAX_PULL_REQUEST_FOLDERS) {
+    const oldest = keys[0]
+    if (oldest != null) delete pullRequestFolders[oldest]
+  }
+  return { ...state, pullRequestFolders }
+}
+
+function isGithubRepoSlug(value: string): boolean {
+  const separator = value.indexOf('/')
+  if (separator <= 0 || value.indexOf('/', separator + 1) !== -1) return false
+  const owner = value.slice(0, separator)
+  const repository = value.slice(separator + 1)
+  return GITHUB_SLUG_PART.test(owner) && GITHUB_SLUG_PART.test(repository)
+}
+
+function parsePullRequestFolders(raw: unknown): Record<string, string> {
+  if (typeof raw !== 'object' || raw == null || Array.isArray(raw)) return {}
+  const folders: Record<string, string> = {}
+  for (const [slug, root] of Object.entries(raw as Record<string, unknown>)) {
+    const normalized = slug.toLowerCase()
+    if (!isGithubRepoSlug(normalized) || typeof root !== 'string' || !isAbsolute(root)) continue
+    delete folders[normalized]
+    folders[normalized] = root
+    if (Object.keys(folders).length > MAX_PULL_REQUEST_FOLDERS) {
+      const oldest = Object.keys(folders)[0]
+      if (oldest != null) delete folders[oldest]
+    }
+  }
+  return folders
 }
 
 /**

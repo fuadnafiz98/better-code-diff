@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-import { isPullRequestWorkspacePending } from './pullRequestOpen'
+import { isPullRequestWorkspacePending, reviewFolderChip } from './pullRequestOpen'
 import { createNewWorld, createPatchWorld, type DeskWorld } from './useReviewWorlds'
 import type { PullRequestReview, RepositorySnapshot } from '../../shared/contracts'
 
@@ -62,6 +62,23 @@ test('blanks the working tree while a pull request is still being fetched', () =
   expect(isPullRequestWorkspacePending('review:338', desk)).toBe(true)
   expect(isPullRequestWorkspacePending('resolve:pull-request', createNewWorld())).toBe(true)
   expect(isPullRequestWorkspacePending(null, createPatchWorld(snapshot, review(0), 1, 'loading'))).toBe(true)
+})
+
+test('the new-tab folder chip prefers a chosen checkout over a suggested match', () => {
+  const chosen = { ...createNewWorld(), repositoryRoot: '/Users/me/Developer/app' }
+  expect(reviewFolderChip(chosen, {
+    root: '/Users/me/Developer/other',
+    name: 'other',
+    displayPath: '~/Developer/other',
+    source: 'matched'
+  })).toEqual({ name: 'app', path: '/Users/me/Developer/app' })
+  expect(reviewFolderChip(createNewWorld(), {
+    root: '/Users/me/Developer/app',
+    name: 'app',
+    displayPath: '~/Developer/app',
+    source: 'remembered'
+  })).toEqual({ name: 'app', path: '~/Developer/app' })
+  expect(reviewFolderChip(null, null)).toEqual({ name: null, path: null })
 })
 
 test('keeps a ready or streamed review visible', () => {

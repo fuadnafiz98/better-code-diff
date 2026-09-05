@@ -3,9 +3,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants as fileConstants } from 'node:fs'
 import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { basename, dirname, resolve, sep } from 'node:path'
+import { cpus } from 'node:os'
+import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
 
 import type {
+  AgentRequestSubject,
   ContentSearchResult,
   DiffFileContents,
   FileComparison,
@@ -24,7 +26,6 @@ import type {
   PullRequestInboxSnapshot,
   PullRequestConversation,
   PullRequestReview,
-  PullRequestReviewProgress,
   PullRequestReviewComment,
   PullRequestReviewEvent,
   PullRequestSummary,
@@ -40,6 +41,7 @@ import type {
 } from '../shared/contracts.js'
 import { createImagePreviewSide } from '../shared/imagePreview.js'
 import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
+import { MAX_CACHED_PATHS } from '../shared/workspaceCache.js'
 import {
   COMMAND_ABORTED_MESSAGE,
   comparePaths,
@@ -48,6 +50,7 @@ import {
   mapWithConcurrency,
   runCommand,
   splitNullDelimited,
+  type CommandLane,
   type CommandResult,
   type GitObjectRead
 } from './gitCommands.js'
@@ -67,6 +70,23 @@ import {
   selectOversizedDiffFiles,
   type RawPullRequestFile
 } from './patchBuilder.js'
+import {
+  prepareAgentReviewContext,
+  rememberedAgentReviewFrom,
+  reviewKey,
+  type RememberedAgentReview
+} from './agentReviewBundle.js'
+import {
+  PullRequestReviewFlight,
+  type PullRequestProgressListener
+} from './pullRequestFlights.js'
+import {
+  EXCLUDED_DIRECTORIES,
+  EXCLUDED_DIRECTORY_SET,
+  EXCLUDED_IGNORED_EXTENSIONS,
+  listIgnoredPaths,
+  withIgnoredListingDeadline
+} from './ignoredListing.js'
 import { listRootSnapshot } from './workspaceListing.js'
 
 // Re-exported so the process, object-reading and patch primitives keep one import
@@ -107,7 +127,19 @@ export function pullRequestReviewReply(
     : review
 }
 
-const MAX_SEARCH_RESULTS = 200
+// The palette renders eight. Two hundred hits crossed IPC and were ranked for
+// nothing, and the last of them cost the whole scan.
+const MAX_SEARCH_RESULTS = 24
+// The diff marks every hit in the file on screen, which a repository-wide cap of 24
+// cannot cover, so the open file gets its own bounded pass.
+const MAX_OPEN_FILE_SEARCH_RESULTS = 200
+const CONTENT_SEARCH_MATCHES_PER_FILE = 20
+// Above this a file is a bundle or a fixture, not something anyone reads in a
+// palette row, and scanning them is most of a cold search.
+const CONTENT_SEARCH_MAX_FILESIZE = '1M'
+// Ripgrep defaults to one thread per core. On a laptop already running a refresh
+// and a review fetch that only makes every one of them slower.
+const CONTENT_SEARCH_THREADS = Math.max(1, Math.min(4, cpus().length))
 // The byte cap is the real guard: at a 2 MB per-entry ceiling 512 typical source
 // files cost a few MB, while 16 entries evicted the first file of any review page
 // before the reader could scroll back to it.
@@ -124,8 +156,13 @@ const PULL_REQUEST_LIST_LIMIT = 30
 // comment measures at nearly two minutes for a 3000-file review. A force-push
 // produces a new oid and therefore a new key, so staleness is impossible.
 const PULL_REQUEST_CACHE_VERSION = 3
-const MAX_PULL_REQUEST_CACHE_ENTRIES = 20
+const MAX_PULL_REQUEST_CACHE_ENTRIES = 60
 const MAX_PULL_REQUEST_CACHE_BYTES = 200 * 1024 * 1024
+// Written beside the diff so a reopen can paint from disk before `gh` answers:
+// the diff is keyed on the head oid, which only `gh pr view` knows, so without a
+// URL-keyed pointer even a warm cache waited out the metadata hop.
+const PULL_REQUEST_INDEX_SUFFIX = '.latest.json'
+const PULL_REQUEST_INDEX_VERSION = 1
 
 export interface CachedPullRequestReview {
   version: number
@@ -142,10 +179,33 @@ interface CachedPullRequestReviewMetadata {
   omittedFiles: OmittedDiffFile[]
   patchLength: number
 }
+
+interface PullRequestPatchPage {
+  patch: string
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+}
+
+/** Everything needed to open a review from disk before the first `gh` answer. */
+export interface CachedPullRequestIndex {
+  version: number
+  url: string
+  headRefOid: string
+  baseRefOid: string
+  viewerCanSubmitDecision: boolean
+  summary: PullRequestSummary
+  writtenAt: number
+}
 const MAX_REVIEW_BODY_LENGTH = 65_536
 // `gh search prs --json` only exposes these pull request fields; richer fields need `gh pr view`.
 const PULL_REQUEST_LIST_FIELDS = 'number,title,url,state,isDraft,author,headRefName,baseRefName,reviewDecision,updatedAt,additions,deletions,changedFiles'
-const PULL_REQUEST_REVIEW_FIELDS = `${PULL_REQUEST_LIST_FIELDS},baseRefOid,headRefOid,files`
+// `files` and the check fields used to ride this hop. `files` duplicates what the
+// diff already carries and the check rollup is the slowest field GitHub serves, so
+// the call that opens the review now asks for neither.
+const PULL_REQUEST_REVIEW_FIELDS = `${PULL_REQUEST_LIST_FIELDS},baseRefOid,headRefOid`
+// Past this, `gh pr diff` returns one document that has to arrive in full before a
+// single file can be shown, while the files API streams a page at a time.
+const PULL_REQUEST_FILES_API_THRESHOLD = 300
 const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 // Requested separately because older `gh` builds reject the whole command when a field name is unknown.
 const PULL_REQUEST_CHECK_FIELDS = 'statusCheckRollup,mergeable'
@@ -261,33 +321,30 @@ const UNRESOLVE_REVIEW_THREAD_MUTATION = `
 `
 const MAX_REMOTE_THREAD_BODY_LENGTH = 65_536
 const GH_EXECUTABLE_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'] as const
+// Refreshing reads the index, and git can still rewrite it (an ancient index
+// version, a racy stat) even with the optional locks off. The watcher is told the
+// write is ours so it does not answer our own read with another refresh.
+const GIT_INDEX_PATH = '.git/index'
+// The gitignored listing is the only part of a refresh that can outlive the
+// branch and the statuses, so it gets its own window: beat this and it joins the
+// snapshot, miss it and the snapshot ships without it and merges the set later.
+const IGNORED_LISTING_DEADLINE_MS = 400
+// A pathological tree must not keep a walk (and a git child) alive forever.
+const IGNORED_LISTING_TIMEOUT_MS = 10_000
 const SEARCH_CANCELLED_MESSAGE = 'The search was cancelled before it finished.'
 const SEARCH_INTERRUPTED_MESSAGE = 'The search stopped before it finished.'
-const EXCLUDED_DIRECTORIES = [
-  '.cache',
-  '.next',
-  '.nuxt',
-  '.output',
-  '.parcel-cache',
-  '.svelte-kit',
-  '.turbo',
-  '.vercel',
-  '.vite',
-  'DerivedData',
-  'build',
-  'coverage',
-  'dist',
-  'node_modules',
-  'out',
-  'target'
-] as const
-const EXCLUDED_DIRECTORY_SET = new Set<string>(EXCLUDED_DIRECTORIES)
-const RIPGREP_EXCLUSION_ARGS = EXCLUDED_DIRECTORIES.flatMap((directory) => [
-  '--glob',
-  `!${directory}/**`,
-  '--glob',
-  `!**/${directory}/**`
-])
+const RIPGREP_EXCLUSION_ARGS = [
+  ...EXCLUDED_DIRECTORIES.flatMap((directory) => [
+    '--glob',
+    `!${directory}/**`,
+    '--glob',
+    `!**/${directory}/**`
+  ]),
+  ...[...EXCLUDED_IGNORED_EXTENSIONS].flatMap((extension) => [
+    '--glob',
+    `!*${extension}`
+  ])
+]
 const RIPGREP_VISIBLE_FILE_ARGS = [
   '--hidden',
   '--no-ignore-vcs',
@@ -295,10 +352,6 @@ const RIPGREP_VISIBLE_FILE_ARGS = [
   '!.git/**',
   ...RIPGREP_EXCLUSION_ARGS
 ]
-const GIT_IGNORED_EXCLUSION_PATHSPECS = EXCLUDED_DIRECTORIES.flatMap((directory) => [
-  `:(exclude,glob)${directory}/**`,
-  `:(exclude,glob)**/${directory}/**`
-])
 
 // `file` is the materialized diff side, built once when the version is read.
 // Rebuilding it per comparison re-ran a utf8 decode and a sha1 over the whole
@@ -344,16 +397,31 @@ function getGhExecutable(): Promise<string> {
 }
 
 
+export type PullRequestReviewIntent = 'foreground' | 'warmup'
+
+/**
+ * A warmup is speculative — nobody is waiting on it — so its `gh` hops queue
+ * behind the ones a reader is watching instead of racing them for slots.
+ */
+export function pullRequestReviewLane(intent: PullRequestReviewIntent): CommandLane {
+  return intent === 'warmup' ? 'background' : 'interactive'
+}
+
 function isTransientGitHubError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /HTTP\s+(?:502|503|504)\b|timed?\s*out|timeout|connection reset/i.test(message)
 }
 
-async function runGitHubReadCommand(
+/**
+ * Exported for the lane test: the retry loop is the one place a `gh` hop can
+ * silently lose the lane it was queued on.
+ */
+export async function runGitHubReadCommand(
   executable: string,
   args: readonly string[],
   cwd: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  lane: CommandLane = 'interactive'
 ): Promise<CommandResult> {
   const retryDelays = [0, 250, 750] as const
   let lastError: unknown
@@ -361,7 +429,7 @@ async function runGitHubReadCommand(
     if (signal?.aborted === true) throw new Error(COMMAND_ABORTED_MESSAGE)
     if (retryDelay > 0) await new Promise((resolve) => setTimeout(resolve, retryDelay))
     try {
-      return await runCommand(executable, args, cwd, [], undefined, signal)
+      return await runCommand(executable, args, cwd, [], undefined, signal, lane)
     } catch (error) {
       lastError = error
       if (!isTransientGitHubError(error)) throw error
@@ -547,9 +615,20 @@ function lastPathSegment(path: string): string {
   return separator === -1 ? path : path.slice(separator + 1)
 }
 
-function isExcludedIgnoredPath(path: string): boolean {
-  return isExcludedPath(path) || EXCLUDED_DIRECTORY_SET.has(lastPathSegment(path))
+function ignoredFileExtension(path: string): string {
+  const name = lastPathSegment(path)
+  const dot = name.lastIndexOf('.')
+  return dot <= 0 ? '' : name.slice(dot).toLowerCase()
 }
+
+function isExcludedIgnoredPath(path: string): boolean {
+  return isExcludedPath(path)
+    || EXCLUDED_DIRECTORY_SET.has(lastPathSegment(path))
+    || EXCLUDED_IGNORED_EXTENSIONS.has(ignoredFileExtension(path))
+}
+
+// Joining a promise only to sequence work after it, whether it kept or broke.
+function ignoreSettled(): void {}
 
 function sameStringList(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((path, index) => path === right[index])
@@ -597,9 +676,10 @@ export function classifySearchCompletion(outcome: {
   signal: string | null
   resultCount: number
   errorOutput: string
+  resultCap?: number
 }): { kind: 'results' } | { kind: 'error'; message: string } {
   if (outcome.cancelled) return { kind: 'error', message: SEARCH_CANCELLED_MESSAGE }
-  if (outcome.resultCount >= MAX_SEARCH_RESULTS) return { kind: 'results' }
+  if (outcome.resultCount >= (outcome.resultCap ?? MAX_SEARCH_RESULTS)) return { kind: 'results' }
   if (outcome.signal != null) return { kind: 'error', message: SEARCH_INTERRUPTED_MESSAGE }
   if (outcome.code != null && outcome.code > 1) {
     return {
@@ -608,6 +688,40 @@ export function classifySearchCompletion(outcome: {
     }
   }
   return { kind: 'results' }
+}
+
+/**
+ * The path of the file the reader has open, as ripgrep will accept it. Anything
+ * that could climb out of the repository is refused rather than corrected.
+ */
+export function contentSearchOpenPath(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const path = value.trim().replace(/^\.\//, '')
+  if (path === '' || path.length > 1024 || isAbsolute(path)) return null
+  if (path.split(/[\\/]/).some((segment) => segment === '..')) return null
+  return path
+}
+
+function contentSearchResultKey(result: ContentSearchResult): string {
+  return `${result.path}:${result.line}:${result.column}`
+}
+
+/** Repository hits first — the palette reads from the top — then whatever the
+ * open file's own pass found that they missed. */
+export function mergeContentSearchResults(
+  workspace: readonly ContentSearchResult[],
+  openFile: readonly ContentSearchResult[]
+): ContentSearchResult[] {
+  const merged = [...workspace]
+  if (openFile.length === 0) return merged
+  const seen = new Set(merged.map(contentSearchResultKey))
+  for (const result of openFile) {
+    const key = contentSearchResultKey(result)
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(result)
+  }
+  return merged
 }
 
 export function isPathWithinApprovedRoots(roots: readonly string[], candidate: string): boolean {
@@ -981,6 +1095,14 @@ export function createPullRequestReviewPayload(
   }
 }
 
+interface ActiveContentSearch {
+  // Two: the repository-wide pass and, when the reader has a file open, that file's
+  // own wider pass. Cancelling the search has to end both.
+  children: Set<ReturnType<typeof spawn>>
+  cancelled: boolean
+  startedAt: number
+}
+
 export interface ContentSearchMetrics {
   spawned: number
   cancelled: number
@@ -1001,6 +1123,15 @@ export class PullRequestReviewCache {
   #entryPaths(url: string, headRefOid: string): { metadata: string; patch: string } {
     const base = resolve(this.#directory, createCacheKey(url, headRefOid))
     return { metadata: `${base}.json`, patch: `${base}.patch` }
+  }
+
+  // The reader and the writer reach the pointer from different spellings of the
+  // same pull request — a pasted URL with a `#files` fragment on one side, the
+  // canonical URL GitHub reports on the other — so both are normalized first.
+  #indexPath(url: string): string | null {
+    const normalized = normalizeGitHubPullRequestUrl(url)
+    if (normalized == null) return null
+    return resolve(this.#directory, `${createCacheKey('index', normalized)}${PULL_REQUEST_INDEX_SUFFIX}`)
   }
 
   #beginPatchCommit(path: string): void {
@@ -1041,6 +1172,55 @@ export class PullRequestReviewCache {
     }
   }
 
+  /**
+   * The pointer from a pull request URL to the diff last cached for it. A stale
+   * pointer costs nothing: the entry read it leads to simply misses and the
+   * caller falls back to `gh`.
+   */
+  async readIndex(url: string): Promise<CachedPullRequestIndex | null> {
+    const path = this.#indexPath(url)
+    if (path == null) return null
+    try {
+      const entry = JSON.parse(await readFile(path, 'utf8')) as CachedPullRequestIndex
+      if (
+        entry.version !== PULL_REQUEST_INDEX_VERSION
+        || typeof entry.url !== 'string'
+        || typeof entry.headRefOid !== 'string'
+        || entry.headRefOid === ''
+        || typeof entry.baseRefOid !== 'string'
+        || typeof entry.viewerCanSubmitDecision !== 'boolean'
+        || typeof entry.summary !== 'object'
+        || entry.summary == null
+        || typeof entry.summary.number !== 'number'
+        || typeof entry.summary.url !== 'string'
+      ) return null
+      return entry
+    } catch {
+      return null
+    }
+  }
+
+  async #writeIndex(url: string, headRefOid: string, review: PullRequestReview): Promise<void> {
+    const path = this.#indexPath(url)
+    if (path == null) return
+    const entry: CachedPullRequestIndex = {
+      version: PULL_REQUEST_INDEX_VERSION,
+      url,
+      headRefOid,
+      baseRefOid: review.baseOid,
+      viewerCanSubmitDecision: review.viewerCanSubmitDecision,
+      summary: review.pullRequest,
+      writtenAt: Date.now()
+    }
+    const temporaryPath = `${path}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporaryPath, JSON.stringify(entry), 'utf8')
+      await rename(temporaryPath, path)
+    } catch {
+      await unlink(temporaryPath).catch(() => {})
+    }
+  }
+
   async write(url: string, headRefOid: string, review: PullRequestReview): Promise<void> {
     if (headRefOid === '' || review.files.length === 0) return
     const entry: CachedPullRequestReviewMetadata = {
@@ -1063,6 +1243,7 @@ export class PullRequestReviewCache {
       await rename(temporaryPatchPath, paths.patch)
       await writeFile(temporaryMetadataPath, JSON.stringify(entry), 'utf8')
       await rename(temporaryMetadataPath, paths.metadata)
+      await this.#writeIndex(url, headRefOid, review)
       await this.sweep()
     } catch {
       // The cache is an optimisation; failing to write it must never fail a review.
@@ -1075,9 +1256,28 @@ export class PullRequestReviewCache {
     }
   }
 
+  // Pointers are tiny and self-healing, so they are capped by count and mtime
+  // rather than reconciled against the entries they name.
+  async #sweepIndexes(names: readonly string[]): Promise<void> {
+    const indexNames = names.filter((name) => name.endsWith(PULL_REQUEST_INDEX_SUFFIX))
+    if (indexNames.length <= MAX_PULL_REQUEST_CACHE_ENTRIES) return
+    const entries = await mapWithConcurrency(indexNames, MAX_PATCH_COMMAND_CONCURRENCY, async (name) => {
+      const path = resolve(this.#directory, name)
+      const info = await stat(path).catch(() => null)
+      return info == null ? null : { path, modifiedAt: info.mtimeMs }
+    })
+    const present = entries.filter((entry) => entry != null)
+    present.sort((left, right) => right.modifiedAt - left.modifiedAt)
+    await Promise.all(present
+      .slice(MAX_PULL_REQUEST_CACHE_ENTRIES)
+      .map((entry) => unlink(entry.path).catch(() => {})))
+  }
+
   async sweep(): Promise<void> {
     const names = await readdir(this.#directory).catch(() => [] as string[])
-    const metadataNames = new Set(names.filter((name) => name.endsWith('.json')))
+    await this.#sweepIndexes(names)
+    const metadataNames = new Set(names.filter((name) =>
+      name.endsWith('.json') && !name.endsWith(PULL_REQUEST_INDEX_SUFFIX)))
     const entries = await mapWithConcurrency(
       [...metadataNames],
       MAX_PATCH_COMMAND_CONCURRENCY,
@@ -1138,9 +1338,19 @@ export class RepositoryService {
   #trackedPathsCache: {
     buffer: Buffer
     untrackedPaths: string[]
-    ignoredPaths: string[]
+    // Held by reference: the listing owns the array and never mutates it, so an
+    // unchanged ignored set is recognised without rescanning it.
+    ignoredPaths: readonly string[]
     paths: string[]
   } | null = null
+  #ignoredPaths: string[] = []
+  #ignoredRun: AbortController | null = null
+  #refreshRun: Promise<RepositorySnapshot> | null = null
+  #refreshGeneration = 0
+  // Counts writes to the working tree or the index, so a refresh that started
+  // before one can never be handed to a caller that asked after it.
+  #mutation = 0
+  #refreshMutation = 0
   #folderPathsCache: { buffer: Buffer; paths: string[] } | null = null
   #workingFileCache = new Map<string, { read: WorkingFileRead; bytes: number }>()
   #workingFileCacheBytes = 0
@@ -1148,11 +1358,14 @@ export class RepositoryService {
   #pendingWorkingTreePatches = new Map<string, Promise<WorkingTreePatch>>()
   #workingTreePatchAbort: AbortController | null = null
   #selfWriteObserver: ((path: string) => void) | null = null
+  #snapshotObserver: ((snapshot: RepositorySnapshot) => void) | null = null
   #checkFieldsSupported = true
-  #reviewAborts = new Map<string, AbortController>()
-  #reviewFlights = new Map<string, Promise<PullRequestReview>>()
+  // requestId -> the flight it is waiting on. Several requests share one flight, so
+  // cancelling one of them must not abort the fetch the others are still reading.
+  #reviewRequests = new Map<string, PullRequestReviewFlight>()
+  #reviewFlights = new Map<string, PullRequestReviewFlight>()
   #pullRequestCache: PullRequestReviewCache | null = null
-  #activeSearch: { child: ReturnType<typeof spawn>; cancelled: boolean; startedAt: number } | null = null
+  #activeSearch: ActiveContentSearch | null = null
   #contentSearchMetrics: ContentSearchMetrics = { spawned: 0, cancelled: 0, completed: 0, durationsMs: [] }
   #githubViewerLogin: string | null = null
   // undefined means "not resolved yet"; null means "resolved, no GitHub remote".
@@ -1161,6 +1374,7 @@ export class RepositoryService {
   // A pull request's owner, repository, and number never change, so the identity
   // lookup is resolved once instead of on every conversation poll.
   #pullRequestIdentities = new Map<string, { owner: string; name: string; number: number }>()
+  #rememberedReviews = new Map<string, RememberedAgentReview>()
 
   getSessionSnapshot(): RepositorySnapshot | null {
     return this.#snapshot
@@ -1172,9 +1386,44 @@ export class RepositoryService {
     this.#selfWriteObserver = observe
   }
 
+  // Announces a snapshot the service produced on its own, outside a refresh the
+  // caller is awaiting — today only the gitignored set arriving after its
+  // deadline. Refresh and hydrate results are published by their caller.
+  setSnapshotObserver(observe: ((snapshot: RepositorySnapshot) => void) | null): void {
+    this.#snapshotObserver = observe
+  }
+
   // Passed in from the main entry point so this module keeps no Electron import.
   setPullRequestCacheDirectory(directory: string | null): void {
     this.#pullRequestCache = directory == null ? null : new PullRequestReviewCache(directory)
+  }
+
+  async prepareAgentReview(subject: AgentRequestSubject): Promise<string> {
+    const remembered = this.#findRememberedReview(subject)
+    const cached = remembered == null && subject.pullRequestUrl != null && subject.headOid != null
+      ? await this.#pullRequestCache?.read(subject.pullRequestUrl, subject.headOid) ?? null
+      : null
+    return prepareAgentReviewContext({
+      snapshot: this.#snapshot,
+      subject,
+      remembered,
+      cached
+    })
+  }
+
+  #rememberAgentReview(review: PullRequestReview | LocalBranchReview): void {
+    if (review.patch === '' && review.files.length === 0) return
+    const remembered = rememberedAgentReviewFrom(review)
+    this.#rememberedReviews.delete(remembered.key)
+    this.#rememberedReviews.set(remembered.key, remembered)
+    if (this.#rememberedReviews.size <= 8) return
+    const oldest = this.#rememberedReviews.keys().next().value
+    if (oldest != null) this.#rememberedReviews.delete(oldest)
+  }
+
+  #findRememberedReview(subject: AgentRequestSubject): RememberedAgentReview | null {
+    if (subject.baseOid == null || subject.headOid == null) return null
+    return this.#rememberedReviews.get(reviewKey(subject.baseOid, subject.headOid)) ?? null
   }
 
   getContentSearchMetricsForTests(): ContentSearchMetrics {
@@ -1215,6 +1464,13 @@ export class RepositoryService {
     this.#workingTreePatchAbort = null
     this.#pendingWorkingTreePatches.clear()
     this.#pullRequestIdentities.clear()
+    this.#ignoredRun?.abort()
+    this.#ignoredRun = null
+    this.#ignoredPaths = []
+    this.#refreshRun = null
+    this.#refreshGeneration += 1
+    this.#mutation = 0
+    this.#refreshMutation = 0
     this.#trackedPathsCache = null
     this.#folderPathsCache = null
     this.#githubSlug = undefined
@@ -1244,8 +1500,12 @@ export class RepositoryService {
     }
   }
 
-  async open(folderPath: string): Promise<RepositorySnapshot> {
-    const selectedRoot = await realpath(folderPath)
+  /**
+   * `resolved` says the caller has already run the path through `realpath`, so an
+   * open resolves it once for the whole stack instead of once per layer.
+   */
+  async open(folderPath: string, resolved = false): Promise<RepositorySnapshot> {
+    const selectedRoot = resolved ? folderPath : await realpath(folderPath)
     const rootResult = await runCommand('git', [
       '-C', selectedRoot, 'rev-parse', '--show-toplevel'
     ]).catch(() => null)
@@ -1269,30 +1529,78 @@ export class RepositoryService {
     return snapshot
   }
 
-  async refresh(): Promise<RepositorySnapshot> {
+  /**
+   * Restore, the folder-open handler, the watcher and every mutation ask for a
+   * refresh, often in the same tick. Two runs against the same index cost twice
+   * as much and answer the same thing, so callers that want the state a run is
+   * already fetching share it; a caller that wants state written since then gets
+   * a fresh run chained behind it rather than racing it.
+   */
+  refresh(): Promise<RepositorySnapshot> {
+    const pending = this.#refreshRun
+    if (pending != null && this.#refreshMutation === this.#mutation) return pending
+    // Starting late is a feature: a queued run reads whatever was written while
+    // it waited its turn.
+    const start = (): Promise<RepositorySnapshot> => {
+      this.#refreshMutation = this.#mutation
+      return this.#refreshSnapshot()
+    }
+    this.#refreshGeneration += 1
+    const generation = this.#refreshGeneration
+    // Released as part of settling, not in a `finally` chained after it: a caller
+    // that asks again the microtask after its own `await` must get a new cycle,
+    // not the run it just consumed.
+    const release = (): void => {
+      if (this.#refreshGeneration === generation) this.#refreshRun = null
+    }
+    const run = (pending == null ? start() : pending.then(ignoreSettled, ignoreSettled).then(start))
+      .then(
+        (snapshot) => {
+          release()
+          return snapshot
+        },
+        (error: unknown) => {
+          release()
+          throw error
+        }
+      )
+    this.#refreshRun = run
+    this.#refreshMutation = this.#mutation
+    return run
+  }
+
+  /**
+   * The watcher reports writes nobody here made, so a run already in flight may
+   * have read the tree before the change landed. Counting the tick as a mutation
+   * chains a fresh cycle behind that run instead of handing back its stale
+   * answer, while the restore/open/handler storm still collapses into one run.
+   */
+  refreshAfterExternalChange(): Promise<RepositorySnapshot> {
+    this.#mutation += 1
+    return this.refresh()
+  }
+
+  async #refreshSnapshot(): Promise<RepositorySnapshot> {
     const root = this.#requireRoot()
     if (this.#kind === 'folder') return this.#refreshFolder(root)
 
-    // Three parallel spawns: `status --porcelain=v2 --branch` reports the branch,
-    // the HEAD oid and the untracked set; `ls-files --cached` lists tracked files;
-    // a second `ls-files` lists gitignored files outside heavy generated dirs.
-    const [trackedResult, statusResult, ignoredResult] = await Promise.all([
+    // Two parallel spawns on the critical path: `status --porcelain=v2 --branch`
+    // reports the branch, the HEAD oid and the untracked set; `ls-files --cached`
+    // lists tracked files. The gitignored listing runs alongside them but only
+    // joins this snapshot if it beats its deadline.
+    this.#selfWriteObserver?.(GIT_INDEX_PATH)
+    const ignoredListing = this.#startIgnoredListing()
+    const [trackedResult, statusResult, settledIgnoredPaths] = await Promise.all([
       this.#git(['ls-files', '--cached', '-z']),
       this.#git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']),
-      this.#git([
-        'ls-files',
-        '--others',
-        '--ignored',
-        '--exclude-standard',
-        '-z',
-        '--',
-        '.',
-        ...GIT_IGNORED_EXCLUSION_PATHSPECS
-      ])
+      ignoredListing
     ])
+    // Re-armed on the way out so the event that lands after the commands finish
+    // is still inside the window, however long they took.
+    this.#selfWriteObserver?.(GIT_INDEX_PATH)
 
     const status = parsePorcelainV2Status(statusResult.stdout)
-    const ignoredPaths = splitNullDelimited(ignoredResult.stdout)
+    const ignoredPaths = settledIgnoredPaths ?? this.#ignoredPaths
     const head = status.head
     const branch = status.branch || head?.slice(0, 8) || 'No commits'
     const snapshot: RepositorySnapshot = {
@@ -1302,11 +1610,75 @@ export class RepositoryService {
       branch,
       head,
       paths: this.#visiblePaths(trackedResult.stdout, status.untrackedPaths, ignoredPaths),
-      statuses: status.statuses.filter((entry) => entry.status !== 'untracked' || !isExcludedPath(entry.path))
+      statuses: status.statuses.filter((entry) => entry.status !== 'untracked' || !isExcludedPath(entry.path)),
+      stage: 'live'
     }
 
     this.#setSnapshot(snapshot)
     return snapshot
+  }
+
+  /**
+   * Starts (or restarts) the gitignored listing and resolves with its paths only
+   * if they land inside `IGNORED_LISTING_DEADLINE_MS`. A listing that misses the
+   * deadline keeps running and merges into the published snapshot when it lands,
+   * so a slow ignored walk never holds up the branch and the statuses.
+   */
+  #startIgnoredListing(): Promise<string[] | null> {
+    this.#ignoredRun?.abort()
+    const abort = new AbortController()
+    // Kept past the listing's own resolution: it is the run's identity, and a set
+    // that lands after a newer refresh replaced it must be recognised as stale.
+    this.#ignoredRun = abort
+    const timeout = setTimeout(() => abort.abort(), IGNORED_LISTING_TIMEOUT_MS)
+    timeout.unref?.()
+    // Nobody is waiting on the ignored set: it misses the snapshot deadline on a
+    // large repository anyway, so it must never delay the status the user is
+    // watching for.
+    const listing = listIgnoredPaths((args, signal) => this.#git(args, signal, 'background'), {
+      root: this.#requireRoot(),
+      excludedDirectories: EXCLUDED_DIRECTORY_SET,
+      excludedExtensions: EXCLUDED_IGNORED_EXTENSIONS,
+      maxPaths: MAX_CACHED_PATHS,
+      signal: abort.signal
+    }).then((paths) => {
+      if (this.#ignoredRun === abort) this.#ignoredPaths = paths
+      return paths
+    }).finally(() => {
+      clearTimeout(timeout)
+    })
+    return withIgnoredListingDeadline(
+      listing,
+      IGNORED_LISTING_DEADLINE_MS,
+      abort,
+      (paths, run) => this.#mergeIgnoredPaths(paths, run)
+    )
+  }
+
+  // A late ignored set only adds paths to the snapshot the refresh already
+  // published, so it is folded into that exact snapshot and announced on its own
+  // rather than costing another git cycle. Aborting a walk only takes effect on
+  // its next directory, so a superseded run can still resolve with a set the
+  // refresh that replaced it has already moved past; its run identity is the only
+  // reliable way to tell.
+  #mergeIgnoredPaths(ignoredPaths: string[], run: AbortController | null): void {
+    if (this.#ignoredRun !== run) return
+    const snapshot = this.#snapshot
+    const cached = this.#trackedPathsCache
+    if (snapshot == null || cached == null || snapshot.paths !== cached.paths) return
+    const paths = this.#visiblePaths(cached.buffer, cached.untrackedPaths, ignoredPaths)
+    if (paths === snapshot.paths) return
+    const merged = { ...snapshot, paths }
+    this.#setSnapshot(merged)
+    this.#snapshotObserver?.(merged)
+  }
+
+  // The late merge only runs when a listing misses its 400 ms deadline and a
+  // newer refresh replaced it in the microseconds before it resolved: two real
+  // git walks cannot be lined up that way from a test, so the callback is driven
+  // directly here. The listing itself is covered by `ignoredListing.test.ts`.
+  mergeIgnoredPathsForTests(ignoredPaths: string[], run: 'current' | 'superseded'): void {
+    this.#mergeIgnoredPaths(ignoredPaths, run === 'current' ? this.#ignoredRun : new AbortController())
   }
 
   // Editing a file leaves both lists byte-for-byte identical, which is the
@@ -1323,7 +1695,7 @@ export class RepositoryService {
       cached != null
       && cached.buffer.equals(trackedBuffer)
       && sameStringList(cached.untrackedPaths, untrackedPaths)
-      && sameStringList(cached.ignoredPaths, ignoredPaths)
+      && (cached.ignoredPaths === ignoredPaths || sameStringList(cached.ignoredPaths, ignoredPaths))
     ) {
       return cached.paths
     }
@@ -1331,7 +1703,7 @@ export class RepositoryService {
     this.#trackedPathsCache = {
       buffer: trackedBuffer,
       untrackedPaths: [...untrackedPaths],
-      ignoredPaths: [...ignoredPaths],
+      ignoredPaths,
       paths
     }
     return paths
@@ -1361,7 +1733,8 @@ export class RepositoryService {
       branch: null,
       head: null,
       paths,
-      statuses: []
+      statuses: [],
+      stage: 'live'
     }
 
     this.#setSnapshot(snapshot)
@@ -1482,6 +1855,7 @@ export class RepositoryService {
       await unlink(temporaryPath).catch(() => {})
     }
 
+    this.#mutation += 1
     this.#snapshotRevision += 1
     this.#deleteWorkingCacheEntry(path)
     this.#pendingComparisons.delete(path)
@@ -1626,12 +2000,61 @@ export class RepositoryService {
     this.#cancelActiveSearch()
   }
 
-  async searchContent(query: string): Promise<ContentSearchResult[]> {
+  /**
+   * `forOpenPath` adds a second, wider pass over the one file the reader is looking
+   * at: the palette only needs a couple of dozen hits across the repository, but the
+   * diff marks every hit in the file on screen and a 24-result cap cannot cover it.
+   */
+  async searchContent(query: string, forOpenPath?: string | null): Promise<ContentSearchResult[]> {
     const trimmedQuery = query.trim()
     this.#cancelActiveSearch()
     if (trimmedQuery.length < 2) return []
     const root = this.#requireRoot()
+    const search: ActiveContentSearch = {
+      children: new Set(),
+      cancelled: false,
+      startedAt: performance.now()
+    }
+    this.#contentSearchMetrics.spawned += 1
+    this.#activeSearch = search
+    const openPath = contentSearchOpenPath(forOpenPath)
 
+    try {
+      const [workspaceResults, openFileResults] = await Promise.all([
+        this.#runContentSearch(search, root, trimmedQuery, {
+          cap: MAX_SEARCH_RESULTS,
+          matchesPerFile: CONTENT_SEARCH_MATCHES_PER_FILE,
+          path: null
+        }),
+        openPath == null
+          ? Promise.resolve<ContentSearchResult[]>([])
+          // A deleted or renamed open file must not fail the search the palette is
+          // waiting on, so this pass reports nothing rather than throwing.
+          : this.#runContentSearch(search, root, trimmedQuery, {
+            cap: MAX_OPEN_FILE_SEARCH_RESULTS,
+            matchesPerFile: MAX_OPEN_FILE_SEARCH_RESULTS,
+            path: openPath
+          }).catch(() => [])
+      ])
+      return mergeContentSearchResults(workspaceResults, openFileResults)
+    } finally {
+      this.#contentSearchMetrics.completed += 1
+      if (!search.cancelled) {
+        this.#contentSearchMetrics.durationsMs.push(performance.now() - search.startedAt)
+        this.#contentSearchMetrics.durationsMs = this.#contentSearchMetrics.durationsMs.slice(-100)
+      }
+      for (const child of search.children) child.kill()
+      search.children.clear()
+      if (this.#activeSearch === search) this.#activeSearch = null
+    }
+  }
+
+  #runContentSearch(
+    search: ActiveContentSearch,
+    root: string,
+    query: string,
+    options: { cap: number; matchesPerFile: number; path: string | null }
+  ): Promise<ContentSearchResult[]> {
     return new Promise((resolveSearch, rejectSearch) => {
       const child = spawn(
         RIPGREP_EXECUTABLE,
@@ -1643,22 +2066,25 @@ export class RepositoryService {
           '--max-columns',
           '500',
           '--max-count',
-          '20',
+          String(options.matchesPerFile),
+          '--max-filesize',
+          CONTENT_SEARCH_MAX_FILESIZE,
+          '--threads',
+          String(CONTENT_SEARCH_THREADS),
           '--',
-          trimmedQuery,
-          '.'
+          query,
+          options.path ?? '.'
         ],
         { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] }
       )
-      const search = { child, cancelled: false, startedAt: performance.now() }
-      this.#contentSearchMetrics.spawned += 1
-      this.#activeSearch = search
+      search.children.add(child)
       const results: ContentSearchResult[] = []
       let pending = ''
       let errorOutput = ''
+      let capped = false
 
       const processLine = (line: string): void => {
-        if (results.length >= MAX_SEARCH_RESULTS || line.length === 0) return
+        if (results.length >= options.cap || line.length === 0) return
         try {
           const event = JSON.parse(line) as {
             type: string
@@ -1685,34 +2111,37 @@ export class RepositoryService {
 
       child.stdout.setEncoding('utf8')
       child.stdout.on('data', (chunk: string) => {
+        if (capped) return
         pending += chunk
         const lines = pending.split('\n')
         pending = lines.pop() ?? ''
         for (const line of lines) processLine(line)
-        if (results.length >= MAX_SEARCH_RESULTS) child.kill()
+        if (results.length < options.cap) return
+        // Killing the child still left a batch of buffered matches to concatenate
+        // and JSON-parse for results nobody will read, so the stream is dropped too.
+        capped = true
+        pending = ''
+        child.stdout.destroy()
+        child.kill()
       })
       child.stderr.setEncoding('utf8')
       child.stderr.on('data', (chunk: string) => {
         errorOutput += chunk
       })
       child.on('error', (error) => {
-        if (this.#activeSearch === search) this.#activeSearch = null
+        search.children.delete(child)
         rejectSearch(error)
       })
       child.on('close', (code, signal) => {
-        if (this.#activeSearch === search) this.#activeSearch = null
-        this.#contentSearchMetrics.completed += 1
-        if (!search.cancelled) {
-          this.#contentSearchMetrics.durationsMs.push(performance.now() - search.startedAt)
-          this.#contentSearchMetrics.durationsMs = this.#contentSearchMetrics.durationsMs.slice(-100)
-        }
-        processLine(pending)
+        search.children.delete(child)
+        if (!capped) processLine(pending)
         const completion = classifySearchCompletion({
           cancelled: search.cancelled,
           code,
           signal,
           resultCount: results.length,
-          errorOutput
+          errorOutput,
+          resultCap: options.cap
         })
         if (completion.kind === 'error') {
           rejectSearch(new Error(completion.message))
@@ -1754,14 +2183,17 @@ export class RepositoryService {
 
   async #resolvePullRequestIdentity(
     ghExecutable: string,
-    selector: string
+    selector: string,
+    lane: CommandLane = 'interactive'
   ): Promise<{ owner: string; name: string; number: number }> {
     const cached = this.#pullRequestIdentities.get(selector)
     if (cached != null) return cached
     const detailsResult = await runGitHubReadCommand(
       ghExecutable,
       ['pr', 'view', selector, '--json', 'number,url'],
-      this.#requireRoot()
+      this.#requireRoot(),
+      undefined,
+      lane
     )
     const details = parseJson<{ number: number; url: string }>(detailsResult, 'GitHub CLI')
     validatePullRequestTarget(details.url, details.number)
@@ -1985,6 +2417,7 @@ export class RepositoryService {
     const branches = new Set(branchesResult.stdout.toString('utf8').split('\n').filter(Boolean))
     if (!branches.has(name)) throw new Error('The selected local branch no longer exists.')
     await this.#git(['switch', '--no-guess', name])
+    this.#mutation += 1
     return this.refresh()
   }
 
@@ -2011,8 +2444,8 @@ export class RepositoryService {
     const patchFiles = new Map(filesFromPatch(patch).map((file) => [file.path, file]))
     const files = diffFilesFromChurn(entries).map((file) => ({ ...file, ...patchFiles.get(file.path) }))
     const limited = limitPatchFileSize(patch, MAX_DIFF_FILE_BYTES)
-    return {
-      kind: 'local',
+    const review = {
+      kind: 'local' as const,
       id: `${comparison}:${baseOid}:${headOid}`,
       title: `${headRef} compared with ${baseRef}`,
       baseRefName: baseRef,
@@ -2023,6 +2456,8 @@ export class RepositoryService {
       patch: limited.patch,
       omittedFiles: [...oversized.omittedFiles, ...limited.omittedFiles]
     }
+    this.#rememberAgentReview(review)
+    return review
   }
 
   async getCommitReview(oid: string): Promise<LocalBranchReview> {
@@ -2050,8 +2485,8 @@ export class RepositoryService {
     const patchFiles = new Map(filesFromPatch(patch).map((file) => [file.path, file]))
     const files = diffFilesFromChurn(entries).map((file) => ({ ...file, ...patchFiles.get(file.path) }))
     const limited = limitPatchFileSize(patch, MAX_DIFF_FILE_BYTES)
-    return {
-      kind: 'local',
+    const review = {
+      kind: 'local' as const,
       id: `commit:${commitOid}`,
       title: `${shortOid} ${subject}`,
       baseRefName: firstParent?.slice(0, 8) ?? 'Empty tree',
@@ -2062,6 +2497,8 @@ export class RepositoryService {
       patch: limited.patch,
       omittedFiles: [...oversized.omittedFiles, ...limited.omittedFiles]
     }
+    this.#rememberAgentReview(review)
+    return review
   }
 
   async fetchRemote(): Promise<GitIntegrationSnapshot> {
@@ -2073,6 +2510,7 @@ export class RepositoryService {
   async pullCurrentBranch(): Promise<RepositorySnapshot> {
     this.#requireGitRepository()
     await this.#git(['pull', '--ff-only'])
+    this.#mutation += 1
     return this.refresh()
   }
 
@@ -2099,110 +2537,208 @@ export class RepositoryService {
   // that budget is spent invisibly.
   cancelPullRequestReview(requestId?: string): void {
     if (requestId != null) {
-      this.#reviewAborts.get(requestId)?.abort()
-      this.#reviewAborts.delete(requestId)
+      const flight = this.#reviewRequests.get(requestId)
+      this.#reviewRequests.delete(requestId)
+      flight?.detach(requestId)
       return
     }
-    for (const abort of this.#reviewAborts.values()) abort.abort()
-    this.#reviewAborts.clear()
+    for (const flight of this.#reviewFlights.values()) flight.abort.abort()
+    this.#reviewRequests.clear()
   }
 
+  /**
+   * `intent: 'warmup'` asks for the review without claiming it: the fetch is not
+   * kept alive on this caller's behalf and cancelling the reader who joined it
+   * still stops the paging.
+   */
   async getPullRequestReview(
     selector: number | string,
-    onProgress?: (progress: PullRequestReviewProgress) => void,
-    requestId: string = randomUUID()
+    onProgress?: PullRequestProgressListener,
+    requestId: string = randomUUID(),
+    intent: PullRequestReviewIntent = 'foreground'
   ): Promise<PullRequestReview> {
     this.#requireGitRepository()
     const normalized = normalizePullRequestSelector(selector)
-    const inFlight = this.#reviewFlights.get(normalized)
-    if (inFlight != null) return inFlight
+    const existing = this.#reviewFlights.get(normalized)
+    if (existing != null) {
+      // Whoever asked first is fetching it. Joining replays the metadata and every
+      // page already emitted, so a second reader is exactly as far along as the first.
+      if (intent === 'foreground') {
+        existing.attach(requestId)
+        this.#reviewRequests.set(requestId, existing)
+      }
+      existing.join(onProgress)
+      try {
+        const review = await existing.promise
+        return pullRequestReviewReply(review, onProgress != null && existing.streamed)
+      } finally {
+        existing.release(onProgress)
+        this.#reviewRequests.delete(requestId)
+      }
+    }
 
-    this.cancelPullRequestReview(requestId)
-    const abort = new AbortController()
-    this.#reviewAborts.set(requestId, abort)
-    const promise = this.#loadPullRequestReview(normalized, abort.signal, onProgress)
-      .finally(() => {
-        if (this.#reviewFlights.get(normalized) === promise) this.#reviewFlights.delete(normalized)
-        if (this.#reviewAborts.get(requestId) === abort) this.#reviewAborts.delete(requestId)
-      })
-    this.#reviewFlights.set(normalized, promise)
-    return promise
+    const flight = new PullRequestReviewFlight()
+    if (intent === 'foreground') {
+      flight.attach(requestId)
+      this.#reviewRequests.set(requestId, flight)
+    }
+    flight.join(onProgress)
+    this.#reviewFlights.set(normalized, flight)
+    try {
+      const review = await flight
+        .start((emit) => this.#loadPullRequestReview(
+          normalized,
+          flight.abort.signal,
+          emit,
+          pullRequestReviewLane(intent)
+        ))
+      return pullRequestReviewReply(review, onProgress != null && flight.streamed)
+    } finally {
+      if (this.#reviewFlights.get(normalized) === flight) this.#reviewFlights.delete(normalized)
+      this.#reviewRequests.delete(requestId)
+      flight.release(onProgress)
+      flight.settle()
+    }
   }
 
   async #loadPullRequestReview(
     normalizedSelector: string,
     signal: AbortSignal,
-    onProgress?: (progress: PullRequestReviewProgress) => void
+    emit: PullRequestProgressListener,
+    lane: CommandLane
   ): Promise<PullRequestReview> {
-    const ghExecutable = await getGhExecutable()
-    // Metadata resolves in a second or two while the diff can take minutes, so it
-    // is awaited on its own: the review header and file tree can open on it alone.
-    const [detailsResult, viewerLogin] = await Promise.all([
-      this.#runPullRequestJsonCommand(
-        ghExecutable,
-        ['pr', 'view', normalizedSelector],
-        PULL_REQUEST_REVIEW_FIELDS,
-        this.#requireRoot(),
-        signal
-      ),
-      this.#getGitHubViewerLogin(ghExecutable)
-    ])
-    const details = parseJson<RawPullRequestSummary & {
-      files: PullRequestReview['files']
-      baseRefOid: string
-      headRefOid: string
-    }>(detailsResult, 'GitHub CLI')
-    const { files, baseRefOid, headRefOid, ...rest } = details
-    const pullRequest = toPullRequestSummary(rest)
-    // The files API stops answering at 3000 files however many GitHub reports, so a
-    // review of a bigger pull request is climbing towards the ceiling, not the count.
-    const expectedFileCount = Math.min(
-      MAX_PULL_REQUEST_FILES,
-      Math.max(
-        Number.isFinite(pullRequest.changedFiles) ? Number(pullRequest.changedFiles) : 0,
-        files?.length ?? 0
-      )
+    const cached = await this.#openCachedPullRequestReview(normalizedSelector, emit)
+    if (cached == null) {
+      return this.#fetchPullRequestReview(await getGhExecutable(), normalizedSelector, signal, emit, lane)
+    }
+    // A review already on disk opens even where `gh` cannot be found; only the
+    // revalidation needs it.
+    const ghExecutable = await getGhExecutable().catch(() => null)
+    if (ghExecutable == null) return cached
+    return this.#revalidateCachedPullRequestReview(
+      ghExecutable,
+      normalizedSelector,
+      cached,
+      signal,
+      emit,
+      lane
     )
+  }
+
+  /**
+   * Paints a reopened pull request straight from disk. The head oid the diff was
+   * stored under is unverified here — the caller revalidates it behind the paint —
+   * but the diff for a given oid is immutable, so what the reader sees is a real
+   * state of this pull request rather than a guess.
+   */
+  async #openCachedPullRequestReview(
+    normalizedSelector: string,
+    emit: PullRequestProgressListener
+  ): Promise<PullRequestReview | null> {
+    const cache = this.#pullRequestCache
+    // A bare number says nothing about which pull request it is until `gh` answers,
+    // so only a URL can be served from the index.
+    if (cache == null || !normalizedSelector.startsWith('https://')) return null
+    const index = await cache.readIndex(normalizedSelector)
+    if (index == null) return null
+    const entry = await cache.read(index.url, index.headRefOid)
+    if (entry == null) return null
+    const viewerLogin = this.#githubViewerLogin
     const base: PullRequestReview = {
       kind: 'github',
       selector: normalizedSelector,
-      baseOid: baseRefOid,
-      headOid: headRefOid,
-      commitId: headRefOid,
-      viewerCanSubmitDecision: !isSameGitHubLogin(viewerLogin, pullRequest.author.login),
-      pullRequest,
+      baseOid: index.baseRefOid,
+      headOid: index.headRefOid,
+      commitId: index.headRefOid,
+      // Asking GitHub who we are would be a third spawn on the path this exists to
+      // shorten, so the stored verdict stands unless this process already knows.
+      viewerCanSubmitDecision: viewerLogin == null
+        ? index.viewerCanSubmitDecision
+        : !isSameGitHubLogin(viewerLogin, index.summary.author.login),
+      pullRequest: index.summary,
       files: [],
       patch: '',
       omittedFiles: [],
-      expectedFileCount
+      expectedFileCount: entry.files.length
     }
-    onProgress?.({ kind: 'metadata', selector: normalizedSelector, review: base })
-
-    const cached = await this.#pullRequestCache?.read(pullRequest.url, headRefOid) ?? null
-    if (cached != null) {
-      // No files event: the whole patch is already in hand, so emitting it here
-      // and returning it from the same call would clone up to the entire review
-      // over IPC twice in one tick. The renderer adopts the resolved review.
-      return {
-        ...base,
-        files: cached.files,
-        patch: cached.patch,
-        omittedFiles: cached.omittedFiles,
-        expectedFileCount: cached.files.length
-      }
+    emit({ kind: 'metadata', selector: normalizedSelector, review: base })
+    emit({
+      kind: 'files',
+      selector: normalizedSelector,
+      patch: entry.patch,
+      files: entry.files,
+      omittedFiles: entry.omittedFiles
+    })
+    emit({ kind: 'done', selector: normalizedSelector, fileCount: entry.files.length })
+    const review: PullRequestReview = {
+      ...base,
+      files: entry.files,
+      patch: entry.patch,
+      omittedFiles: entry.omittedFiles
     }
+    this.#seedPullRequestIdentity(normalizedSelector, index.summary)
+    this.#rememberAgentReview(review)
+    return review
+  }
 
+  async #revalidateCachedPullRequestReview(
+    ghExecutable: string,
+    normalizedSelector: string,
+    cached: PullRequestReview,
+    signal: AbortSignal,
+    emit: PullRequestProgressListener,
+    lane: CommandLane
+  ): Promise<PullRequestReview> {
+    this.#emitPullRequestChecks(ghExecutable, normalizedSelector, signal, emit, lane)
+    let headRefOid = ''
+    try {
+      const result = await runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'view', normalizedSelector, '--json', 'headRefOid'],
+        this.#requireRoot(),
+        signal,
+        lane
+      )
+      headRefOid = parseJson<{ headRefOid: string }>(result, 'GitHub CLI').headRefOid
+    } catch {
+      // Offline, rate limited or cancelled. The cached diff is immutable for the oid
+      // it was stored under, so it stays on screen instead of collapsing into an error.
+      return cached
+    }
+    if (signal.aborted || headRefOid === '' || headRefOid === cached.headOid) return cached
+    // A force push moved the head. Refetch quietly — the reader is looking at the
+    // previous head meanwhile — and hand the whole review over in one event.
+    const review = await this.#fetchPullRequestReview(
+      ghExecutable,
+      normalizedSelector,
+      signal,
+      () => {},
+      lane
+    )
+    emit({ kind: 'replace', selector: normalizedSelector, review })
+    return review
+  }
+
+  async #fetchPullRequestReview(
+    ghExecutable: string,
+    normalizedSelector: string,
+    signal: AbortSignal,
+    emit: PullRequestProgressListener,
+    lane: CommandLane
+  ): Promise<PullRequestReview> {
     const collectedFiles: PullRequestFile[] = []
     const collectedOmitted: OmittedDiffFile[] = []
     const patchParts: string[] = []
+    const staged: PullRequestPatchPage[] = []
+    let opened = false
     let emittedPage = false
-    const emit = (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }): void => {
+    const publish = (page: PullRequestPatchPage): void => {
       const limited = limitPatchFileSize(page.patch, MAX_DIFF_FILE_BYTES)
       patchParts.push(limited.patch)
       collectedFiles.push(...page.files)
       collectedOmitted.push(...page.omittedFiles, ...limited.omittedFiles)
       emittedPage = true
-      onProgress?.({
+      emit({
         kind: 'files',
         selector: normalizedSelector,
         patch: limited.patch,
@@ -2210,44 +2746,214 @@ export class RepositoryService {
         omittedFiles: [...page.omittedFiles, ...limited.omittedFiles]
       })
     }
+    // A page cannot be shown before the event that opens the review, and the diff
+    // now starts before that event, so early pages wait here rather than being lost.
+    const collect = (page: PullRequestPatchPage): void => {
+      if (opened) publish(page)
+      else staged.push(page)
+    }
 
-    await this.#collectPullRequestPatch(
-      ghExecutable,
-      normalizedSelector,
-      signal,
-      emit
-    )
-    const review: PullRequestReview = {
-      ...base,
-      files: collectedFiles,
-      patch: patchParts.join(''),
-      omittedFiles: collectedOmitted
+    // `gh pr diff` needs no oid, so it runs alongside the metadata hop instead of
+    // queueing behind it. That serial pair was most of the wait on a fresh review.
+    const diffAbort = new AbortController()
+    const abortDiff = (): void => diffAbort.abort()
+    signal.addEventListener('abort', abortDiff, { once: true })
+    const diffRun = this
+      .#collectPullRequestDiff(ghExecutable, normalizedSelector, diffAbort.signal, collect, lane)
+      .then(
+        (outcome) => ({ outcome, error: null as unknown }),
+        (error: unknown) => ({ outcome: 'failed' as const, error })
+      )
+
+    try {
+      const [detailsResult, viewerLogin] = await Promise.all([
+        runGitHubReadCommand(
+          ghExecutable,
+          ['pr', 'view', normalizedSelector, '--json', PULL_REQUEST_REVIEW_FIELDS],
+          this.#requireRoot(),
+          signal,
+          lane
+        ),
+        this.#getGitHubViewerLogin(ghExecutable, lane)
+      ])
+      const details = parseJson<RawPullRequestSummary & {
+        baseRefOid: string
+        headRefOid: string
+      }>(detailsResult, 'GitHub CLI')
+      const { baseRefOid, headRefOid, ...rest } = details
+      const pullRequest = toPullRequestSummary(rest)
+      this.#seedPullRequestIdentity(normalizedSelector, pullRequest)
+      // The files API stops answering at 3000 files however many GitHub reports, so a
+      // review of a bigger pull request is climbing towards the ceiling, not the count.
+      const expectedFileCount = Math.min(
+        MAX_PULL_REQUEST_FILES,
+        Number.isFinite(pullRequest.changedFiles) ? Number(pullRequest.changedFiles) : 0
+      )
+      let summary = pullRequest
+      const checksRun = this.#loadPullRequestChecks(ghExecutable, normalizedSelector, signal, lane)
+      void checksRun.then((result) => {
+        if (result == null) return
+        summary = { ...pullRequest, checks: result.checks, mergeable: result.mergeable }
+        if (signal.aborted) return
+        emit({
+          kind: 'checks',
+          selector: normalizedSelector,
+          checks: result.checks,
+          mergeable: result.mergeable
+        })
+      })
+      const base: PullRequestReview = {
+        kind: 'github',
+        selector: normalizedSelector,
+        baseOid: baseRefOid,
+        headOid: headRefOid,
+        commitId: headRefOid,
+        viewerCanSubmitDecision: !isSameGitHubLogin(viewerLogin, pullRequest.author.login),
+        pullRequest,
+        files: [],
+        patch: '',
+        omittedFiles: [],
+        expectedFileCount
+      }
+      emit({ kind: 'metadata', selector: normalizedSelector, review: base })
+
+      const cached = await this.#pullRequestCache?.read(pullRequest.url, headRefOid) ?? null
+      if (cached != null) {
+        // No files event: the whole patch is already in hand, so emitting it here
+        // and returning it from the same call would clone up to the entire review
+        // over IPC twice in one tick. The renderer adopts the resolved review.
+        diffAbort.abort()
+        staged.length = 0
+        const review: PullRequestReview = {
+          ...base,
+          pullRequest: summary,
+          files: cached.files,
+          patch: cached.patch,
+          omittedFiles: cached.omittedFiles,
+          expectedFileCount: cached.files.length
+        }
+        // The entry predates the URL index, or the index was swept. Writing it back
+        // is what turns the next open of this pull request into a disk read.
+        if (!signal.aborted) await this.#pullRequestCache?.write(pullRequest.url, headRefOid, review)
+        this.#rememberAgentReview(review)
+        return review
+      }
+
+      opened = true
+      for (const page of staged.splice(0)) publish(page)
+
+      if (expectedFileCount > PULL_REQUEST_FILES_API_THRESHOLD) {
+        // A diff document this size has to arrive in full before a single file can be
+        // shown; the files API streams, and the identity it needs is already seeded.
+        diffAbort.abort()
+        await diffRun
+        if (!emittedPage && !signal.aborted) {
+          await this.#collectPullRequestPatchFromFilesApi(ghExecutable, normalizedSelector, signal, publish, lane)
+        }
+      } else {
+        const result = await diffRun
+        if (result.error != null) throw result.error
+        if (result.outcome === 'too-large' && !signal.aborted) {
+          await this.#collectPullRequestPatchFromFilesApi(ghExecutable, normalizedSelector, signal, publish, lane)
+        }
+      }
+
+      const review: PullRequestReview = {
+        ...base,
+        pullRequest: summary,
+        files: collectedFiles,
+        patch: patchParts.join(''),
+        omittedFiles: collectedOmitted
+      }
+      if (emittedPage) {
+        emit({ kind: 'done', selector: normalizedSelector, fileCount: collectedFiles.length })
+      }
+      if (!signal.aborted) await this.#pullRequestCache?.write(pullRequest.url, headRefOid, review)
+      this.#rememberAgentReview(review)
+      return review
+    } finally {
+      diffAbort.abort()
+      signal.removeEventListener('abort', abortDiff)
     }
-    const streamed = onProgress != null && emittedPage
-    if (streamed) {
-      onProgress({ kind: 'done', selector: normalizedSelector, fileCount: collectedFiles.length })
+  }
+
+  // The identity never changes and the metadata hop already carries it. Resolving it
+  // again cost a second `gh pr view` on every paged review and every conversation poll.
+  #seedPullRequestIdentity(selector: string, pullRequest: PullRequestSummary): void {
+    if (!Number.isSafeInteger(pullRequest.number) || pullRequest.number < 1) return
+    const slug = githubRepoSlugFromRemoteUrl(pullRequest.url.replace(/\/pull\/\d+.*$/, ''))
+    const [owner, name] = slug?.split('/') ?? []
+    if (owner == null || name == null) return
+    const identity = { owner, name, number: pullRequest.number }
+    this.#pullRequestIdentities.set(selector, identity)
+    this.#pullRequestIdentities.set(pullRequest.url, identity)
+  }
+
+  // Check data is optional garnish, so an unsupported field costs the chips instead
+  // of the whole response. An older `gh` rejects the command outright and the retry
+  // costs a second spawn, so the answer is remembered — on the service rather than
+  // the module, where one degraded call used to degrade every later one in the
+  // process, tests included.
+  async #loadPullRequestChecks(
+    ghExecutable: string,
+    selector: string,
+    signal: AbortSignal,
+    lane: CommandLane
+  ): Promise<{ checks: PullRequestChecks | null; mergeable: string | null } | null> {
+    if (!this.#checkFieldsSupported) return null
+    try {
+      const result = await runGitHubReadCommand(
+        ghExecutable,
+        ['pr', 'view', selector, '--json', PULL_REQUEST_CHECK_FIELDS],
+        this.#requireRoot(),
+        signal,
+        lane
+      )
+      const raw = parseJson<{ statusCheckRollup?: unknown; mergeable?: unknown }>(result, 'GitHub CLI')
+      return {
+        checks: summarizeCheckRollup(raw.statusCheckRollup),
+        mergeable: typeof raw.mergeable === 'string' ? raw.mergeable : null
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/unknown json field/i.test(message)) this.#checkFieldsSupported = false
+      return null
     }
-    if (!signal.aborted) await this.#pullRequestCache?.write(pullRequest.url, headRefOid, review)
-    return pullRequestReviewReply(review, streamed)
+  }
+
+  #emitPullRequestChecks(
+    ghExecutable: string,
+    selector: string,
+    signal: AbortSignal,
+    emit: PullRequestProgressListener,
+    lane: CommandLane
+  ): void {
+    void this.#loadPullRequestChecks(ghExecutable, selector, signal, lane).then((result) => {
+      if (result == null || signal.aborted) return
+      emit({ kind: 'checks', selector, checks: result.checks, mergeable: result.mergeable })
+    })
   }
 
   /**
    * One diff document is the fast path; a pull request too big for GitHub to render
    * as a single diff is rebuilt from the paged files API instead of failing to open.
    */
-  async #collectPullRequestPatch(
+  async #collectPullRequestDiff(
     ghExecutable: string,
     selector: string,
     signal: AbortSignal,
-    emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
-  ): Promise<void> {
+    emit: (page: PullRequestPatchPage) => void,
+    lane: CommandLane
+  ): Promise<'complete' | 'aborted' | 'too-large'> {
     try {
       const diffResult = await runGitHubReadCommand(
         ghExecutable,
         ['pr', 'diff', selector, '--color', 'never'],
         this.#requireRoot(),
-        signal
+        signal,
+        lane
       )
+      if (signal.aborted) return 'aborted'
       const patch = diffResult.stdout.toString('utf8')
       for (const page of chunkPatchByFileCount(patch)) {
         emit({
@@ -2256,21 +2962,22 @@ export class RepositoryService {
           omittedFiles: []
         })
       }
-      return
+      return 'complete'
     } catch (error) {
-      if (signal.aborted) return
-      if (!isPullRequestDiffTooLargeError(error)) throw error
+      if (signal.aborted) return 'aborted'
+      if (isPullRequestDiffTooLargeError(error)) return 'too-large'
+      throw error
     }
-    await this.#collectPullRequestPatchFromFilesApi(ghExecutable, selector, signal, emit)
   }
 
   async #collectPullRequestPatchFromFilesApi(
     ghExecutable: string,
     selector: string,
     signal: AbortSignal,
-    emit: (page: { patch: string; files: PullRequestFile[]; omittedFiles: OmittedDiffFile[] }) => void
+    emit: (page: PullRequestPatchPage) => void,
+    lane: CommandLane
   ): Promise<void> {
-    const { owner, name, number } = await this.#resolvePullRequestIdentity(ghExecutable, selector)
+    const { owner, name, number } = await this.#resolvePullRequestIdentity(ghExecutable, selector, lane)
     const readPage = async (page: number): Promise<RawPullRequestFile[]> => {
       const result = await runGitHubReadCommand(
         ghExecutable,
@@ -2279,7 +2986,8 @@ export class RepositoryService {
           `repos/${owner}/${name}/pulls/${number}/files?per_page=${PULL_REQUEST_FILES_PAGE_SIZE}&page=${page}`
         ],
         this.#requireRoot(),
-        signal
+        signal,
+        lane
       )
       const pageFiles = parseJson<RawPullRequestFile[]>(result, 'GitHub')
       return Array.isArray(pageFiles) ? pageFiles : []
@@ -2303,6 +3011,7 @@ export class RepositoryService {
     this.#requireGitRepository()
     requirePullRequestNumber(number)
     await runCommand(await getGhExecutable(), ['pr', 'checkout', String(number)], this.#requireRoot())
+    this.#mutation += 1
     return this.refresh()
   }
 
@@ -2372,42 +3081,14 @@ export class RepositoryService {
     }
   }
 
-  // Check data is optional garnish, so an unsupported field costs the chips instead
-  // of the whole response. An older `gh` rejects the check fields and the fallback
-  // costs a second spawn, so the answer is remembered — on the service rather than
-  // the module, where one degraded call used to degrade every later one in the
-  // process, tests included.
-  async #runPullRequestJsonCommand(
-    executable: string,
-    args: readonly string[],
-    fields: string,
-    cwd: string,
-    signal?: AbortSignal
-  ): Promise<CommandResult> {
-    if (!this.#checkFieldsSupported) {
-      return runGitHubReadCommand(executable, [...args, '--json', fields], cwd, signal)
-    }
-    try {
-      return await runGitHubReadCommand(
-        executable,
-        [...args, '--json', `${fields},${PULL_REQUEST_CHECK_FIELDS}`],
-        cwd,
-        signal
-      )
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (!/unknown json field/i.test(message)) throw error
-      this.#checkFieldsSupported = false
-      return runGitHubReadCommand(executable, [...args, '--json', fields], cwd, signal)
-    }
-  }
-
-  async #getGitHubViewerLogin(ghExecutable: string): Promise<string> {
+  async #getGitHubViewerLogin(ghExecutable: string, lane: CommandLane = 'interactive'): Promise<string> {
     if (this.#githubViewerLogin != null) return this.#githubViewerLogin
     const result = await runGitHubReadCommand(
       ghExecutable,
       ['api', 'user', '--jq', '.login'],
-      this.#requireRoot()
+      this.#requireRoot(),
+      undefined,
+      lane
     )
     const login = result.stdout.toString('utf8').trim()
     const containsControlCharacter = [...login].some((character) => {
@@ -2594,9 +3275,9 @@ export class RepositoryService {
     return this.#remotes
   }
 
-  async #git(args: readonly string[], signal?: AbortSignal): Promise<CommandResult> {
+  async #git(args: readonly string[], signal?: AbortSignal, lane: CommandLane = 'interactive'): Promise<CommandResult> {
     if (this.#kind !== 'git') throw new Error('The open folder is not a Git repository.')
-    return runCommand('git', ['-C', this.#requireRoot(), ...args], undefined, [], undefined, signal)
+    return runCommand('git', ['-C', this.#requireRoot(), ...args], undefined, [], undefined, signal, lane)
   }
 
   #requireGitRepository(): void {
@@ -2628,7 +3309,7 @@ export class RepositoryService {
     if (search == null) return
     search.cancelled = true
     this.#contentSearchMetrics.cancelled += 1
-    search.child.kill()
+    for (const child of search.children) child.kill()
     this.#activeSearch = null
   }
 

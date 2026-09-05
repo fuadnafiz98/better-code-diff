@@ -1,0 +1,232 @@
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { isAbsolute, join, resolve } from 'node:path'
+
+import type {
+  AgentRequestSubject,
+  LocalBranchReview,
+  OmittedDiffFile,
+  PullRequestFile,
+  PullRequestReview,
+  RepositorySnapshot
+} from '../shared/contracts.js'
+
+interface CachedReviewPatch {
+  headRefOid: string
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+  patch: string
+}
+
+export const AGENT_REVIEW_DIR = '.horus/review'
+export const AGENT_REVIEW_PATCH_NAME = 'changes.patch'
+export const AGENT_REVIEW_BRIEF_NAME = 'brief.md'
+const AGENT_REVIEW_EXCLUDE = '.horus/'
+const AGENT_CONTEXT_FILE_LIMIT = 80
+
+export interface RememberedAgentReview {
+  key: string
+  title: string
+  pullRequestUrl?: string
+  baseOid: string
+  headOid: string
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+  patch: string
+}
+
+export function rememberedAgentReviewFrom(
+  review: PullRequestReview | LocalBranchReview
+): RememberedAgentReview {
+  if (review.kind === 'github') {
+    return {
+      key: reviewKey(review.baseOid, review.headOid),
+      title: `#${review.pullRequest.number} ${review.pullRequest.title}`,
+      pullRequestUrl: review.pullRequest.url,
+      baseOid: review.baseOid,
+      headOid: review.headOid,
+      files: review.files,
+      omittedFiles: review.omittedFiles,
+      patch: review.patch
+    }
+  }
+  return {
+    key: reviewKey(review.baseOid, review.headOid),
+    title: review.title,
+    baseOid: review.baseOid,
+    headOid: review.headOid,
+    files: review.files,
+    omittedFiles: review.omittedFiles,
+    patch: review.patch
+  }
+}
+
+export function reviewKey(baseOid: string, headOid: string): string {
+  return `${baseOid}:${headOid}`
+}
+
+export function agentReviewPaths(root: string): { directory: string; patch: string; brief: string } {
+  const directory = join(root, AGENT_REVIEW_DIR)
+  return {
+    directory,
+    patch: join(directory, AGENT_REVIEW_PATCH_NAME),
+    brief: join(directory, AGENT_REVIEW_BRIEF_NAME)
+  }
+}
+
+export async function writeAgentReviewBundle(
+  root: string,
+  review: RememberedAgentReview,
+  snapshot: RepositorySnapshot
+): Promise<{ patchPath: string; briefPath: string }> {
+  await ensureHorusExcluded(root)
+  const paths = agentReviewPaths(root)
+  await mkdir(paths.directory, { recursive: true })
+  const brief = formatAgentReviewBrief(review, snapshot, paths.patch)
+  await Promise.all([
+    writeFile(paths.patch, review.patch, 'utf8'),
+    writeFile(paths.brief, brief, 'utf8')
+  ])
+  return { patchPath: paths.patch, briefPath: paths.brief }
+}
+
+export async function prepareAgentReviewContext(options: {
+  snapshot: RepositorySnapshot | null
+  subject: AgentRequestSubject
+  remembered: RememberedAgentReview | null
+  cached: CachedReviewPatch | null
+}): Promise<string> {
+  const { snapshot, subject, remembered, cached } = options
+  const review = remembered ?? rememberedFromCache(cached, subject)
+  if (snapshot == null || snapshot.kind !== 'git') {
+    return formatAgentReviewInstructions({
+      subject,
+      review,
+      snapshot,
+      patchPath: null,
+      briefPath: null
+    })
+  }
+  if (review != null && review.patch !== '') {
+    const written = await writeAgentReviewBundle(snapshot.root, review, snapshot)
+    return formatAgentReviewInstructions({
+      subject,
+      review,
+      snapshot,
+      patchPath: written.patchPath,
+      briefPath: written.briefPath
+    })
+  }
+  return formatAgentReviewInstructions({
+    subject,
+    review,
+    snapshot,
+    patchPath: null,
+    briefPath: null
+  })
+}
+
+export function formatAgentReviewInstructions(options: {
+  subject: AgentRequestSubject
+  review: RememberedAgentReview | null
+  snapshot: RepositorySnapshot | null
+  patchPath: string | null
+  briefPath: string | null
+}): string {
+  const { subject, review, snapshot, patchPath, briefPath } = options
+  const files = (review?.files ?? []).slice(0, AGENT_CONTEXT_FILE_LIMIT).map((file) => (
+    `${file.path} (+${file.additions}/-${file.deletions})`
+  ))
+  const overflow = (review?.files.length ?? 0) > AGENT_CONTEXT_FILE_LIMIT
+    ? [`…and ${(review?.files.length ?? 0) - AGENT_CONTEXT_FILE_LIMIT} more files`]
+    : []
+  const omitted = (review?.omittedFiles ?? []).map((file) => file.path)
+  return [
+    'Horus already loaded this review. Do not fetch remotes, clone repositories, or call GitHub, gh, or the network.',
+    'The working directory is the matching local checkout. Stay inside it.',
+    `Local checkout: ${subject.repositoryRoot}`,
+    `Current branch: ${subject.workingBranch ?? snapshot?.branch ?? 'unknown'} (this is the current codebase; it may differ from the pull-request head)`,
+    review == null ? null : `Review: ${review.title}`,
+    subject.pullRequestUrl == null ? null : `Pull request: ${subject.pullRequestUrl}`,
+    patchPath == null
+      ? 'No local patch file is available. Read the listed files from this checkout. Do not search for the pull-request commits with git fetch or gh.'
+      : `Read this patch first: ${patchPath}`,
+    briefPath == null ? null : `Review brief: ${briefPath}`,
+    'After the patch, read only those files and their direct callers or callees in this checkout.',
+    'When a flow, state machine, or sequence helps, include a mermaid diagram.',
+    omitted.length === 0 ? null : `Omitted from the patch: ${omitted.join(', ')}`,
+    files.length === 0 ? null : ['Changed files:', ...files, ...overflow].join('\n')
+  ].filter((line): line is string => line != null && line !== '').join('\n')
+}
+
+function formatAgentReviewBrief(
+  review: RememberedAgentReview,
+  snapshot: RepositorySnapshot,
+  patchPath: string
+): string {
+  const files = review.files.slice(0, AGENT_CONTEXT_FILE_LIMIT).map((file) => (
+    `- ${file.path} (+${file.additions}/-${file.deletions})`
+  ))
+  const overflow = review.files.length > AGENT_CONTEXT_FILE_LIMIT
+    ? [`- …and ${review.files.length - AGENT_CONTEXT_FILE_LIMIT} more files`]
+    : []
+  return [
+    `# ${review.title}`,
+    '',
+    'This pull request is already loaded. Do not fetch from GitHub.',
+    '',
+    `- Repository: ${snapshot.name}`,
+    `- Root: ${snapshot.root}`,
+    `- Current branch: ${snapshot.branch ?? 'unknown'}`,
+    review.pullRequestUrl == null ? null : `- Pull request: ${review.pullRequestUrl}`,
+    `- Base: ${review.baseOid}`,
+    `- Head: ${review.headOid}`,
+    `- Patch: ${patchPath}`,
+    '',
+    '## Changed files',
+    ...files,
+    ...overflow
+  ].filter((line): line is string => line != null).join('\n')
+}
+
+function rememberedFromCache(
+  cached: CachedReviewPatch | null,
+  subject: AgentRequestSubject
+): RememberedAgentReview | null {
+  if (cached == null || subject.baseOid == null || subject.headOid == null) return null
+  if (cached.headRefOid !== subject.headOid || cached.patch === '') return null
+  return {
+    key: reviewKey(subject.baseOid, subject.headOid),
+    title: subject.pullRequestUrl ?? subject.repositoryName,
+    ...(subject.pullRequestUrl == null ? {} : { pullRequestUrl: subject.pullRequestUrl }),
+    baseOid: subject.baseOid,
+    headOid: subject.headOid,
+    files: cached.files,
+    omittedFiles: cached.omittedFiles,
+    patch: cached.patch
+  }
+}
+
+export async function resolveGitDirectory(root: string): Promise<string | null> {
+  const gitPath = join(root, '.git')
+  const info = await stat(gitPath).catch(() => null)
+  if (info == null) return null
+  if (info.isDirectory()) return gitPath
+  if (!info.isFile()) return null
+  const text = await readFile(gitPath, 'utf8')
+  const match = /^gitdir:\s*(.+)$/m.exec(text)
+  if (match?.[1] == null) return null
+  const gitdir = match[1].trim()
+  return isAbsolute(gitdir) ? gitdir : resolve(root, gitdir)
+}
+
+async function ensureHorusExcluded(root: string): Promise<void> {
+  const gitDir = await resolveGitDirectory(root)
+  if (gitDir == null) return
+  const excludePath = join(gitDir, 'info', 'exclude')
+  const current = await readFile(excludePath, 'utf8').catch(() => '')
+  const lines = current.split('\n')
+  if (lines.some((line) => line.trim() === AGENT_REVIEW_EXCLUDE)) return
+  await mkdir(join(gitDir, 'info'), { recursive: true })
+  const prefix = current === '' || current.endsWith('\n') ? current : `${current}\n`
+  await writeFile(excludePath, `${prefix}${AGENT_REVIEW_EXCLUDE}\n`, 'utf8')
+}

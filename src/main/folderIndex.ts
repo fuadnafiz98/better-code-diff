@@ -1,3 +1,4 @@
+import type { Dirent } from 'node:fs'
 import { readdir, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, sep } from 'node:path'
 
@@ -9,6 +10,7 @@ export const DEFAULT_SCAN_ROOT_NAMES = ['Developer', 'Projects', 'src', 'code', 
 export const SKIPPED_DIRECTORY_NAMES = new Set([
   '.cache',
   '.git',
+  '.horus',
   '.next',
   '.turbo',
   '.venv',
@@ -38,25 +40,42 @@ export async function collectFolderCandidates(
   extraRoots: readonly string[] = []
 ): Promise<FolderCandidate[]> {
   const resolvedHome = await safeRealpath(home) ?? home
+  // Every root probe is independent of every other one, so the whole set of
+  // stats resolves in one round instead of one root at a time.
+  const [defaultRoots, extraDirectories] = await Promise.all([
+    Promise.all(DEFAULT_SCAN_ROOT_NAMES.map((name) => resolveScanRoot(join(resolvedHome, name)))),
+    Promise.all(extraRoots.map((root) => resolveExtraRoot(root)))
+  ])
+
   const found = new Map<string, FolderCandidate>()
   const scanRoots = new Set<string>()
-
-  for (const name of DEFAULT_SCAN_ROOT_NAMES) {
-    const root = join(resolvedHome, name)
-    if (await isDirectory(root)) scanRoots.add(await safeRealpath(root) ?? root)
+  for (const root of defaultRoots) {
+    if (root != null) scanRoots.add(root)
   }
-  for (const extra of extraRoots) {
-    const resolved = await safeRealpath(extra)
-    if (resolved == null || !await isDirectory(resolved)) continue
-    addCandidate(found, resolved, resolvedHome)
+  for (const root of extraDirectories) {
+    if (root != null) addCandidate(found, root, resolvedHome)
   }
 
-  for (const root of scanRoots) {
-    await walk(root, 0, found, resolvedHome)
-    if (found.size >= MAX_FOLDERS) break
-  }
+  // Roots are walked in `DEFAULT_SCAN_ROOT_NAMES` order, one at a time, so the
+  // folder cap always keeps the same candidates. Concurrency lives inside
+  // `walk`, per directory.
+  await visitInOrder([...scanRoots], (root) => walk(root, 0, found, resolvedHome))
 
   return [...found.values()].toSorted((left, right) => left.displayPath.localeCompare(right.displayPath))
+}
+
+/** A default scan root counts only when it exists as a directory; its realpath is what gets walked. */
+async function resolveScanRoot(root: string): Promise<string | null> {
+  const [directory, resolved] = await Promise.all([isDirectory(root), safeRealpath(root)])
+  if (!directory) return null
+  return resolved ?? root
+}
+
+/** A remembered root is named by the caller, so it is resolved first and checked afterwards. */
+async function resolveExtraRoot(root: string): Promise<string | null> {
+  const resolved = await safeRealpath(root)
+  if (resolved == null || !await isDirectory(resolved)) return null
+  return resolved
 }
 
 export async function resolveOpenableFolder(
@@ -74,9 +93,14 @@ export async function resolveOpenableFolder(
   })
   if (!info.isDirectory()) throw new Error('Choose a folder, not a file.')
 
-  const home = await safeRealpath(options.home) ?? options.home
+  // The home realpath and the approved-root realpaths need nothing from each
+  // other; only the scan roots are built from the resolved home.
+  const [resolvedHome, approved] = await Promise.all([
+    safeRealpath(options.home),
+    Promise.all(options.approvedRoots.map((root) => safeRealpath(root)))
+  ])
+  const home = resolvedHome ?? options.home
   if (resolved === home) throw new Error('Choose a project folder, not your home directory.')
-  const approved = await Promise.all(options.approvedRoots.map((root) => safeRealpath(root)))
   const scanRoots = await Promise.all(
     DEFAULT_SCAN_ROOT_NAMES.map((name) => safeRealpath(join(home, name)))
   )
@@ -133,6 +157,8 @@ function addCandidate(found: Map<string, FolderCandidate>, path: string, home: s
   })
 }
 
+type WalkChild = { path: string; repository: boolean }
+
 async function walk(
   directory: string,
   depth: number,
@@ -141,17 +167,49 @@ async function walk(
 ): Promise<void> {
   if (depth >= MAX_DEPTH || found.size >= MAX_FOLDERS) return
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
+  const probes: Promise<WalkChild | null>[] = []
   for (const entry of entries) {
-    if (found.size >= MAX_FOLDERS) return
-    if (!entry.isDirectory() || entry.isSymbolicLink()) continue
-    if (entry.name.startsWith('.') || SKIPPED_DIRECTORY_NAMES.has(entry.name)) continue
-    const child = join(directory, entry.name)
-    const resolved = await safeRealpath(child)
-    if (resolved == null) continue
-    const git = await isGitDirectory(resolved)
-    if (depth < 2 || git) addCandidate(found, resolved, home)
-    if (!git) await walk(resolved, depth + 1, found, home)
+    if (!isWalkableEntry(entry)) continue
+    probes.push(describeChild(join(directory, entry.name)))
   }
+  // A directory of 40 children used to cost 80 serial syscalls before the first
+  // candidate landed. The realpath and the `.git` probe are independent per
+  // child, so the whole directory resolves in one round.
+  const children = await Promise.all(probes)
+  // Depth-first, in readdir order: a later sibling must not claim a cap slot
+  // that a nested folder of an earlier sibling would have taken.
+  await visitInOrder(children, async (child) => {
+    if (found.size >= MAX_FOLDERS || child == null) return
+    if (depth < 2 || child.repository) addCandidate(found, child.path, home)
+    if (!child.repository) await walk(child.path, depth + 1, found, home)
+  })
+}
+
+/**
+ * Runs `visit` over `items` one at a time, in order. The folder cap makes the
+ * order load-bearing — the first `MAX_FOLDERS` candidates are the ones kept — so
+ * these walks must not overlap, and a promise chain puts that in the structure
+ * rather than in a comment.
+ */
+function visitInOrder<Item>(
+  items: readonly Item[],
+  visit: (item: Item) => Promise<void>
+): Promise<void> {
+  return items.reduce<Promise<void>>(
+    (previous, item) => previous.then(() => visit(item)),
+    Promise.resolve()
+  )
+}
+
+function isWalkableEntry(entry: Dirent): boolean {
+  if (!entry.isDirectory() || entry.isSymbolicLink()) return false
+  return !entry.name.startsWith('.') && !SKIPPED_DIRECTORY_NAMES.has(entry.name)
+}
+
+async function describeChild(child: string): Promise<WalkChild | null> {
+  const path = await safeRealpath(child)
+  if (path == null) return null
+  return { path, repository: await isGitDirectory(path) }
 }
 
 async function isGitDirectory(directory: string): Promise<boolean> {

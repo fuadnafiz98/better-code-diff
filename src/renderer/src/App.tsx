@@ -11,36 +11,32 @@ import {
   useLayoutEffect,
   useState,
   useSyncExternalStore,
-  type CSSProperties,
-  type RefObject
+  type CSSProperties
 } from 'react'
 
-import type {
-  FileComparison,
-  RepositoryChangeEvent,
-  RepositorySnapshot
-} from '../../shared/contracts'
-import {
-  ErrorBanner,
-  Titlebar,
-  Welcome,
-  type DiffStyle,
-  type WorkspaceView
-} from './AppView'
-import type { CommandPaletteHandle } from './CommandPalette'
-import { commandFromEvent, formatKeybinding, formatTerminalToggleShortcut, type AppCommand } from './keybindings'
-import { FolderChromeButton } from './FolderPicker'
+import type { RepositoryChangeEvent, RepositorySnapshot } from '../../shared/contracts'
+import type { DiffStyle, WorkspaceView } from './AppView'
+import type { AppLayoutProps, WorkspaceLayoutProps } from './appLayoutProps'
+import { AppChrome } from './AppChrome'
+import { WorkspaceStage } from './WorkspaceStage'
+import { useAppCommands, useCommandPaletteControls } from './useAppCommands'
+import { useAppPersistence } from './useAppPersistence'
+import { useExternalPullRequest } from './useExternalPullRequest'
+import { useFolderOpen } from './useFolderOpen'
+import { useSessionRestore } from './useSessionRestore'
+import { ErrorBanner } from './ErrorBanner'
+import { CommandPaletteHost } from './CommandPaletteHost'
+import { formatTerminalToggleShortcut } from './keybindings'
 import {
   CODE_FONTS,
   getEditorThemeType,
-  INTERFACE_FONTS,
   loadPreferences,
-  savePreferences,
   type AppPreferences
 } from './preferences'
 import { PullRequestLoadingIndicator } from './PullRequestLoadingIndicator'
 import { isPullRequestWorkspacePending } from './pullRequestOpen'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
+import { useRecentFiles } from './recentFiles'
 import {
   loadRecentFolders,
   rememberRecentFolder,
@@ -49,32 +45,18 @@ import {
 } from './recentFolders'
 import { useGitWorkflow } from './useGitWorkflow'
 import { useAgentSession } from './useAgentSession'
-import {
-  useRepositorySearch,
-  type RepositorySearchController
-} from './useRepositorySearch'
-import { AgentDock } from './AgentDock'
-import type { TerminalDockHandle } from './TerminalDock'
 import { useTerminalVisibility } from './useTerminalVisibility'
 import { includesPath, retainSnapshotIdentity, snapshotLooksUnchanged } from './snapshotPaths'
 import { useComparisonLoader } from './useComparisonLoader'
 import { usePresence, useRetainedPresence } from './usePresence'
-import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog'
+import { ConfirmDialog } from './ConfirmDialog'
 import { useConfirm } from './useConfirm'
 import { agentSubjectForWorld, formatAgentReviewContext } from './agentReviewContext'
-import {
-  sessionRestoreExpected,
-  sessionWorkspaceStage,
-  shouldReportRestoreFailure,
-  startupSnapshotAction
-} from '../../shared/sessionRestore'
-import {
-  cachedFileTextFromComparison,
-  comparisonFromCachedText,
-  initialWorkspacePaint
-} from '../../shared/workspaceCache'
+import { sessionWorkspaceStage } from '../../shared/sessionRestore'
+import { comparisonFromCachedText, initialWorkspacePaint } from '../../shared/workspaceCache'
 import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
-import { WorldStrip } from './WorldStrip'
+import { revealInExplorer } from './explorerReveal'
+import { isLiveSnapshot, reportAppliedSnapshot } from './folderOpenSettle'
 import { findCollisionPaths, newWorldHoldsReview } from './useReviewWorlds'
 import {
   getLoadedWorkspaceRoot,
@@ -83,7 +65,6 @@ import {
   subscribeWorkspaceRoot
 } from './workspaceBoot'
 import { markRendererStartup } from './startupMetrics'
-import { useDebouncedPersist } from './useDebouncedPersist'
 
 const TerminalDock = lazy(() => import('./TerminalDock'))
 const RepositoryPanel = lazy(async () => ({
@@ -92,67 +73,6 @@ const RepositoryPanel = lazy(async () => ({
 const SettingsPage = lazy(async () => ({
   default: (await import('./SettingsPage')).SettingsPage
 }))
-let commandPaletteModule: Promise<typeof import('./CommandPalette')> | null = null
-function preloadCommandPalette(): Promise<typeof import('./CommandPalette')> {
-  commandPaletteModule ??= import('./CommandPalette')
-  return commandPaletteModule
-}
-const CommandPaletteController = lazy(async () => ({
-  default: (await preloadCommandPalette()).CommandPaletteController
-}))
-
-function useCommandPaletteLoader(onError: (message: string) => void): {
-  controllerRef: RefObject<CommandPaletteHandle | null>
-  mounted: boolean
-  attach(handle: CommandPaletteHandle | null): void
-  close(): void
-  open(): void
-  toggle(): void
-} {
-  const controllerRef = useRef<CommandPaletteHandle>(null)
-  const [mounted, setMounted] = useState(false)
-  const openOnMountRef = useRef(false)
-  const attach = useCallback((handle: CommandPaletteHandle | null) => {
-    controllerRef.current = handle
-    if (handle == null || !openOnMountRef.current) return
-    openOnMountRef.current = false
-    handle.open()
-  }, [])
-  const close = useCallback(() => {
-    openOnMountRef.current = false
-    controllerRef.current?.close()
-  }, [])
-  const mountAndOpen = useCallback(() => {
-    openOnMountRef.current = true
-    setMounted(true)
-    void preloadCommandPalette().catch((error: unknown) => {
-      openOnMountRef.current = false
-      onError(getErrorMessage(error))
-    })
-  }, [onError])
-  const open = useCallback(() => {
-    const controller = controllerRef.current
-    if (controller != null) {
-      controller.open()
-      return
-    }
-    mountAndOpen()
-  }, [mountAndOpen])
-  const toggle = useCallback(() => {
-    const controller = controllerRef.current
-    if (controller != null) {
-      controller.toggle()
-      return
-    }
-    mountAndOpen()
-  }, [mountAndOpen])
-  return useMemo(
-    () => ({ controllerRef, mounted, attach, close, open, toggle }),
-    [attach, close, mounted, open, toggle]
-  )
-}
-
-const NO_PATHS: readonly string[] = Object.freeze([])
 // The titlebar reserves 92px for the traffic lights; in fullscreen there are
 // none, so the CSS collapses the reserve off this attribute.
 function useFullscreenSync(): void {
@@ -190,194 +110,14 @@ function useWindowVisibilitySync(): void {
   }, [])
 }
 
-interface AppShortcutOptions {
-  commandPaletteRef: RefObject<CommandPaletteHandle | null>
-  closeFolderPicker(): boolean
-  gitWorkflow: ReturnType<typeof useGitWorkflow>
-  keybindings: AppPreferences['keybindings']
-  runCommand(command: AppCommand): void
-  settingsOpen: boolean
-}
-
-function useAppShortcuts({
-  commandPaletteRef,
-  closeFolderPicker,
-  gitWorkflow,
-  keybindings,
-  runCommand,
-  settingsOpen
-}: AppShortcutOptions): void {
-  const handleKeyDown = useEffectEvent((event: KeyboardEvent): void => {
-    if (event.key === 'Meta') void preloadCommandPalette()
-    // Leaf surfaces (comment drafts, find, open dialogs) preventDefault first.
-    // Settings is a modal <dialog>: Escape reaches it as `cancel`, which runs its
-    // own 160ms exit. Closing it from here would skip that.
-    if (event.defaultPrevented || event.repeat) return
-    if (event.key === 'Escape' && document.querySelector('dialog[open]') != null) return
-    if (event.key === 'Escape' && closeFolderPicker()) {
-      event.preventDefault()
-      return
-    }
-    if (event.key === 'Escape' && commandPaletteRef.current?.close()) {
-      event.preventDefault()
-      return
-    }
-    if (event.key === 'Escape' && settingsOpen) return
-    if (event.key === 'Escape' && gitWorkflow.panelOpen) {
-      event.preventDefault()
-      gitWorkflow.setPanelOpen(false)
-      return
-    }
-    if (!settingsOpen && event.metaKey && !event.ctrlKey && !event.altKey) {
-      if (!event.shiftKey && event.key.toLowerCase() === 't') {
-        event.preventDefault()
-        gitWorkflow.openNewWorld()
-        return
-      }
-      if (!event.shiftKey && event.key.toLowerCase() === 'w') {
-        event.preventDefault()
-        gitWorkflow.closeReview()
-        return
-      }
-      if (event.shiftKey && (event.key === '[' || event.key === ']')) {
-        event.preventDefault()
-        gitWorkflow.cycleWorld(event.key === '[' ? -1 : 1)
-        return
-      }
-    }
-    const command = commandFromEvent(event, keybindings)
-    if (command == null) return
-    event.preventDefault()
-    runCommand(command)
-  })
-
-  useEffect(() => {
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-}
-
-interface AppLayoutProps {
-  WorkspaceRoot: ReturnType<typeof getLoadedWorkspaceRoot>
-  snapshot: RepositorySnapshot | null
-  selectedPath: string | null
-  comparison: FileComparison | null
-  repositoryChange: RepositoryChangeEvent | null
-  opening: boolean
-  openingRecentPath: string | null
-  loadingDiff: boolean
-  error: string | null
-  sidebarVisible: boolean
-  diffStyle: DiffStyle
-  workspaceView: WorkspaceView
-  terminalOpen: boolean
-  terminalMounted: boolean
-  terminalHeight: number
-  terminalResizing: boolean
-  preferences: AppPreferences
-  settingsOpen: boolean
-  recentFolders: RecentFolder[]
-  search: RepositorySearchController
-  commandPaletteRef: React.RefObject<CommandPaletteHandle | null>
-  commandPaletteMounted: boolean
-  setCommandPaletteHandle(handle: CommandPaletteHandle | null): void
-  terminalDockRef: React.RefObject<TerminalDockHandle | null>
-  gitWorkflow: ReturnType<typeof useGitWorkflow>
-  setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>
-  setError: React.Dispatch<React.SetStateAction<string | null>>
-  setRecentFolders: React.Dispatch<React.SetStateAction<RecentFolder[]>>
-  setPreferences: React.Dispatch<React.SetStateAction<AppPreferences>>
-  setSelectedPath: React.Dispatch<React.SetStateAction<string | null>>
-  onComparisonSaved(comparison: FileComparison): void
-  setDiffStyle: React.Dispatch<React.SetStateAction<DiffStyle>>
-  setWorkspaceView(view: WorkspaceView): void
-  setTerminalHeight: React.Dispatch<React.SetStateAction<number>>
-  setTerminalResizing: React.Dispatch<React.SetStateAction<boolean>>
-  toggleSidebar(): void
-  toggleTerminal(): void
-  closeTerminal(): void
-  commitTerminalHeight(height: number): void
-  openFolder(): Promise<void>
-  openFolderFromPicker(path: string): Promise<void>
-  openRecentFolder(folder: RecentFolder): Promise<void>
-  folderPickerOpen: boolean
-  openFolderPicker(): void
-  closeFolderPicker(): boolean
-  toggleFolderPicker(): void
-  openPullRequestFromPalette(selector: number | string): void
-  openCommandPalette(): void
-  openSettings(): void
-  runCommand(command: AppCommand): void
-  recentFiles: readonly string[]
-  restorePending: boolean
-  restoreRoot: string | null
-  confirmRequest: ConfirmRequest | null
-  confirm(request: ConfirmRequest): Promise<boolean>
-  resolveConfirm(confirmed: boolean): void
-}
-
-function CachedWorkspaceFallback({
-  snapshot,
-  selectedPath,
-  onSelectPath
-}: {
-  snapshot: RepositorySnapshot
-  selectedPath: string | null
-  onSelectPath(path: string): void
-}): React.JSX.Element {
-  return (
-    <>
-      <aside className="sidebar" aria-label={snapshot.name}>
-        <div className="sidebar-heading">
-          <div className="sidebar-heading-identity">
-            <span>{snapshot.name}</span>
-          </div>
-        </div>
-        <ul className="cached-workspace-tree">
-          {snapshot.paths.slice(0, 120).map((path) => (
-            <li key={path}>
-              <button
-                type="button"
-                aria-current={path === selectedPath ? 'true' : undefined}
-                onClick={() => onSelectPath(path)}
-              >
-                {path}
-              </button>
-            </li>
-          ))}
-        </ul>
-      </aside>
-      <div className="sidebar-resizer" aria-hidden="true" />
-      <section className="diff-panel" />
-    </>
-  )
-}
-
-const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps): React.JSX.Element {
+const AgentSessionLayout = memo(function AgentSessionLayout(view: WorkspaceLayoutProps): React.JSX.Element {
   const { gitWorkflow } = view
-  const { search } = view
-  const { WorkspaceRoot } = view
-  // The palette lists branches the integration snapshot already holds; it never
-  // fetches on its own, so this stays empty until the panel has been opened once.
-  const branches = gitWorkflow.integration?.branches
-  const paletteBranches = useMemo(() => {
-    if (branches == null) return undefined
-    const names: string[] = []
-    for (const branch of branches) if (!branch.current) names.push(branch.name)
-    return names
-  }, [branches])
   // Both surfaces have a closed-state rule in styles.css that only bites while
   // the node is still in the tree, so presence holds them for the exit.
   const reviewLoadingPresence = usePresence(gitWorkflow.actionKey?.startsWith('review:') ?? false, 160)
   const repositoryPanelPresence = usePresence(gitWorkflow.panelOpen, 220)
   // The message is null the moment the banner is dismissed; the exit still needs text.
   const errorPresence = useRetainedPresence(view.error, 160)
-  // Content hits for the file being edited become inline hint markers.
-  const contentSearch = useMemo(
-    () => ({ query: search.query, results: search.contentResults }),
-    [search.contentResults, search.query]
-  )
-  const workspaceContentSearch = view.workspaceView === 'file' ? contentSearch : undefined
   // Keep the tab/review summary stable while answer tokens stream.
   const agentSubject = useMemo(
     () => agentSubjectForWorld(gitWorkflow.activeWorld),
@@ -404,51 +144,13 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
     pullRequestPending: pullRequestWorkspacePending
   })
   return <>
-    <header className="app-chrome">
-    <WorldStrip
-      worlds={gitWorkflow.worlds}
-      activeWorldId={gitWorkflow.activeWorld?.worldId ?? null}
+    <AppChrome
+      view={view}
       collisionCount={collisionPaths.size}
-      leadingAction={(
-        <FolderChromeButton
-          opening={view.opening}
-          open={view.folderPickerOpen}
-          shortcut={formatKeybinding(view.preferences.keybindings.openFolder)}
-          recentFolders={view.recentFolders}
-          openingPath={view.openingRecentPath}
-          onToggle={view.toggleFolderPicker}
-          onClose={() => { view.closeFolderPicker() }}
-          onSelect={(path) => {
-            view.closeFolderPicker()
-            void view.openFolderFromPicker(path)
-          }}
-          onUseExisting={() => {
-            view.closeFolderPicker()
-            void view.openFolder()
-          }}
-        />
-      )}
-      onFocus={gitWorkflow.focusWorld}
-      onClose={gitWorkflow.closeReview}
-      onNew={gitWorkflow.openNewWorld}
+      activeNewWorld={activeNewWorld}
+      agentOpen={agent.open}
+      onAgentToggle={agent.toggle}
     />
-
-    <Titlebar snapshot={activeNewWorld == null ? view.snapshot : null}
-      newTab={activeNewWorld != null}
-      locator={activeNewWorld?.locator ?? ''}
-      locatorBusy={gitWorkflow.actionKey === 'resolve:pull-request'}
-      keybindings={view.preferences.keybindings}
-      onSearchOpen={view.openCommandPalette}
-      onLocatorChange={gitWorkflow.updateNewWorldLocator}
-      onLocatorSubmit={() => {
-        const locator = activeNewWorld?.locator.trim() ?? ''
-        if (locator === '') return
-        void gitWorkflow.openPullRequestFromLocator(locator)
-      }}
-      onSettingsOpen={view.openSettings} onGitOpen={gitWorkflow.openPanel}
-      agentOpen={agent.open} onAgentToggle={agent.toggle}
-      terminalOpen={view.terminalOpen} onTerminalToggle={view.toggleTerminal} />
-    </header>
 
     {reviewLoadingPresence.mounted ? <PullRequestLoadingIndicator closing={reviewLoadingPresence.closing} /> : null}
     {repositoryPanelPresence.mounted && view.snapshot?.kind === 'git' ? <Suspense fallback={null}>
@@ -468,18 +170,6 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
         onCheckout={(pullRequest) => void gitWorkflow.checkoutPullRequest(pullRequest)} />
     </Suspense> : null}
 
-    {view.commandPaletteMounted ? <Suspense fallback={null}>
-      <CommandPaletteController ref={view.setCommandPaletteHandle}
-        gitRepositoryOpen={view.snapshot?.kind === 'git'} projectOpen={view.snapshot != null}
-        keybindings={view.preferences.keybindings} onOpenPullRequest={view.openPullRequestFromPalette}
-        onOpenRepository={gitWorkflow.openPanel} onOpenSettings={view.openSettings}
-        onToggleTerminal={view.toggleTerminal}
-        onRunCommand={view.runCommand}
-        recentFiles={view.recentFiles} onOpenFile={view.setSelectedPath}
-        fileResults={search.fileResults} contentResults={search.contentResults}
-        searchingContent={search.searchingContent} onQueryChange={search.changeQuery}
-        branches={paletteBranches} onSwitchBranch={(branch) => void gitWorkflow.switchBranch(branch)} />
-    </Suspense> : null}
     {view.settingsOpen ? <Suspense fallback={null}>
       <SettingsPage preferences={view.preferences} onChange={view.setPreferences}
         onClose={() => view.setSettingsOpen(false)} />
@@ -489,70 +179,14 @@ const AgentSessionLayout = memo(function AgentSessionLayout(view: AppLayoutProps
           onDismiss={() => view.setError(null)} />
       : null}
 
-    {workspaceStage === 'welcome' ? (view.settingsOpen ? null : <Welcome onOpen={view.openFolder} onOpenPickedFolder={(path) => void view.openFolderFromPicker(path)} opening={view.opening}
-      recentFolders={view.recentFolders} openingRecentPath={view.openingRecentPath} onRecentOpen={view.openRecentFolder}
-      onRecentRemove={(path) => view.setRecentFolders((current) => current.filter((folder) => folder.path !== path))}
-      keybindings={view.preferences.keybindings} />) : workspaceStage === 'opening' ? (
-      <div className="workspace-host workspace-opening" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
-        <div className="workspace-opening-canvas" />
-      </div>
-    ) : view.snapshot == null ? null : (
-      <div className="workspace-host" aria-hidden={view.settingsOpen} inert={view.settingsOpen}>
-        <div className={`workspace ${view.sidebarVisible ? '' : 'sidebar-hidden'} ${agent.open ? 'agent-open' : ''}`}>
-          {WorkspaceRoot == null ? (
-            <CachedWorkspaceFallback
-              snapshot={view.snapshot}
-              selectedPath={view.selectedPath}
-              onSelectPath={view.setSelectedPath}
-            />
-          ) : (
-              <WorkspaceRoot workspaceKey={view.snapshot.root}
-                theme={view.preferences.editorTheme}
-                snapshot={view.snapshot} selectedPath={view.selectedPath} comparison={view.comparison}
-                loadingDiff={view.loadingDiff} diffStyle={view.diffStyle} workspaceView={view.workspaceView}
-                preferences={view.preferences} onPreferencesChange={view.setPreferences}
-                onAttachToAgent={agent.attach}
-                repositoryReview={gitWorkflow.repositoryReview} repositoryChange={view.repositoryChange}
-                reviewWorldSource={gitWorkflow.activeWorld?.source === 'new'
-                  ? 'desk'
-                  : gitWorkflow.activeWorld?.source ?? 'desk'}
-                reviewCheckpoint={gitWorkflow.reviewCheckpoint}
-                checkpointChangedFileCount={gitWorkflow.checkpointChangedFileCount}
-                checkpointRemovedFileCount={gitWorkflow.checkpointRemovedFileCount}
-                reviewReady={gitWorkflow.reviewReady}
-                sinceRemovedPaths={gitWorkflow.activeWorld?.source === 'since'
-                  ? gitWorkflow.activeWorld.removedPaths : NO_PATHS}
-                sinceUncertainPaths={gitWorkflow.activeWorld?.source === 'since'
-                  ? gitWorkflow.activeWorld.uncertainPaths : NO_PATHS}
-                collisionPaths={collisionPaths}
-                initialReviewScrollTop={gitWorkflow.initialReviewScrollTop}
-                onReviewScrollPositionChange={gitWorkflow.rememberReviewScroll}
-                contentSearch={workspaceContentSearch}
-                onSelectPath={view.setSelectedPath} onDiffStyleChange={view.setDiffStyle}
-                onWorkspaceViewChange={view.setWorkspaceView} onClosePullRequestReview={gitWorkflow.closeReview}
-                onSetReviewCheckpoint={gitWorkflow.setReviewCheckpoint}
-                onOpenSinceReview={gitWorkflow.openSinceReview}
-                submittingPullRequestReview={gitWorkflow.submittingReview} pullRequestReviewMessage={gitWorkflow.submissionMessage}
-                onSubmitPullRequestReview={gitWorkflow.submitReview} onComparisonSaved={view.onComparisonSaved}
-                onError={view.setError}
-                patchLoadError={gitWorkflow.activeWorld?.source === 'patch'
-                  ? gitWorkflow.activeWorld.errorMessage
-                  : null}
-                reviewWorldId={gitWorkflow.activeWorld?.worldId ?? `desk:${view.snapshot.root}`}
-                sidebarVisible={view.sidebarVisible}
-                onSidebarToggle={view.toggleSidebar}
-                onBranchesOpen={gitWorkflow.openBranches} />
-          )}
-          <AgentDock session={agent}
-            confirm={view.confirm}
-            contextLabel={gitWorkflow.repositoryReview == null ? 'your working tree' : 'this review'} />
-        </div>
-      </div>
-    )}
+    <WorkspaceStage
+      workspaceStage={workspaceStage}
+      view={view}
+      agent={agent}
+      collisionPaths={collisionPaths}
+    />
   </>
 })
-
-const RECENT_FILE_LIMIT = 10
 
 const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Element {
   // Keyed on the repository only. Opening a pull request review keys the
@@ -560,6 +194,14 @@ const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Eleme
   // transcript (useAgentAnswer cancels the in-flight request on unmount) and,
   // with ViewerProviders inside, the worker pool and every cached edit session.
   const agentSessionKey = view.snapshot?.root ?? view.restoreRoot ?? 'welcome'
+  const { commandPaletteRef, terminalDockRef, ...workspace } = view
+  const branches = workspace.gitWorkflow.integration?.branches
+  const paletteBranches = useMemo(() => {
+    if (branches == null) return undefined
+    const names: string[] = []
+    for (const branch of branches) if (!branch.current) names.push(branch.name)
+    return names
+  }, [branches])
   const shellStyle = {
     '--terminal-panel-height': `${view.terminalHeight}px`,
     '--terminal-dock-offset': view.terminalOpen ? `${view.terminalHeight}px` : '0px'
@@ -569,11 +211,28 @@ const AppLayout = memo(function AppLayout(view: AppLayoutProps): React.JSX.Eleme
     data-theme-type={getEditorThemeType(view.preferences.editorTheme)}
     style={shellStyle}
   >
-    <AgentSessionLayout key={agentSessionKey} {...view} />
+    <CommandPaletteHost
+      ref={commandPaletteRef}
+      snapshot={workspace.snapshot}
+      repositoryReview={workspace.gitWorkflow.repositoryReview}
+      keybindings={workspace.preferences.keybindings}
+      onError={workspace.setError}
+      onOpenPullRequest={workspace.openPullRequestFromPalette}
+      onOpenRepository={workspace.gitWorkflow.openPanel}
+      onOpenSettings={workspace.openSettings}
+      onToggleTerminal={workspace.toggleTerminal}
+      onRunCommand={workspace.runCommand}
+      recentFiles={workspace.recentFiles}
+      onOpenFile={workspace.selectPath}
+      onRevealDirectory={revealInExplorer}
+      branches={paletteBranches}
+      onSwitchBranch={(branch) => void workspace.gitWorkflow.switchBranch(branch)}
+    />
+    <AgentSessionLayout key={agentSessionKey} {...workspace} />
     {view.snapshot != null && view.terminalMounted ? <Suspense fallback={null}>
       <TerminalDock
         key={view.snapshot.root}
-        ref={view.terminalDockRef}
+        ref={terminalDockRef}
         open={view.terminalOpen}
         projectName={view.snapshot.name}
         projectRoot={view.snapshot.root}
@@ -608,13 +267,14 @@ export function App({
   useLayoutEffect(() => markRendererStartup('reactCommitted'), [])
   useWindowVisibilitySync()
   useFullscreenSync()
-  const cachedPaint = initialWorkspacePaint(window.repository?.cachedWorkspace ?? null)
+  // Reading and re-deriving the cached paint is boot work, not render work: both
+  // ran on every App render before, at up to 35ms each on a 3,000-path tree.
+  const [cachedPaint] = useState(() => initialWorkspacePaint(window.repository?.cachedWorkspace ?? null))
   const [snapshot, setSnapshot] = useState<RepositorySnapshot | null>(cachedPaint.snapshot)
   const [selectedPath, setSelectedPath] = useState<string | null>(
-    cachedPaint.selectedPath ?? (cachedPaint.snapshot == null ? null : firstOpenPathForSnapshot(cachedPaint.snapshot))
+    () => cachedPaint.selectedPath
+      ?? (cachedPaint.snapshot == null ? null : firstOpenPathForSnapshot(cachedPaint.snapshot))
   )
-  const [opening, setOpening] = useState(false)
-  const [openingRecentPath, setOpeningRecentPath] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [sidebarVisible, setSidebarVisible] = useState(true)
   const [diffStyle, setDiffStyle] = useState<DiffStyle>('split')
@@ -622,13 +282,8 @@ export function App({
   const [preferences, setPreferences] = useState<AppPreferences>(initialPreferences)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [recentFolders, setRecentFolders] = useState<RecentFolder[]>(loadRecentFolders)
-  const [folderPickerOpen, setFolderPickerOpen] = useState(false)
-  const folderPickerOpenRef = useRef(false)
   const [repositoryChange, setRepositoryChange] = useState<RepositoryChangeEvent | null>(null)
   const restoreHint = window.repository?.restoreHint ?? null
-  const [restorePending, setRestorePending] = useState(
-    () => cachedPaint.snapshot == null && sessionRestoreExpected(restoreHint)
-  )
   const [sessionReady, setSessionReady] = useState(false)
   const [startupSessionSnapshot] = useState(() => sessionSnapshot
     ?? window.repository?.getSessionSnapshot()
@@ -638,8 +293,10 @@ export function App({
     getLoadedWorkspaceRoot,
     getLoadedWorkspaceRoot
   )
-  const commandPalette = useCommandPaletteLoader(setError)
-  const [recentFiles, setRecentFiles] = useState<readonly string[]>([])
+  const commandPalette = useCommandPaletteControls()
+  // Most-recently-opened files lead the palette's empty-query list. Tracked here
+  // because this is the only place that sees every selection, wherever it came from.
+  const recentFiles = useRecentFiles(snapshot?.root ?? null, selectedPath)
   const confirmation = useConfirm()
   const closeOverlays = useCallback(() => {
     commandPalette.close()
@@ -664,6 +321,7 @@ export function App({
 
   const applySnapshot = useCallback(
     (nextSnapshot: RepositorySnapshot) => {
+      reportAppliedSnapshot(nextSnapshot)
       const previous = appliedSnapshotRef.current
       const snapshotToApply = retainSnapshotIdentity(previous, nextSnapshot)
       if (snapshotLooksUnchanged(previous, snapshotToApply)) return
@@ -680,6 +338,16 @@ export function App({
     },
     []
   )
+
+  // Armed while a freshly opened folder is still showing its skeleton snapshot.
+  // The live snapshot re-derives the view and the first file from real statuses,
+  // but only until the reader has picked something themselves.
+  const skeletonOpenRootRef = useRef<string | null>(null)
+
+  const selectPath = useCallback((path: string | null) => {
+    skeletonOpenRootRef.current = null
+    setSelectedPath(path)
+  }, [])
 
   const activateSnapshot = useCallback((nextSnapshot: RepositorySnapshot | null) => {
     if (nextSnapshot != null) {
@@ -704,7 +372,6 @@ export function App({
     onWorkspaceViewChange: changeWorkspaceView,
     confirm: confirmation.confirm
   })
-  const search = useRepositorySearch(snapshot, setError, gitWorkflow.repositoryReview)
   const openPullRequestReview = gitWorkflow.openPullRequestReview
   const openWorkingTree = gitWorkflow.openWorkingTree
   const reviewWorlds = gitWorkflow.worlds
@@ -724,25 +391,9 @@ export function App({
     void openPullRequestReview(selector)
   }, [openPullRequestReview])
 
-  const openExternalPullRequest = useEffectEvent((url: string) => {
-    void gitWorkflow.openPullRequestFromLocator(url)
+  useExternalPullRequest((url, root) => {
+    void gitWorkflow.openPullRequestFromLocator(url, root)
   })
-
-  useEffect(() => {
-    const api = window.repository
-    if (api == null) return undefined
-    let opened: string | null = null
-    const open = (url: string): void => {
-      if (opened === url) return
-      opened = url
-      openExternalPullRequest(url)
-    }
-    const stop = api.onOpenExternalPullRequest(open)
-    void api.getPendingExternalPullRequest().then((url) => {
-      if (url != null) open(url)
-    })
-    return stop
-  }, [])
 
   const openSettings = useCallback(() => {
     commandPalette.close()
@@ -753,92 +404,27 @@ export function App({
     setSidebarVisible((visible) => !visible)
   }, [])
 
-  const openFolder = useCallback(async () => {
-    ensureWorkspaceRoot()
-    setOpening(true)
-    setError(null)
-    try {
-      const nextSnapshot = await requireRepositoryApi().openFolder()
-      if (nextSnapshot != null) {
-        setSessionReady(true)
-        setSelectedPath(null)
-        openWorkingTree(nextSnapshot)
-        changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
-        setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
-      }
-    } catch (openError) {
-      setError(getErrorMessage(openError))
-    } finally {
-      setOpening(false)
-    }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
+  // The workspace view and the first file come from the snapshot the open
+  // returned. A skeleton has no statuses, so a dirty repository would land in
+  // the file view and stay there; arm the re-derivation for the git snapshot
+  // still on its way.
+  const adoptOpenedSnapshot = useCallback((nextSnapshot: RepositorySnapshot) => {
+    setSessionReady(true)
+    setSelectedPath(null)
+    openWorkingTree(nextSnapshot)
+    changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
+    setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
+    skeletonOpenRootRef.current = isLiveSnapshot(nextSnapshot) ? null : nextSnapshot.root
+  }, [changeWorkspaceView, openWorkingTree])
 
-  const closeFolderPicker = useCallback((): boolean => {
-    if (!folderPickerOpenRef.current) return false
-    folderPickerOpenRef.current = false
-    setFolderPickerOpen(false)
-    return true
-  }, [])
-
-  const openFolderPicker = useCallback(() => {
-    commandPalette.close()
-    folderPickerOpenRef.current = true
-    setFolderPickerOpen(true)
-  }, [commandPalette])
-
-  const toggleFolderPicker = useCallback(() => {
-    if (folderPickerOpenRef.current) {
-      folderPickerOpenRef.current = false
-      setFolderPickerOpen(false)
-      return
-    }
-    openFolderPicker()
-  }, [openFolderPicker])
-
-  const openPickedFolder = useCallback(async (path: string) => {
-    ensureWorkspaceRoot()
-    setOpeningRecentPath(path)
-    setError(null)
-    try {
-      const nextSnapshot = await requireRepositoryApi().openPickedFolder(path)
-      setSessionReady(true)
-      setSelectedPath(null)
-      openWorkingTree(nextSnapshot)
-      changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
-      setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
-    } catch (openError) {
-      setError(`Cannot open that folder. ${getErrorMessage(openError)}`)
-    } finally {
-      setOpeningRecentPath(null)
-    }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
-
-  const openRecentFolder = useCallback(async (folder: RecentFolder) => {
-    ensureWorkspaceRoot()
-    setOpeningRecentPath(folder.path)
-    setError(null)
-    try {
-      const nextSnapshot = await requireRepositoryApi().openPath(folder.path)
-      setSessionReady(true)
-      setSelectedPath(null)
-      openWorkingTree(nextSnapshot)
-      changeWorkspaceView(automaticWorkspaceView(nextSnapshot, null))
-      setRecentFolders((current) => rememberRecentFolder(current, nextSnapshot))
-    } catch (openError) {
-      setError(`Cannot open “${folder.name}”. ${getErrorMessage(openError)}`)
-    } finally {
-      setOpeningRecentPath(null)
-    }
-  }, [changeWorkspaceView, ensureWorkspaceRoot, openWorkingTree])
-
-  const openFolderFromPicker = useCallback(async (path: string) => {
-    const recent = recentFolders.find((folder) => folder.path === path)
-    if (recent != null) {
-      await openRecentFolder(recent)
-      return
-    }
-    await openPickedFolder(path)
-  }, [openPickedFolder, openRecentFolder, recentFolders])
+  const folderOpen = useFolderOpen({
+    recentFolders,
+    adoptSnapshot: adoptOpenedSnapshot,
+    ensureWorkspaceRoot,
+    onBeforePickerOpen: commandPalette.close,
+    onError: setError
+  })
+  const closeFolderPicker = folderOpen.closeFolderPicker
 
   const handleRepositoryChange = useEffectEvent((change: RepositoryChangeEvent): void => {
     const previousWorld = reviewWorlds.find((world) => world.source !== 'new'
@@ -852,10 +438,14 @@ export function App({
     }
     syncRepositorySnapshot(nextSnapshot)
     if (appliedSnapshotRef.current?.root !== change.snapshot.root) return
+    const adoptSkeletonOpen = skeletonOpenRootRef.current === nextSnapshot.root
+      && isLiveSnapshot(nextSnapshot)
+    if (adoptSkeletonOpen) skeletonOpenRootRef.current = null
     comparisonLoader.invalidate(change.changedPaths)
     startTransition(() => {
       applySnapshot(nextSnapshot)
       setRepositoryChange(change)
+      if (adoptSkeletonOpen) gitWorkflow.resyncDeskNavigation(nextSnapshot)
       if (selectedPath != null && change.changedPaths.includes(selectedPath)) {
         comparisonLoader.markRevision(change.revision)
       }
@@ -866,13 +456,11 @@ export function App({
 
   const hasSnapshot = snapshot != null
 
-  const applyStartupSnapshot = useEffectEvent((restoredSnapshot: RepositorySnapshot | null) => {
-    const action = startupSnapshotAction({
-      cancelled: false,
-      snapshot: restoredSnapshot,
-      paintedSnapshot: appliedSnapshotRef.current
-    })
-    if (action === 'apply' && restoredSnapshot != null) {
+  const restorePending = useSessionRestore({
+    snapshotPromise: startupSessionSnapshot,
+    restoreHint,
+    paintedSnapshot: () => appliedSnapshotRef.current,
+    onRestore: (restoredSnapshot) => {
       setSessionReady(true)
       ensureWorkspaceRoot()
       const holdingReview = gitWorkflow.worlds.some((world) => newWorldHoldsReview(world))
@@ -881,150 +469,62 @@ export function App({
         changeWorkspaceView(automaticWorkspaceView(restoredSnapshot, null))
       }
       setRecentFolders((current) => rememberRecentFolder(current, restoredSnapshot))
-    } else if (shouldReportRestoreFailure({
-      action,
-      restoreExpected: sessionRestoreExpected(restoreHint)
-    })) {
-      const folder = restoreHint?.lastRoot?.split('/').pop()
-      setError(folder == null
-        ? 'Could not reopen the last folder.'
-        : `Could not reopen “${folder}”.`)
-    }
-    setRestorePending(false)
+    },
+    onError: setError
   })
 
-  useEffect(() => {
-    let cancelled = false
-    void startupSessionSnapshot.then((restoredSnapshot) => {
-      if (cancelled) return
-      applyStartupSnapshot(restoredSnapshot)
-    }).catch((sessionError: unknown) => {
-      if (cancelled) return
-      setRestorePending(false)
-      setError(getErrorMessage(sessionError))
-    })
-    return () => { cancelled = true }
-  }, [startupSessionSnapshot])
-
-  useEffect(() => {
-    const root = document.documentElement
-    root.style.setProperty('--font-ui', INTERFACE_FONTS[preferences.interfaceFont].fontFamily)
-    root.style.setProperty('--font-mono', CODE_FONTS[preferences.codeFont].fontFamily)
-    document.querySelector('meta[name="theme-color"]')?.setAttribute(
-      'content',
-      getEditorThemeType(preferences.editorTheme) === 'light' ? '#f7f8fa' : '#0c0d0f'
-    )
-  }, [preferences.codeFont, preferences.editorTheme, preferences.interfaceFont])
-
-  useDebouncedPersist(preferences, (settledPreferences) => {
-    savePreferences(settledPreferences)
-    // Main paints the window background before the renderer exists, so it needs
-    // its own copy of the two preferences that decide what the first frame looks like.
-    void window.repository?.setStartupPreferences({
-      themeType: getEditorThemeType(settledPreferences.editorTheme),
-      restoreLastFolder: settledPreferences.restoreLastFolder
-    })
-  }, 150)
-
-  useDebouncedPersist({
+  useAppPersistence({
+    preferences,
     root: snapshot?.root ?? null,
     selectedPath,
     workspaceView,
-    fileText: cachedFileTextFromComparison(comparisonLoader.comparison)
-  }, (value) => {
-    if (value.root == null) return
-    void window.repository?.persistWorkspaceUi({
-      selectedPath: value.selectedPath,
-      workspaceView: value.workspaceView,
-      fileText: value.fileText
-    })
-  }, 250)
+    comparison: comparisonLoader.comparison
+  })
 
   useEffect(() => {
     saveRecentFolders(recentFolders)
   }, [recentFolders])
 
-  // Most-recently-opened files, for the palette's Files group. Kept here because
-  // it is the only place that sees every selection, wherever it came from.
-  const snapshotRoot = snapshot?.root
-  useEffect(() => {
-    if (snapshotRoot == null) return undefined
-    const idle = window.requestIdleCallback(() => {
-      void preloadCommandPalette()
-    })
-    return () => window.cancelIdleCallback(idle)
-  }, [snapshotRoot])
-  useEffect(() => {
-    setRecentFiles([])
-  }, [snapshotRoot])
-
-  useEffect(() => {
-    if (selectedPath == null) return
-    setRecentFiles((current) => current[0] === selectedPath
-      ? current
-      : [selectedPath, ...current.filter((path) => path !== selectedPath)].slice(0, RECENT_FILE_LIMIT))
-  }, [selectedPath])
-
-  const toggleTerminal = terminal.toggle
-
-  // Shared by the keyboard shortcuts and the command palette, so every command
-  // the palette lists actually does something.
-  const runCommand = useCallback((command: AppCommand) => {
-    // While settings is modal only the two commands that manage overlays run —
-    // the palette reaches this too, and everything else would act on inert UI.
-    if (settingsOpen && command !== 'openSettings' && command !== 'openCommandPalette') return
-    if (command === 'openSettings') {
-      commandPalette.close()
-      closeFolderPicker()
-      setSettingsOpen(true)
-    } else if (command === 'openCommandPalette') {
-      closeFolderPicker()
-      commandPalette.toggle()
-    } else if (command === 'goToFile' || command === 'searchContent') {
-      closeFolderPicker()
-      commandPalette.open()
-    } else if (command === 'openFolder') {
-      toggleFolderPicker()
-    } else if (command === 'toggleSidebar' && hasSnapshot) {
-      toggleSidebar()
-    } else if (command === 'toggleWordWrap') {
-      setPreferences((current) => ({ ...current, wordWrap: !current.wordWrap }))
-    } else if (command === 'toggleFoldUnchanged') {
-      setPreferences((current) => ({ ...current, foldUnchanged: !current.foldUnchanged }))
-    } else if (command === 'toggleTerminal' && hasSnapshot) {
-      toggleTerminal()
-    }
-  }, [closeFolderPicker, commandPalette, hasSnapshot, settingsOpen, toggleFolderPicker, toggleSidebar, toggleTerminal])
-
-  useAppShortcuts({
-    commandPaletteRef: commandPalette.controllerRef,
+  const runCommand = useAppCommands({
+    commandPalette,
     closeFolderPicker,
+    toggleFolderPicker: folderOpen.toggleFolderPicker,
     gitWorkflow,
     keybindings: preferences.keybindings,
-    runCommand,
-    settingsOpen
+    hasSnapshot,
+    settingsOpen,
+    setSettingsOpen,
+    setPreferences,
+    toggleSidebar,
+    toggleTerminal: terminal.toggle
   })
 
-  const view: AppLayoutProps = {
-    WorkspaceRoot, snapshot, selectedPath, repositoryChange, opening, openingRecentPath,
+  const view: Omit<AppLayoutProps, 'commandPaletteRef' | 'terminalDockRef'> = {
+    WorkspaceRoot, snapshot, selectedPath, repositoryChange,
     comparison: comparisonLoader.comparison, loadingDiff: comparisonLoader.loading,
+    opening: folderOpen.opening, openingRecentPath: folderOpen.openingRecentPath,
     error, sidebarVisible, diffStyle, workspaceView,
     terminalOpen: terminal.open, terminalMounted: terminal.mounted,
     terminalHeight: terminal.height, terminalResizing: terminal.resizing,
     preferences, settingsOpen,
-    recentFolders, search, commandPaletteRef: commandPalette.controllerRef,
+    recentFolders,
     restorePending, restoreRoot: restorePending ? restoreHint?.lastRoot ?? null : null,
-    commandPaletteMounted: commandPalette.mounted, setCommandPaletteHandle: commandPalette.attach,
-    terminalDockRef: terminal.dockRef, gitWorkflow,
-    setSettingsOpen, setError, setRecentFolders, setPreferences, setSelectedPath, onComparisonSaved: comparisonLoader.save,
+    gitWorkflow,
+    setSettingsOpen, setError, setRecentFolders, setPreferences, selectPath, onComparisonSaved: comparisonLoader.save,
     setDiffStyle, setWorkspaceView: changeWorkspaceView,
     setTerminalHeight: terminal.setHeight, setTerminalResizing: terminal.setResizing,
     toggleSidebar, toggleTerminal: terminal.toggle, closeTerminal: terminal.close,
-    commitTerminalHeight: terminal.commitHeight, openFolder, openFolderFromPicker,
-    openRecentFolder, folderPickerOpen, openFolderPicker, closeFolderPicker, toggleFolderPicker,
+    commitTerminalHeight: terminal.commitHeight,
+    openFolder: folderOpen.openFolder, openFolderFromPicker: folderOpen.openFolderFromPicker,
+    openRecentFolder: folderOpen.openRecentFolder, folderPickerOpen: folderOpen.folderPickerOpen,
+    openFolderPicker: folderOpen.openFolderPicker, closeFolderPicker, toggleFolderPicker: folderOpen.toggleFolderPicker,
     openPullRequestFromPalette, openCommandPalette: commandPalette.open,
     openSettings, runCommand, recentFiles,
     confirmRequest: confirmation.request, confirm: confirmation.confirm, resolveConfirm: confirmation.resolve
   }
-  return <AppLayout {...view} />
+  // The two refs stay out of `view`: the React Compiler treats a ref read into an
+  // object literal as a ref access during render and bails out of the component.
+  return <AppLayout {...view}
+    commandPaletteRef={commandPalette.ref}
+    terminalDockRef={terminal.dockRef} />
 }

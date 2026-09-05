@@ -1,10 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { cleanup, render, screen } from '@testing-library/react'
 
-import type { RepositorySnapshot } from '../../shared/contracts'
-import { DiffToolbar, Titlebar, type FileEditControls } from './AppView'
+import type { FileEditControls } from './AppView'
+import { DiffToolbar } from './DiffToolbar'
 import { formatEditorShortcut } from './editor/editorKeymap'
-import { DEFAULT_KEYBINDINGS } from './keybindings'
 
 afterEach(cleanup)
 
@@ -104,44 +103,4 @@ test('DiffToolbar reveals the explorer when the sidebar is hidden', () => {
 
   screen.getByRole('button', { name: 'Show explorer' }).click()
   expect(shown).toBe(true)
-})
-
-const snapshot: RepositorySnapshot = {
-  root: '/projects/alpha',
-  name: 'alpha',
-  kind: 'git',
-  branch: 'main',
-  head: 'a'.repeat(40),
-  paths: ['src/app.ts'],
-  statuses: [{ path: 'src/app.ts', status: 'modified' }]
-}
-
-test('Titlebar keeps explorer controls out of the window chrome', () => {
-  render(<Titlebar snapshot={snapshot} keybindings={DEFAULT_KEYBINDINGS} newTab={false}
-    locator="" locatorBusy={false} onLocatorChange={() => {}} onLocatorSubmit={() => {}}
-    onSearchOpen={() => {}}
-    onSettingsOpen={() => {}} onGitOpen={() => {}} agentOpen={false} onAgentToggle={() => {}}
-    terminalOpen={false} onTerminalToggle={() => {}} />)
-
-  expect(screen.queryByRole('button', { name: 'Hide explorer' })).toBeNull()
-  expect(screen.queryByRole('button', { name: /Switch branch/ })).toBeNull()
-  expect(screen.queryByRole('button', { name: 'Open folder' })).toBeNull()
-  expect(screen.getByRole('button', { name: 'Open settings' })).toBeTruthy()
-  expect(screen.getByRole('button', { name: 'Open branches and pull requests' })).toBeTruthy()
-  expect(screen.getByRole('button', { name: 'Search files and commands' }).getAttribute('title')).toContain('⌘P')
-  expect(screen.queryByRole('combobox')).toBeNull()
-})
-
-test('Titlebar centers the pull-request locator on a new tab', () => {
-  render(<Titlebar snapshot={null} keybindings={DEFAULT_KEYBINDINGS} newTab={true}
-    locator="" locatorBusy={false} onLocatorChange={() => {}} onLocatorSubmit={() => {}}
-    onSearchOpen={() => {}}
-    onSettingsOpen={() => {}} onGitOpen={() => {}} agentOpen={false} onAgentToggle={() => {}}
-    terminalOpen={false} onTerminalToggle={() => {}} />)
-
-  expect(screen.getByRole('textbox', { name: 'Open pull request URL' })).toBeTruthy()
-  expect(screen.queryByRole('button', { name: 'Open folder' })).toBeNull()
-  expect(screen.getByRole('button', { name: 'Open settings' })).toBeTruthy()
-  expect(screen.queryByRole('button', { name: 'Search files and commands' })).toBeNull()
-  expect(screen.queryByRole('button', { name: 'Open branches and pull requests' })).toBeNull()
 })

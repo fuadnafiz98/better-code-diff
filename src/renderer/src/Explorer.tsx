@@ -15,6 +15,11 @@ import {
 
 import { getDirectoryPaths } from './treeExpansion'
 import type { EditorThemeType } from './preferences'
+import {
+  EMPTY_REVIEW_FILE_FILTER,
+  reviewFileFilterIsActive,
+  type ReviewFileFilter
+} from './reviewFileFilter'
 
 // Only one palette is ever rendered, so the other one stays out of the workspace
 // chunk: the light theme is fetched the first time it is selected and kept for the
@@ -52,6 +57,9 @@ interface ExplorerProps {
   branchName: string | null
   onBranchesOpen(): void
   onRowActivate(path: string): void
+  fileFilter?: ReviewFileFilter
+  onFileFilterChange?(filter: ReviewFileFilter): void
+  unfilteredFileCount?: number
 }
 
 export const Explorer = memo(function Explorer({
@@ -64,7 +72,10 @@ export const Explorer = memo(function Explorer({
   isGit,
   branchName,
   onBranchesOpen,
-  onRowActivate
+  onRowActivate,
+  fileFilter = EMPTY_REVIEW_FILE_FILTER,
+  onFileFilterChange,
+  unfilteredFileCount
 }: ExplorerProps) {
   const search = useFileTreeSearch(model)
   const directoryPaths = useMemo(() => getDirectoryPaths(filePaths), [filePaths])
@@ -133,7 +144,11 @@ export const Explorer = memo(function Explorer({
           ) : null}
         </div>
         <div className="sidebar-heading-actions">
-          <span className="sidebar-file-count">{visibleFileCount.toLocaleString()} files</span>
+          <span className="sidebar-file-count">
+            {unfilteredFileCount != null && unfilteredFileCount !== visibleFileCount
+              ? `${visibleFileCount.toLocaleString()} of ${unfilteredFileCount.toLocaleString()}`
+              : `${visibleFileCount.toLocaleString()} files`}
+          </span>
           <button type="button" aria-label="Expand all folders" title="Expand all folders" onClick={expandAll}>
             <IconExpandAll />
           </button>
@@ -151,6 +166,52 @@ export const Explorer = memo(function Explorer({
           </button>
         </div>
       </div>
+      {onFileFilterChange == null ? null : (
+        <div className="sidebar-file-filter">
+          <input
+            type="search"
+            value={fileFilter.query}
+            placeholder="Filter files, e.g. /api/* or *.test.ts"
+            aria-label="Filter files"
+            onChange={(event) => onFileFilterChange({ ...fileFilter, query: event.target.value })}
+          />
+          <div className="sidebar-file-filter-chips" role="group" aria-label="Hide file groups">
+            <button
+              type="button"
+              aria-pressed={fileFilter.hideTests}
+              onClick={() => onFileFilterChange({ ...fileFilter, hideTests: !fileFilter.hideTests })}
+            >
+              Hide tests
+            </button>
+            <button
+              type="button"
+              aria-pressed={fileFilter.hideApi}
+              onClick={() => onFileFilterChange({ ...fileFilter, hideApi: !fileFilter.hideApi })}
+            >
+              Hide API
+            </button>
+            <button
+              type="button"
+              aria-pressed={fileFilter.query.trim() === '/api/*'}
+              onClick={() => onFileFilterChange({
+                ...fileFilter,
+                query: fileFilter.query.trim() === '/api/*' ? '' : '/api/*'
+              })}
+            >
+              /api/*
+            </button>
+            {reviewFileFilterIsActive(fileFilter) ? (
+              <button
+                type="button"
+                className="sidebar-file-filter-clear"
+                onClick={() => onFileFilterChange(EMPTY_REVIEW_FILE_FILTER)}
+              >
+                Clear
+              </button>
+            ) : null}
+          </div>
+        </div>
+      )}
       <FileTree className="project-tree" model={model} style={treeStyle} onClick={activateClickedRow} />
     </aside>
   )

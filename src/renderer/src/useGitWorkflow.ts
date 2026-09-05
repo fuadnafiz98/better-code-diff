@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type {
   GitIntegrationSnapshot,
+  OmittedDiffFile,
+  PullRequestFile,
+  PullRequestFolderPreview,
   PullRequestInboxSnapshot,
   PullRequestMergeStrategy,
   PullRequestReviewComment,
@@ -9,8 +12,10 @@ import type {
   PullRequestSummary,
   RepositorySnapshot
 } from '../../shared/contracts'
+import { extractGitHubPullRequestUrl } from '../../shared/pullRequestUrl'
 import type { WorkspaceView } from './AppView'
 import type { ConfirmRequest } from './ConfirmDialog'
+import { reviewFolderChip } from './pullRequestOpen'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
 import { automaticWorkspaceView, firstOpenPathForSnapshot } from './workspaceMode'
 import { useReviewWorlds, type ReviewWorld } from './useReviewWorlds'
@@ -69,6 +74,50 @@ export function isPanelDataStale(
   if (snapshot != null && entry.root !== (snapshot.root ?? null)) return true
   if (snapshot != null && (entry.head !== snapshot.head || entry.branch !== snapshot.branch)) return true
   return now - entry.fetchedAt >= ttlMs
+}
+
+interface PullRequestPatchContent {
+  pages: readonly string[]
+  files: PullRequestFile[]
+  omittedFiles: OmittedDiffFile[]
+}
+
+/**
+ * A review that streamed its pages replies without them — the patch would
+ * otherwise cross IPC twice — so a caller who wants the whole thing, such as a
+ * released `since` world being restored, has to read the stream as well.
+ */
+async function fetchPullRequestPatch(root: string, url: string): Promise<PullRequestPatchContent> {
+  const requestId = crypto.randomUUID()
+  let pages: string[] = []
+  let files: PullRequestFile[] = []
+  let omittedFiles: OmittedDiffFile[] = []
+  const stopListening = requireRepositoryApi().onPullRequestReviewProgress((progress) => {
+    if (progress.requestId !== requestId || progress.root !== root) return
+    if (progress.kind === 'files') {
+      pages.push(progress.patch)
+      files.push(...progress.files)
+      omittedFiles.push(...progress.omittedFiles)
+      return
+    }
+    if (progress.kind !== 'replace') return
+    pages = progress.review.patch === '' ? [] : [progress.review.patch]
+    files = [...progress.review.files]
+    omittedFiles = [...progress.review.omittedFiles]
+  })
+  try {
+    const review = await requireRepositoryApi().getPullRequestReview(root, url, requestId)
+    if (review.patch !== '' || review.files.length > 0) {
+      return {
+        pages: review.patch === '' ? [] : [review.patch],
+        files: review.files,
+        omittedFiles: review.omittedFiles
+      }
+    }
+    return { pages, files, omittedFiles }
+  } finally {
+    stopListening()
+  }
 }
 
 export function useGitWorkflow({
@@ -131,17 +180,58 @@ export function useGitWorkflow({
     openPatchWorld,
     openSinceWorld,
     rememberReviewScroll,
+    replacePatchHead,
     replacePatchReview,
     reset: resetReviewWorlds,
     restoreSincePatch,
     selectInitialPath,
     setNewWorldPending,
+    setPatchChecks,
     setPatchExpectedFileCount,
     setPatchLoadStatus,
     syncRepositorySnapshot,
     updateNewWorldLocator,
+    updateNewWorldRepositoryRoot,
     worlds: reviewWorldList
   } = reviewWorlds
+  const [suggestedReviewFolder, setSuggestedReviewFolder] = useState<PullRequestFolderPreview | null>(null)
+  const newWorldId = activeReviewWorld?.source === 'new' ? activeReviewWorld.worldId : null
+  const newWorldLocator = activeReviewWorld?.source === 'new' ? activeReviewWorld.locator : ''
+  const newWorldRoot = activeReviewWorld?.source === 'new' ? activeReviewWorld.repositoryRoot : null
+  useEffect(() => {
+    if (newWorldId == null || newWorldRoot != null) {
+      setSuggestedReviewFolder(null)
+      return
+    }
+    const url = extractGitHubPullRequestUrl(newWorldLocator)
+    const preview = window.repository?.previewPullRequestFolder
+    if (url == null || typeof preview !== 'function') {
+      setSuggestedReviewFolder(null)
+      return
+    }
+    let cancelled = false
+    void preview(url).then((next) => {
+      if (!cancelled) setSuggestedReviewFolder(next)
+    }).catch(() => {
+      if (!cancelled) setSuggestedReviewFolder(null)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [newWorldId, newWorldLocator, newWorldRoot])
+  const reviewFolder = reviewFolderChip(
+    activeReviewWorld?.source === 'new' ? activeReviewWorld : null,
+    suggestedReviewFolder
+  )
+  const chooseReviewFolder = useCallback(() => {
+    const choose = window.repository?.chooseFolder
+    if (typeof choose !== 'function') return
+    void choose().then((path) => {
+      if (path != null) updateNewWorldRepositoryRoot(path)
+    }).catch((error: unknown) => {
+      onError(getErrorMessage(error))
+    })
+  }, [onError, updateNewWorldRepositoryRoot])
   const activeWorldIdRef = useRef(activeReviewWorld?.worldId ?? null)
   useEffect(() => {
     activeWorldIdRef.current = activeReviewWorld?.worldId ?? null
@@ -373,6 +463,22 @@ export function useGitWorkflow({
         setPatchExpectedFileCount(worldId, generation, progress.fileCount)
         return
       }
+      if (progress.kind === 'checks') {
+        setPatchChecks(worldId, generation, progress.checks, progress.mergeable)
+        return
+      }
+      if (progress.kind === 'replace') {
+        // The review opened from disk and the head has since moved. What arrives
+        // here is the whole pull request again at its new commits, so it supersedes
+        // every page as well as the oids the tab was opened at.
+        replacePatchHead(worldId, generation, {
+          ...progress.review,
+          expectedFileCount: progress.review.files.length
+        })
+        const replacedPath = progress.review.files[0]?.path
+        if (replacedPath != null) selectInitialPath(worldId, replacedPath)
+        return
+      }
       appendPatchPage(worldId, generation, progress)
       const firstPath = progress.files[0]?.path
       if (firstPath != null) selectInitialPath(worldId, firstPath)
@@ -445,19 +551,43 @@ export function useGitWorkflow({
       reviewRequestsRef.current.delete(requestId)
       setActionKey((current) => current === `review:${selector}` ? null : current)
     }
-  }, [activeReviewWorld, appendPatchPage, onError, openPatchWorld, replacePatchReview,
-    selectInitialPath, setPatchExpectedFileCount, setPatchLoadStatus, snapshot])
+  }, [activeReviewWorld, appendPatchPage, onError, openPatchWorld, replacePatchHead,
+    replacePatchReview, selectInitialPath, setPatchChecks, setPatchExpectedFileCount,
+    setPatchLoadStatus, snapshot])
 
-  const openPullRequestFromLocator = useCallback(async (pullRequestUrl: string): Promise<boolean> => {
+  /**
+   * A folder opened on a skeleton snapshot picked its view and its first file
+   * from an empty status list. Once the git snapshot lands, derive both again —
+   * only while the desk for that root is still the tab in front of the reader.
+   */
+  const resyncDeskNavigation = useCallback((nextSnapshot: RepositorySnapshot) => {
+    const active = activeReviewWorld
+    if (active == null || active.source !== 'desk' || active.root !== nextSnapshot.root) return
+    focusDesk(firstOpenPathForSnapshot(nextSnapshot), automaticWorkspaceView(nextSnapshot, null))
+  }, [activeReviewWorld, focusDesk])
+
+  const openPullRequestFromLocator = useCallback(async (pullRequestUrl: string,
+    resolvedRoot: string | null = null): Promise<boolean> => {
     const originWorldId = activeReviewWorld?.source === 'new'
       ? activeReviewWorld.worldId
       : openNewWorld()
+    // Retargeting this tab abandons whatever it was loading. Without this the old
+    // review kept paging — up to eight `gh api` children per wave — against a
+    // pull request nobody is going to look at.
+    for (const [requestId, request] of reviewRequestsRef.current) {
+      if (request.originWorldId !== originWorldId) continue
+      reviewRequestsRef.current.delete(requestId)
+      requireRepositoryApi().cancelPullRequestReview(request.root, requestId)
+    }
     updateNewWorldLocator(pullRequestUrl, originWorldId)
     setNewWorldPending(true, pullRequestUrl, originWorldId)
     setActionKey('resolve:pull-request')
     onError(null)
     try {
-      const repositorySnapshot = await requireRepositoryApi().resolvePullRequestRepository(pullRequestUrl)
+      const preferredRoot = resolvedRoot
+        ?? (activeReviewWorld?.source === 'new' ? activeReviewWorld.repositoryRoot : null)
+      const repositorySnapshot = await requireRepositoryApi()
+        .resolvePullRequestRepository(pullRequestUrl, preferredRoot)
       if (repositorySnapshot == null) return false
       if (!hasWorld(originWorldId)) {
         if (!hasRepositoryRoot(repositorySnapshot.root)) {
@@ -501,22 +631,14 @@ export function useGitWorkflow({
         let files = parentReview.files
         let omittedFiles = parentReview.omittedFiles
         if (pages.length === 0) {
-          let review = await requireRepositoryApi().getPullRequestReview(
-            parent.root,
-            parentReview.pullRequest.url,
-            crypto.randomUUID()
-          )
-          if (review.patch === '' && review.files.length === 0) {
+          let fetched = await fetchPullRequestPatch(parent.root, parentReview.pullRequest.url)
+          if (fetched.files.length === 0) {
             await openPullRequestReview(parentReview.pullRequest.url, parent.snapshot, parent.worldId)
-            review = await requireRepositoryApi().getPullRequestReview(
-              parent.root,
-              parentReview.pullRequest.url,
-              crypto.randomUUID()
-            )
+            fetched = await fetchPullRequestPatch(parent.root, parentReview.pullRequest.url)
           }
-          pages = review.patch === '' ? [] : [review.patch]
-          files = review.files
-          omittedFiles = review.omittedFiles
+          pages = fetched.pages
+          files = fetched.files
+          omittedFiles = fetched.omittedFiles
         }
         const changedPaths = new Set(world.changedPaths)
         restoreSincePatch(
@@ -831,8 +953,13 @@ export function useGitWorkflow({
     reviewPullRequest,
     openPullRequestReview,
     openPullRequestFromLocator,
+    resyncDeskNavigation,
     openNewWorld,
     updateNewWorldLocator,
+    updateNewWorldRepositoryRoot,
+    reviewFolderName: reviewFolder.name,
+    reviewFolderPath: reviewFolder.path,
+    chooseReviewFolder,
     openWorkingTree: openDeskWorld,
     syncRepositorySnapshot,
     reviewLocalBranch,
@@ -859,8 +986,12 @@ export function useGitWorkflow({
     openDeskWorld,
     openNewWorld,
     rememberReviewScroll,
+    chooseReviewFolder,
+    reviewFolder.name,
+    reviewFolder.path,
     syncRepositorySnapshot,
     updateNewWorldLocator,
+    updateNewWorldRepositoryRoot,
     reviewWorldList,
     integrationEntry.fetchedAt,
     refreshPanelData,
@@ -878,6 +1009,7 @@ export function useGitWorkflow({
     openBranches,
     openPullRequestReview,
     openPullRequestFromLocator,
+    resyncDeskNavigation,
     panelOpen,
     panelTab,
     pullCurrentBranch,

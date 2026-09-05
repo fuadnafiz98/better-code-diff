@@ -94,6 +94,7 @@ import { VIEWER_BASE_CSS } from './viewerCss'
 import { buildViewedPathsKey, parseViewedPathsKey } from './viewedPaths'
 import { PullRequestContext } from './PullRequestContext'
 import { createReviewCommentAnchor } from './reviewThreadAnchors'
+import './MultiFileReview.css'
 
 const CODE_VIEW_CSS = `
   ${VIEWER_BASE_CSS}
@@ -274,10 +275,7 @@ function ReviewProgressBar({
   skippedCount,
   omittedFiles,
   failedCount,
-  collapsedCount,
-  onLoadMore,
-  collapseAllFiles,
-  expandAllFiles
+  onLoadMore
 }: {
   loading: boolean
   loadedPathCount: number
@@ -288,10 +286,7 @@ function ReviewProgressBar({
   skippedCount: number
   omittedFiles: ReviewLoadState['omittedFiles']
   failedCount: number
-  collapsedCount: number
   onLoadMore(): void
-  collapseAllFiles(): void
-  expandAllFiles(): void
 }): React.JSX.Element {
   return (
     <div className="multi-file-progress" style={{
@@ -321,14 +316,6 @@ function ReviewProgressBar({
           </button>
         </div>
       ) : null}
-      <div className="multi-file-fold-actions" role="group" aria-label="Multi-file folding">
-        <button type="button" onClick={collapseAllFiles} disabled={collapsedCount === itemCount}>
-          Collapse all
-        </button>
-        <button type="button" onClick={expandAllFiles} disabled={collapsedCount === 0}>
-          Expand all
-        </button>
-      </div>
     </div>
   )
 }
@@ -647,8 +634,6 @@ interface MultiFileViewerProps {
   setViewerRef(viewer: CodeViewHandle<ReviewAnnotationMetadata> | null): void
   getInitialScrollTop(): number
   toggleItemCollapsed(item: CodeViewItem<ReviewAnnotationMetadata>): void
-  collapseAllFiles(): void
-  expandAllFiles(): void
   cancelComment(): void
   saveComment(body: string): void
   updateThread: UpdateReviewThread
@@ -695,8 +680,6 @@ const MultiFileViewer = memo(function MultiFileViewer({
   setViewerRef,
   getInitialScrollTop,
   toggleItemCollapsed,
-  collapseAllFiles,
-  expandAllFiles,
   cancelComment,
   saveComment,
   updateThread,
@@ -910,10 +893,7 @@ const MultiFileViewer = memo(function MultiFileViewer({
         skippedCount={loadState.skippedCount}
         omittedFiles={loadState.omittedFiles}
         failedCount={loadState.failedCount}
-        collapsedCount={collapsedItemIds.size}
         onLoadMore={onLoadMore}
-        collapseAllFiles={collapseAllFiles}
-        expandAllFiles={expandAllFiles}
       />
     ) : null}
     <div className="multi-file-code-view-host">
@@ -1098,8 +1078,6 @@ const MultiFileReview = memo(function MultiFileReview({
     toggleItemCollapsed,
     toggleCollapsedById,
     setCollapsedById,
-    collapseAllFiles,
-    expandAllFiles,
     beginComment,
     handleSelectedLinesChange,
     saveComment,
@@ -1283,8 +1261,7 @@ const MultiFileReview = memo(function MultiFileReview({
       onImagePreview={handleImagePreview}
       onScrollPositionChange={onScrollPositionChange} onVisiblePathChange={onVisiblePathChange} setViewerRef={setViewerRef}
       getInitialScrollTop={getInitialScrollTop}
-      toggleItemCollapsed={toggleItemCollapsed} collapseAllFiles={collapseAllFiles}
-      expandAllFiles={expandAllFiles} cancelComment={cancelComment} saveComment={saveComment}
+      toggleItemCollapsed={toggleItemCollapsed} cancelComment={cancelComment} saveComment={saveComment}
       updateThread={updateThread} reattachingThread={reattachingThread}
       onBeginReattach={startReattach} onCancelReattach={stopReattach}
       onDropAll={dropAllReviewThreads}

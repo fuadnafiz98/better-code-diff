@@ -5,13 +5,20 @@ const AGENT_CONTEXT_FILE_LIMIT = 80
 
 export function agentSubjectForWorld(world: ReviewWorld | null): AgentRequestSubject | null {
   if (world == null || world.source === 'new') return null
+  const pullRequestUrl = world.source === 'patch' || world.source === 'since'
+    ? world.review.kind === 'github' ? world.review.pullRequest.url : undefined
+    : undefined
   return {
     tabId: world.worldId,
     repositoryRoot: world.root,
     repositoryName: world.snapshot.name,
     source: world.source === 'desk' ? 'workingTree' : world.source,
     baseOid: world.source === 'desk' ? world.snapshot.head : world.baseOid,
-    headOid: world.source === 'desk' ? world.snapshot.head : world.headOid
+    headOid: world.source === 'desk' ? world.snapshot.head : world.headOid,
+    ...(pullRequestUrl == null ? {} : { pullRequestUrl }),
+    ...(world.snapshot.branch == null || world.snapshot.branch === ''
+      ? {}
+      : { workingBranch: world.snapshot.branch })
   }
 }
 
@@ -23,10 +30,14 @@ export function formatAgentReviewContext(
     `Review tab: ${subject.tabId}`,
     `Repository: ${subject.repositoryName}`,
     `Repository root: ${subject.repositoryRoot}`,
+    subject.workingBranch == null ? null : `Current branch: ${subject.workingBranch}`,
     `Source: ${subject.source}`,
     `Base revision: ${subject.baseOid ?? 'none'}`,
-    `Head revision: ${subject.headOid ?? 'working tree without HEAD'}`
-  ]
+    `Head revision: ${subject.headOid ?? 'working tree without HEAD'}`,
+    subject.source === 'workingTree'
+      ? null
+      : 'Those revisions may be absent from this checkout. Do not fetch them. Horus already loaded the review.'
+  ].filter((line): line is string => line != null)
   if (review == null) return tabContext.join('\n')
   const identity = review.kind === 'github'
     ? [
@@ -48,4 +59,17 @@ export function formatAgentReviewContext(
     ? [`…and ${review.files.length - AGENT_CONTEXT_FILE_LIMIT} more files`]
     : []
   return [...tabContext, ...identity, ...omitted, 'Changed files:', ...listedFiles, ...overflow].join('\n')
+}
+
+export function agentContextLabel(
+  world: ReviewWorld | null,
+  review: RepositoryReview | null
+): string {
+  if (world == null || world.source === 'new') {
+    return review == null ? 'this tab' : 'this review'
+  }
+  const repository = world.snapshot.name
+  if (review == null) return `${repository} working tree`
+  if (review.kind === 'github') return `#${review.pullRequest.number} in ${repository}`
+  return `${review.title} in ${repository}`
 }

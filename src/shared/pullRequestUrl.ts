@@ -67,3 +67,9 @@ export function describeGitHubPullRequest(value: string): GitHubPullRequestRef |
   if (owner == null || repository == null || rawNumber == null) return null
   return { owner, repository, number: Number(rawNumber), url }
 }
+
+export function githubRepoSlugFromPullRequestUrl(value: string): string | null {
+  const ref = describeGitHubPullRequest(value)
+  if (ref == null) return null
+  return `${ref.owner}/${ref.repository}`.toLowerCase()
+}

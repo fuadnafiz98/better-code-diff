@@ -37,6 +37,48 @@ describe('collectFolderCandidates', () => {
     const folders = await collectFolderCandidates(home, [extra])
     expect(folders.map((folder) => folder.path)).toContain(await realpath(extra))
   })
+
+  // The children of one directory are resolved in a single concurrent round.
+  // A wide directory is where that either keeps every candidate or quietly
+  // drops one, so it is the shape worth pinning down.
+  test('indexes every child of a wide directory exactly once', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-folders-wide-'))
+    const group = join(home, 'Developer', 'group')
+    const names = Array.from({ length: 24 }, (_, index) => `repo-${String(index).padStart(2, '0')}`)
+    await Promise.all(names.map((name) => makeGitRepo(join(group, name))))
+    await mkdir(join(group, 'node_modules', 'left-pad'), { recursive: true })
+    await mkdir(join(group, '.hidden'), { recursive: true })
+    await writeFile(join(group, 'notes.txt'), 'hi')
+
+    const folders = await collectFolderCandidates(home)
+    const displayPaths = folders.map((folder) => folder.displayPath)
+
+    expect(displayPaths).toContain('~/Developer/group')
+    for (const name of names) expect(displayPaths).toContain(`~/Developer/group/${name}`)
+    expect(new Set(displayPaths).size).toBe(displayPaths.length)
+    expect(displayPaths).toEqual(displayPaths.toSorted((left, right) => left.localeCompare(right)))
+    expect(displayPaths.some((path) => path.includes('node_modules'))).toBe(false)
+    expect(displayPaths.some((path) => path.includes('.hidden'))).toBe(false)
+    expect(displayPaths.some((path) => path.includes('notes.txt'))).toBe(false)
+  })
+
+  test('resolves remembered roots and default scan roots in the same round', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'horus-folders-extra-'))
+    const echo = join(home, 'Developer', 'echo')
+    await makeGitRepo(echo)
+    const notes = join(home, 'Documents', 'notes')
+    await mkdir(notes, { recursive: true })
+    const file = join(home, 'Documents', 'todo.txt')
+    await writeFile(file, 'hi')
+
+    const folders = await collectFolderCandidates(home, [notes, join(home, 'Documents', 'gone'), file])
+    const paths = folders.map((folder) => folder.path)
+
+    expect(paths).toContain(await realpath(notes))
+    expect(paths).toContain(await realpath(echo))
+    expect(paths.some((path) => path.endsWith('todo.txt'))).toBe(false)
+    expect(paths.some((path) => path.endsWith('gone'))).toBe(false)
+  })
 })
 
 describe('resolveOpenableFolder', () => {

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 
 import type { RemoteReviewThread } from '../../shared/contracts'
 import { RemoteReviewThreadCard } from './RemoteReviewThreads'
@@ -24,28 +24,28 @@ function thread(body: string): RemoteReviewThread {
   }
 }
 
-test('renders GitHub table syntax in a thread comment', () => {
+test('renders GitHub table syntax in a thread comment', async () => {
   render(<RemoteReviewThreadCard
     thread={thread('| a | b |\n| --- | --- |\n| 1 | 2 |')}
     pending={false} onReply={() => {}} onToggleResolved={() => {}} />)
 
-  expect(screen.getByRole('table')).toBeTruthy()
+  expect(await screen.findByRole('table')).toBeTruthy()
 })
 
-test('sanitises script tags out of GitHub comment bodies', () => {
+test('sanitises script tags out of GitHub comment bodies', async () => {
   const { container } = render(<RemoteReviewThreadCard
     thread={thread('Safe text <script>alert(1)</script>')}
     pending={false} onReply={() => {}} onToggleResolved={() => {}} />)
 
+  await waitFor(() => { expect(screen.getByText(/Safe text/).tagName).toBe('P') })
   expect(container.querySelector('script')).toBeNull()
-  expect(screen.getByText(/Safe text/)).toBeTruthy()
 })
 
-test('autolinks a bare URL in a GitHub comment', () => {
+test('autolinks a bare URL in a GitHub comment', async () => {
   render(<RemoteReviewThreadCard
     thread={thread('See https://example.com/review')}
     pending={false} onReply={() => {}} onToggleResolved={() => {}} />)
 
-  const link = screen.getByRole('link', { name: 'https://example.com/review' })
+  const link = await screen.findByRole('link', { name: 'https://example.com/review' })
   expect(link.getAttribute('href')).toBe('https://example.com/review')
 })

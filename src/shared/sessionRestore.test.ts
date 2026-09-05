@@ -22,12 +22,23 @@ const restoring = {
   restoreLastFolder: true,
   themeType: 'light' as const,
   folderPresent: true,
-  restoring: true
+  restoring: true,
+  pendingPullRequestUrl: null
 }
 
 describe('parseRestoreHint', () => {
   it('reads a complete hint', () => {
     expect(parseRestoreHint(restoring)).toEqual(restoring)
+  })
+
+  it('carries a pending pull request URL and rejects anything else', () => {
+    expect(parseRestoreHint({
+      ...restoring,
+      pendingPullRequestUrl: 'https://github.com/acme/app/pull/717?files=1'
+    }).pendingPullRequestUrl).toBe('https://github.com/acme/app/pull/717')
+    expect(parseRestoreHint({ ...restoring, pendingPullRequestUrl: 'not a url' }).pendingPullRequestUrl).toBeNull()
+    expect(parseRestoreHint({ ...restoring, pendingPullRequestUrl: 42 }).pendingPullRequestUrl).toBeNull()
+    expect(EMPTY_RESTORE_HINT.pendingPullRequestUrl).toBeNull()
   })
 
   it('treats a missing folder as not restorable', () => {
@@ -42,7 +53,8 @@ describe('parseRestoreHint', () => {
       restoreLastFolder: true,
       themeType: 'dark',
       folderPresent: false,
-      restoring: false
+      restoring: false,
+      pendingPullRequestUrl: null
     })
     expect(sessionRestoreExpected(parseRestoreHint({
       lastRoot: '/missing',
@@ -113,7 +125,8 @@ describe('restorePendingFromHint', () => {
       restoreLastFolder: true,
       themeType: 'dark',
       folderPresent: false,
-      restoring: false
+      restoring: false,
+      pendingPullRequestUrl: null
     }, true)).toBe(false)
   })
 })
@@ -191,7 +204,8 @@ describe('sessionWorkspaceStage', () => {
         restoreLastFolder: true,
         themeType: 'dark',
         folderPresent: false,
-        restoring: false
+        restoring: false,
+        pendingPullRequestUrl: null
       }),
       pullRequestPending: false
     })).toBe('welcome')

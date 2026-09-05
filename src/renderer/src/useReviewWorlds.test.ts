@@ -402,3 +402,132 @@ test('open-desk still replaces an empty Welcome New tab', () => {
   expect(next.worlds[0]?.source).toBe('desk')
   expect(next.activeWorldId).toBe('desk:/repo')
 })
+
+test('a New tab keeps a chosen folder until the pull-request repository changes', () => {
+  const world = { ...createNewWorld(), repositoryRoot: '/Users/me/Developer/app' }
+  const state = { worlds: [world], activeWorldId: world.worldId }
+  const sameRepo = reduceWorldRegistry(state, {
+    type: 'update-locator',
+    worldId: world.worldId,
+    locator: 'https://github.com/acme/app/pull/9'
+  })
+  expect(sameRepo.worlds[0]?.source === 'new' ? sameRepo.worlds[0].repositoryRoot : null)
+    .toBe('/Users/me/Developer/app')
+
+  const otherPr = reduceWorldRegistry(sameRepo, {
+    type: 'update-locator',
+    worldId: world.worldId,
+    locator: 'https://github.com/acme/app/pull/10'
+  })
+  expect(otherPr.worlds[0]?.source === 'new' ? otherPr.worlds[0].repositoryRoot : null)
+    .toBe('/Users/me/Developer/app')
+
+  const otherRepo = reduceWorldRegistry(otherPr, {
+    type: 'update-locator',
+    worldId: world.worldId,
+    locator: 'https://github.com/acme/other/pull/10'
+  })
+  expect(otherRepo.worlds[0]?.source === 'new' ? otherRepo.worlds[0].repositoryRoot : null)
+    .toBeNull()
+
+  const chosen = reduceWorldRegistry(otherRepo, {
+    type: 'update-repository-root',
+    worldId: world.worldId,
+    root: '/Users/me/Developer/other'
+  })
+  expect(chosen.worlds[0]?.source === 'new' ? chosen.worlds[0].repositoryRoot : null)
+    .toBe('/Users/me/Developer/other')
+})
+
+test('a force-pushed review replaces the tab it was opened in, oids and all', () => {
+  const opened = createPatchWorld(snapshot(), { ...review(), patch: 'stale patch\n' }, 1, 'loading')
+  const state = reduceWorldRegistry(
+    { worlds: [], activeWorldId: null },
+    { type: 'open-patch', world: opened, originWorldId: null }
+  )
+  const moved: PullRequestReview = {
+    ...review(),
+    baseOid: 'base-7b',
+    headOid: 'head-7b',
+    commitId: 'head-7b',
+    patch: 'fresh patch\n',
+    files: [{ path: 'src/b.ts', additions: 2, deletions: 0 }]
+  }
+
+  const replaced = reduceWorldRegistry(state, {
+    type: 'replace-patch-head', worldId: opened.worldId, generation: 1, review: moved
+  })
+  const world = replaced.worlds[0]
+  // The tab keeps its id — the loader still holds it — and takes the new commits.
+  expect(world?.worldId).toBe(opened.worldId)
+  expect(world?.source === 'patch' ? world.headOid : null).toBe('head-7b')
+  expect(world?.source === 'patch' ? world.baseOid : null).toBe('base-7b')
+  expect(world?.source === 'patch' ? world.patchPages : null).toEqual(['fresh patch\n'])
+  expect(world?.source === 'patch' ? world.patchLength : null).toBe('fresh patch\n'.length)
+
+  const otherPullRequest = reduceWorldRegistry(replaced, {
+    type: 'replace-patch-head', worldId: opened.worldId, generation: 1, review: review(9)
+  })
+  expect(otherPullRequest.worlds[0]?.source === 'patch' ? otherPullRequest.worlds[0].headOid : null)
+    .toBe('head-7b')
+})
+
+test('reopening a force-pushed pull request takes over its tab instead of adding one', () => {
+  const opened = createPatchWorld(snapshot(), review(), 1, 'ready')
+  const state = reduceWorldRegistry(
+    { worlds: [], activeWorldId: null },
+    { type: 'open-patch', world: opened, originWorldId: null }
+  )
+  const moved = createPatchWorld(
+    snapshot(),
+    { ...review(), baseOid: 'base-7b', headOid: 'head-7b', commitId: 'head-7b' },
+    2,
+    'loading'
+  )
+  expect(moved.worldId).not.toBe(opened.worldId)
+
+  const reopened = reduceWorldRegistry(state, {
+    type: 'open-patch',
+    world: moved,
+    originWorldId: 'somewhere-else',
+    supersedesWorldId: opened.worldId
+  })
+
+  expect(reopened.worlds).toHaveLength(1)
+  expect(reopened.worlds[0]?.worldId).toBe(moved.worldId)
+  // The superseded tab was the one in front, so the reader stays on it.
+  expect(reopened.activeWorldId).toBe(moved.worldId)
+})
+
+test('a background open with no active world does not steal focus', () => {
+  const state = reduceWorldRegistry(
+    { worlds: [createNewWorld()], activeWorldId: null },
+    { type: 'open-patch', world: createPatchWorld(snapshot(), review(), 1, 'ready'), originWorldId: 'elsewhere' }
+  )
+
+  expect(state.activeWorldId).toBeNull()
+})
+
+test('checks land on the review header without disturbing the patch', () => {
+  const opened = createPatchWorld(snapshot(), { ...review(), patch: 'patch\n' }, 1, 'loading')
+  const state = reduceWorldRegistry(
+    { worlds: [], activeWorldId: null },
+    { type: 'open-patch', world: opened, originWorldId: null }
+  )
+
+  const patched = reduceWorldRegistry(state, {
+    type: 'set-patch-checks',
+    worldId: opened.worldId,
+    generation: 1,
+    checks: { passing: 3, failing: 1, pending: 0 },
+    mergeable: 'CONFLICTING'
+  })
+  const world = patched.worlds[0]
+  expect(world?.source === 'patch' && world.review.kind === 'github'
+    ? world.review.pullRequest.checks
+    : null).toEqual({ passing: 3, failing: 1, pending: 0 })
+  expect(world?.source === 'patch' && world.review.kind === 'github'
+    ? world.review.pullRequest.mergeable
+    : null).toBe('CONFLICTING')
+  expect(world?.source === 'patch' ? world.patchPages : null).toEqual(['patch\n'])
+})

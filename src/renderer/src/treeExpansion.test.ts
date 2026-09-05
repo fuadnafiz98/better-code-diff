@@ -9,20 +9,35 @@ import {
 } from './treeExpansion'
 
 describe('treeContentSyncMode', () => {
+  const root = '/repo'
   const paths = ['src/a.ts', 'src/b.ts']
   const statuses = [{ path: 'src/a.ts', status: 'modified' }]
+  const applied = { root, paths, statuses }
 
   it('skips work when the tree already has this content', () => {
-    expect(treeContentSyncMode({ paths, statuses }, paths, statuses)).toBe('skip')
+    expect(treeContentSyncMode(applied, root, paths, statuses)).toBe('skip')
   })
 
   it('updates decorations without resetting when only statuses change', () => {
     const nextStatuses = [{ path: 'src/a.ts', status: 'added' }]
-    expect(treeContentSyncMode({ paths, statuses }, paths, nextStatuses)).toBe('status')
+    expect(treeContentSyncMode(applied, root, paths, nextStatuses)).toBe('status')
   })
 
   it('resets when the path list itself changes', () => {
-    expect(treeContentSyncMode({ paths, statuses }, [...paths, 'src/c.ts'], statuses)).toBe('reset')
+    expect(treeContentSyncMode(applied, root, [...paths, 'src/c.ts'], statuses)).toBe('reset')
+  })
+
+  it('adopts the first content without a collapse pass', () => {
+    expect(treeContentSyncMode(null, root, paths, statuses)).toBe('adopt')
+  })
+
+  it('adopts content for a different root', () => {
+    expect(treeContentSyncMode(applied, '/other', paths, statuses)).toBe('adopt')
+  })
+
+  it('adopts the git snapshot that replaces an empty skeleton listing', () => {
+    expect(treeContentSyncMode({ root, paths: [], statuses: [] }, root, paths, statuses))
+      .toBe('adopt')
   })
 })
 

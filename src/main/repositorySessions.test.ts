@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,6 +7,17 @@ import type { RepositoryChangeEvent, RepositorySnapshot } from '../shared/contra
 import { runCommand } from './gitCommands.js'
 import { RepositoryService } from './repository.js'
 import { RepositorySessionRegistry } from './repositorySessions.js'
+import { RepositoryWatcher } from './repositoryWatcher.js'
+
+const sleep = (ms: number): Promise<void> => new Promise((resolveSleep) => { setTimeout(resolveSleep, ms) })
+
+async function waitFor(satisfied: () => boolean): Promise<boolean> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (satisfied()) return true
+    await sleep(25)
+  }
+  return satisfied()
+}
 
 const directories: string[] = []
 const registries: RepositorySessionRegistry[] = []
@@ -56,7 +67,7 @@ describe('RepositorySessionRegistry', () => {
     expect(registry.activeRoot).toBe(first.root)
     expect(registry.require(first.root)).not.toBe(registry.require(second.root))
 
-    const activated = registry.activate(second.root)
+    const activated = await registry.activate(second.root)
     expect(activated.root).toBe(second.root)
     expect(registry.activeRoot).toBe(second.root)
   })
@@ -120,9 +131,36 @@ describe('RepositorySessionRegistry', () => {
     for (const path of paths) await firstRepository.getComparison(path)
 
     expect(firstRepository.getHeadCacheStatsForTests().workingBytes).toBeGreaterThan(8 * 1024 * 1024)
-    registry.activate(second.root)
+    await registry.activate(second.root)
 
     expect(firstRepository.getHeadCacheStatsForTests().workingBytes).toBeLessThanOrEqual(8 * 1024 * 1024)
+  })
+
+  it('refreshes the root it is given, not whichever one is active', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'horus-refresh-root-'))
+    directories.push(parent)
+    await Promise.all([mkdir(join(parent, 'active')), mkdir(join(parent, 'background'))])
+    const activeRoot = await realpath(join(parent, 'active'))
+    const backgroundRoot = await realpath(join(parent, 'background'))
+
+    const registry = new RepositorySessionRegistry(() => {}, () => {})
+    registries.push(registry)
+    await registry.open(backgroundRoot, false)
+    await registry.open(activeRoot)
+    expect(registry.activeRoot).toBe(activeRoot)
+
+    const active = spyOn(registry.require(activeRoot), 'refresh')
+    const background = spyOn(registry.require(backgroundRoot), 'refresh')
+    try {
+      await registry.refresh(backgroundRoot)
+
+      expect(background).toHaveBeenCalledTimes(1)
+      expect(active).not.toHaveBeenCalled()
+      expect(await registry.refresh(join(parent, 'never-opened'))).toBeNull()
+    } finally {
+      active.mockRestore()
+      background.mockRestore()
+    }
   })
 
   it('returns a snapshot before git status finishes', async () => {
@@ -146,6 +184,78 @@ describe('RepositorySessionRegistry', () => {
       expect(snapshot.statuses).toEqual([])
       expect(refresh).toHaveBeenCalled()
       release(snapshot)
+    } finally {
+      refresh.mockRestore()
+    }
+  })
+
+  it('returns the live snapshot when the refresh beats the open deadline', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'horus-open-live-')))
+    directories.push(root)
+    await writeFile(join(root, 'readme.md'), 'hello\n', 'utf8')
+    const events: RepositoryChangeEvent[] = []
+    const registry = new RepositorySessionRegistry((event) => events.push(event), () => {})
+    registries.push(registry)
+    const live: RepositorySnapshot = {
+      root,
+      name: 'live',
+      kind: 'git',
+      branch: 'main',
+      head: 'abcdef',
+      paths: ['readme.md'],
+      statuses: [{ path: 'readme.md', status: 'modified' }]
+    }
+    const refresh = spyOn(RepositoryService.prototype, 'refresh')
+      .mockImplementation(async () => {
+        await sleep(10)
+        return live
+      })
+
+    try {
+      const snapshot = await registry.open(root)
+
+      expect(snapshot).toBe(live)
+      expect(snapshot.statuses).toEqual([{ path: 'readme.md', status: 'modified' }])
+      // The caller already has it; publishing the same snapshot again is noise.
+      expect(events).toEqual([])
+    } finally {
+      refresh.mockRestore()
+    }
+  })
+
+  it('falls back to the listing and publishes the live snapshot when the refresh is slow', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'horus-open-slow-')))
+    directories.push(root)
+    await writeFile(join(root, 'readme.md'), 'hello\n', 'utf8')
+    const events: RepositoryChangeEvent[] = []
+    const registry = new RepositorySessionRegistry((event) => events.push(event), () => {})
+    registries.push(registry)
+    const live: RepositorySnapshot = {
+      root,
+      name: 'live',
+      kind: 'git',
+      branch: 'main',
+      head: 'abcdef',
+      paths: ['readme.md'],
+      statuses: [{ path: 'readme.md', status: 'modified' }]
+    }
+    const refresh = spyOn(RepositoryService.prototype, 'refresh')
+      .mockImplementation(async () => {
+        await sleep(400)
+        return live
+      })
+
+    try {
+      const snapshot = await registry.open(root)
+
+      expect(snapshot).not.toBe(live)
+      expect(snapshot.paths).toContain('readme.md')
+      expect(snapshot.statuses).toEqual([])
+      expect(events).toEqual([])
+
+      expect(await waitFor(() => events.length > 0)).toBe(true)
+      expect(events.at(-1)?.snapshot).toBe(live)
+      expect(events.at(-1)?.changedPaths).toEqual(['readme.md'])
     } finally {
       refresh.mockRestore()
     }
@@ -184,6 +294,133 @@ describe('RepositorySessionRegistry', () => {
     expect(published.length).toBeGreaterThan(0)
     expect(published.at(-1)?.changedPaths).not.toContain('clean.ts')
   })
+
+  it('counts a watcher tick as an external change instead of joining an older refresh', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-watch-tick-')))
+    directories.push(root)
+    const file = join(root, 'watched.ts')
+    await writeFile(file, 'export const watched = 0\n', 'utf8')
+    const registry = new RepositorySessionRegistry(() => {}, () => {})
+    registries.push(registry)
+    await registry.open(root)
+
+    const external = spyOn(registry.requireActive(), 'refreshAfterExternalChange')
+    try {
+      // FSEvents coalesces and every write restarts the watcher's debounce, so
+      // the settle between attempts has to outlast it.
+      for (let attempt = 0; attempt < 30 && external.mock.calls.length === 0; attempt += 1) {
+        await writeFile(file, `export const watched = ${attempt + 1}\n`, 'utf8')
+        await sleep(150)
+      }
+
+      expect(external).toHaveBeenCalled()
+    } finally {
+      external.mockRestore()
+    }
+  }, 30_000)
+
+  it('opens an already-resolved path into the session the symlink opened', async () => {
+    const parent = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-resolved-')))
+    directories.push(parent)
+    const realRoot = join(parent, 'project')
+    const linkPath = join(parent, 'link')
+    await mkdir(realRoot)
+    await symlink(realRoot, linkPath)
+
+    const registry = new RepositorySessionRegistry(() => {}, () => {})
+    registries.push(registry)
+    const viaLink = await registry.open(linkPath)
+    expect(viaLink.root).toBe(realRoot)
+
+    // `openRepository` has already run the path through realpath, so the
+    // registry is told not to do it again; the session must still be the same one.
+    const viaResolved = await registry.open(realRoot, true, true)
+    expect(viaResolved.root).toBe(realRoot)
+    expect(registry.roots).toEqual([realRoot])
+  })
+
+  it('pauses every background watcher when a repository is activated', async () => {
+    const parent = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-pause-')))
+    directories.push(parent)
+    const firstRoot = join(parent, 'first')
+    const secondRoot = join(parent, 'second')
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)])
+    const pause = spyOn(RepositoryWatcher.prototype, 'pause')
+    const resume = spyOn(RepositoryWatcher.prototype, 'resume')
+
+    try {
+      const registry = new RepositorySessionRegistry(() => {}, () => {})
+      registries.push(registry)
+      const first = await registry.open(firstRoot)
+      const second = await registry.open(secondRoot)
+
+      // Activating the second root parked the first one.
+      expect(pause).toHaveBeenCalled()
+      pause.mockClear()
+      resume.mockClear()
+
+      await registry.activate(first.root)
+      expect(registry.activeRoot).toBe(first.root)
+      expect(resume).toHaveBeenCalled()
+      expect(pause).toHaveBeenCalled()
+      expect(second.root).not.toBe(first.root)
+    } finally {
+      pause.mockRestore()
+      resume.mockRestore()
+    }
+  }, 30_000)
+
+  it('never arms a watcher for a repository opened in the background', async () => {
+    const parent = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-background-')))
+    directories.push(parent)
+    const activeRoot = join(parent, 'active')
+    const backgroundRoot = join(parent, 'background')
+    await Promise.all([mkdir(activeRoot), mkdir(backgroundRoot)])
+    const pause = spyOn(RepositoryWatcher.prototype, 'pause')
+
+    try {
+      const registry = new RepositorySessionRegistry(() => {}, () => {})
+      registries.push(registry)
+      await registry.open(activeRoot)
+      pause.mockClear()
+      await registry.open(backgroundRoot, false)
+      // The watcher is armed on the next tick, and parked on the same one.
+      await sleep(50)
+
+      expect(registry.activeRoot).toBe(await realpath(activeRoot))
+      expect(pause).toHaveBeenCalled()
+    } finally {
+      pause.mockRestore()
+    }
+  }, 30_000)
+
+  it('caps resident sessions and reopens an evicted root when its tab returns', async () => {
+    const parent = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-cap-')))
+    directories.push(parent)
+    const roots: string[] = []
+    for (let index = 0; index < 6; index += 1) {
+      const root = join(parent, `repo-${index}`)
+      await mkdir(root)
+      await writeFile(join(root, 'app.ts'), 'export {}\n', 'utf8')
+      roots.push(root)
+    }
+
+    const registry = new RepositorySessionRegistry(() => {}, () => {})
+    registries.push(registry)
+    for (const root of roots) await registry.open(root)
+    const evictedRoot = roots[0]!
+    const newestRoot = roots.at(-1)!
+
+    expect(registry.roots).toHaveLength(4)
+    expect(registry.roots).toEqual(roots.slice(2))
+    expect(registry.activeRoot).toBe(newestRoot)
+    expect(() => registry.require(evictedRoot)).toThrow('The repository tab is no longer open.')
+
+    const reopened = await registry.activate(evictedRoot)
+    expect(reopened.root).toBe(evictedRoot)
+    expect(registry.activeRoot).toBe(evictedRoot)
+    expect(registry.roots).toHaveLength(4)
+  }, 30_000)
 
   it('hydrates a cached snapshot so the tree is available before git refresh', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'horus-session-hydrate-')))

@@ -247,6 +247,142 @@ test('closing a loading New tab cancels its request and releases its unused chec
   expect(result.current.worlds.some((world) => world.source === 'patch')).toBe(false)
 })
 
+test('opening a pull request from a New tab uses the chosen project folder', async () => {
+  const resolvePullRequestRepository = mock(async (
+    _url: string,
+    _preferredRoot?: string | null
+  ) => repositorySnapshot)
+  window.repository = {
+    resolvePullRequestRepository,
+    getPullRequestReview: async () => review(9),
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: () => () => {}
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow(workflowOptions()))
+
+  act(() => { result.current.openNewWorld() })
+  act(() => { result.current.updateNewWorldRepositoryRoot('/Users/me/Developer/app') })
+  await act(() => result.current.openPullRequestFromLocator(review(9).pullRequest.url))
+
+  expect(resolvePullRequestRepository).toHaveBeenCalledWith(
+    review(9).pullRequest.url,
+    '/Users/me/Developer/app'
+  )
+})
+
+test('reopening a pull request whose head moved keeps one tab', async () => {
+  const moved: PullRequestReview = {
+    ...review(5),
+    baseOid: 'b2'.repeat(20),
+    headOid: 'h2'.repeat(20),
+    commitId: 'h2'.repeat(20)
+  }
+  let next = review(5)
+  window.repository = {
+    getPullRequestReview: async () => next,
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: () => () => {}
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow(workflowOptions()))
+
+  await act(() => result.current.openPullRequestReview(5))
+  const originalWorldId = result.current.activeWorld?.worldId
+  expect(result.current.worlds.filter((world) => world.source === 'patch')).toHaveLength(1)
+
+  next = moved
+  await act(() => result.current.openPullRequestReview(5))
+
+  const patchWorlds = result.current.worlds.filter((world) => world.source === 'patch')
+  expect(patchWorlds).toHaveLength(1)
+  expect(patchWorlds[0]?.worldId).not.toBe(originalWorldId)
+  expect(result.current.activeWorld?.worldId).toBe(patchWorlds[0]?.worldId)
+})
+
+test('the git snapshot behind a skeleton open re-derives the desk view and file', async () => {
+  const selected: (string | null)[] = []
+  const views: string[] = []
+  window.repository = { onPullRequestReviewProgress: () => () => {} } as unknown as RepositoryApi
+  const skeleton: RepositorySnapshot = {
+    ...repositorySnapshot,
+    branch: null,
+    paths: ['desk.ts', 'src/changed.ts'],
+    statuses: [],
+    stage: 'skeleton'
+  }
+  const { result } = renderHook(() => useGitWorkflow({
+    ...workflowOptions(),
+    snapshot: skeleton,
+    selectedPath: null,
+    workspaceView: 'file' as const,
+    onSelectPath: (path) => selected.push(path),
+    onWorkspaceViewChange: (view) => views.push(view)
+  }))
+  await waitFor(() => expect(result.current.activeWorld?.source).toBe('desk'))
+
+  const live: RepositorySnapshot = {
+    ...skeleton,
+    branch: 'main',
+    statuses: [{ path: 'src/changed.ts', status: 'modified' }],
+    stage: 'live'
+  }
+  act(() => { result.current.resyncDeskNavigation(live) })
+
+  expect(selected.at(-1)).toBe('src/changed.ts')
+  expect(views.at(-1)).toBe('multi')
+})
+
+test('a resync while another tab is in front leaves the reader where they are', async () => {
+  const selected: (string | null)[] = []
+  window.repository = {
+    getPullRequestReview: async () => review(3),
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: () => () => {}
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow({
+    ...workflowOptions(),
+    onSelectPath: (path) => selected.push(path)
+  }))
+
+  await act(() => result.current.openPullRequestReview(3))
+  expect(result.current.activeWorld?.source).toBe('patch')
+  const before = selected.length
+
+  act(() => {
+    result.current.resyncDeskNavigation({
+      ...repositorySnapshot,
+      statuses: [{ path: 'desk.ts', status: 'modified' }],
+      stage: 'live'
+    })
+  })
+
+  expect(selected.length).toBe(before)
+  expect(result.current.activeWorld?.source).toBe('patch')
+})
+
+test('a root resolved by main wins over the New tab folder as the preferred root', async () => {
+  const resolvePullRequestRepository = mock(async (
+    _url: string,
+    _preferredRoot?: string | null
+  ) => repositorySnapshot)
+  window.repository = {
+    resolvePullRequestRepository,
+    getPullRequestReview: async () => review(9),
+    activateRepository: async () => repositorySnapshot,
+    releaseRepository: async () => {},
+    onPullRequestReviewProgress: () => () => {}
+  } as unknown as RepositoryApi
+  const { result } = renderHook(() => useGitWorkflow(workflowOptions()))
+
+  act(() => { result.current.openNewWorld() })
+  act(() => { result.current.updateNewWorldRepositoryRoot('/Users/me/Developer/app') })
+  await act(() => result.current.openPullRequestFromLocator(review(9).pullRequest.url, '/repo'))
+
+  expect(resolvePullRequestRepository).toHaveBeenCalledWith(review(9).pullRequest.url, '/repo')
+})
+
 test('a deep-linked pull request pops a New tab before the repository resolve returns', async () => {
   const pending = deferred<RepositorySnapshot | null>()
   const resolvePullRequestRepository = mock(() => pending.promise)

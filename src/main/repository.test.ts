@@ -1,19 +1,20 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { describe, expect, it, spyOn } from 'bun:test'
 
-import type { PullRequestReview } from '../shared/contracts.js'
-import { COMMAND_ABORTED_MESSAGE } from './gitCommands.js'
+import type { PullRequestReview, PullRequestReviewProgress } from '../shared/contracts.js'
+import { COMMAND_ABORTED_MESSAGE, commandSemaphore, MAX_BACKGROUND_COMMANDS } from './gitCommands.js'
 
 import {
   buildPullRequestPatchFromFiles,
   chunkPatchByFileCount,
   chunkPathspecs,
   classifySearchCompletion,
+  contentSearchOpenPath,
   createNewFilePatch,
   createPullRequestReviewPayload,
   diffFilesFromChurn,
@@ -26,6 +27,7 @@ import {
   isSameGitHubLogin,
   limitPatchFileSize,
   mapGitStatus,
+  mergeContentSearchResults,
   normalizePullRequestSelector,
   parseNumstat,
   mergeVisiblePaths,
@@ -33,12 +35,14 @@ import {
   parsePorcelainV2Status,
   parsePullRequestConversation,
   PullRequestReviewCache,
+  pullRequestReviewLane,
   pullRequestReviewReply,
   pullRequestFilePageWave,
   pullRequestTargetsRemotes,
   replaceStatusEntry,
   RepositoryService,
   resolvePackagedExecutablePath,
+  runGitHubReadCommand,
   sectionPullRequestInbox,
   selectOversizedDiffFiles,
   summarizeCheckRollup
@@ -269,6 +273,16 @@ describe('mergeVisiblePaths', () => {
       'apps/web/node_modules',
       'src/.env.local'
     ])).toEqual(['.env', 'notes.txt', 'src/.env.local', 'src/a.ts'])
+  })
+
+  it('drops ignored virtualenvs, bytecode caches, and .pyc files', () => {
+    expect(mergeVisiblePaths(Buffer.from('src/a.ts\0'), [], [
+      '.env',
+      '.venv/lib/python3.12/site-packages/requests/api.py',
+      'apps/api/__pycache__/verify.cpython-312.pyc',
+      'src/verify.pyc',
+      'venv/bin/activate'
+    ])).toEqual(['.env', 'src/a.ts'])
   })
 })
 
@@ -749,6 +763,59 @@ describe('classifySearchCompletion', () => {
     expect(classifySearchCompletion(completion)).toEqual({ kind: 'results' })
     expect(classifySearchCompletion({ ...completion, code: 1, resultCount: 0 })).toEqual({ kind: 'results' })
   })
+
+  it('measures the stop against the cap the caller asked for', () => {
+    // The open file's own pass runs to a much higher cap than the palette's.
+    expect(classifySearchCompletion({
+      ...completion,
+      code: null,
+      signal: 'SIGTERM',
+      resultCount: 30,
+      resultCap: 200
+    })).toEqual({ kind: 'error', message: 'The search stopped before it finished.' })
+    expect(classifySearchCompletion({
+      ...completion,
+      code: null,
+      signal: 'SIGTERM',
+      resultCount: 200,
+      resultCap: 200
+    })).toEqual({ kind: 'results' })
+  })
+})
+
+describe('contentSearchOpenPath', () => {
+  it('accepts a repository-relative path and strips the leading ./', () => {
+    expect(contentSearchOpenPath('src/App.tsx')).toBe('src/App.tsx')
+    expect(contentSearchOpenPath('./src/App.tsx')).toBe('src/App.tsx')
+    expect(contentSearchOpenPath('  src/App.tsx  ')).toBe('src/App.tsx')
+  })
+
+  it('refuses anything that could search outside the repository', () => {
+    expect(contentSearchOpenPath('/etc/passwd')).toBeNull()
+    expect(contentSearchOpenPath('../secrets/keys.txt')).toBeNull()
+    expect(contentSearchOpenPath('src/../../out')).toBeNull()
+    expect(contentSearchOpenPath('')).toBeNull()
+    expect(contentSearchOpenPath(null)).toBeNull()
+    expect(contentSearchOpenPath(42)).toBeNull()
+    expect(contentSearchOpenPath(`a/${'b'.repeat(1_100)}`)).toBeNull()
+  })
+})
+
+describe('mergeContentSearchResults', () => {
+  const hit = (path: string, line: number): { path: string; line: number; column: number; preview: string } =>
+    ({ path, line, column: 1, preview: 'needle' })
+
+  it('keeps the repository hits first and appends what the open file adds', () => {
+    const merged = mergeContentSearchResults(
+      [hit('src/a.ts', 1), hit('src/open.ts', 4)],
+      [hit('src/open.ts', 4), hit('src/open.ts', 9)]
+    )
+    expect(merged).toEqual([hit('src/a.ts', 1), hit('src/open.ts', 4), hit('src/open.ts', 9)])
+  })
+
+  it('returns the repository hits unchanged when no file was open', () => {
+    expect(mergeContentSearchResults([hit('src/a.ts', 1)], [])).toEqual([hit('src/a.ts', 1)])
+  })
 })
 
 describe('isPathWithinApprovedRoots', () => {
@@ -994,9 +1061,10 @@ describe('PullRequestReviewCache', () => {
       expect(hit?.patch).toBe('diff --git a/src/a.ts b/src/a.ts\n')
       expect(hit?.files).toEqual([{ path: 'src/a.ts', additions: 1, deletions: 0 }])
       const names = await readdir(join(directory, 'pr-cache'))
-      expect(names.filter((name) => name.endsWith('.json'))).toHaveLength(1)
+      expect(names.filter((name) => name.endsWith('.json') && !name.endsWith('.latest.json'))).toHaveLength(1)
+      expect(names.filter((name) => name.endsWith('.latest.json'))).toHaveLength(1)
       expect(names.filter((name) => name.endsWith('.patch'))).toHaveLength(1)
-      const metadataName = names.find((name) => name.endsWith('.json'))
+      const metadataName = names.find((name) => name.endsWith('.json') && !name.endsWith('.latest.json'))
       const metadata = JSON.parse(await readFile(join(directory, 'pr-cache', metadataName ?? ''), 'utf8'))
       expect(metadata.patch).toBeUndefined()
       expect(metadata.patchLength).toBe(review().patch.length)
@@ -1037,21 +1105,209 @@ describe('PullRequestReviewCache', () => {
     try {
       const cacheDirectory = join(directory, 'pr-cache')
       const cache = new PullRequestReviewCache(cacheDirectory)
-      for (let index = 0; index < 24; index += 1) {
+      for (let index = 1; index <= 64; index += 1) {
         await cache.write(`https://github.com/acme/app/pull/${index}`, `oid-${index}`, review())
       }
       await writeFile(join(cacheDirectory, 'orphan.patch'), 'orphan', 'utf8')
       await cache.sweep()
       const names = await readdir(cacheDirectory)
-      const metadataCount = names.filter((name) => name.endsWith('.json')).length
+      const metadataCount = names.filter((name) => name.endsWith('.json') && !name.endsWith('.latest.json')).length
       const patchCount = names.filter((name) => name.endsWith('.patch')).length
-      expect(metadataCount).toBeLessThanOrEqual(20)
+      expect(names.filter((name) => name.endsWith('.latest.json')).length).toBeLessThanOrEqual(60)
+      expect(metadataCount).toBeLessThanOrEqual(60)
       expect(patchCount).toBe(metadataCount)
       expect(names).not.toContain('orphan.patch')
       // The most recent write always survives its own sweep.
-      expect(await cache.read('https://github.com/acme/app/pull/23', 'oid-23')).not.toBeNull()
+      expect(await cache.read('https://github.com/acme/app/pull/64', 'oid-64')).not.toBeNull()
     } finally {
       await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('indexes the latest diff per URL so a reopen needs no head oid', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'better-code-diff-pr-index-'))
+    try {
+      const cache = new PullRequestReviewCache(join(directory, 'pr-cache'))
+      const url = 'https://github.com/acme/app/pull/7'
+      await cache.write(url, 'oid-1', review())
+
+      const index = await cache.readIndex(url)
+      expect(index?.headRefOid).toBe('oid-1')
+      expect(index?.url).toBe(url)
+      expect(index?.baseRefOid).toBe('base-oid-1')
+      expect(index?.viewerCanSubmitDecision).toBe(true)
+      expect(index?.summary.title).toBe('Add a thing')
+      // The reader has a pasted URL, the writer had GitHub's canonical one.
+      expect((await cache.readIndex('https://github.com/acme/app/pull/7?files=1#top'))?.headRefOid).toBe('oid-1')
+      expect(await cache.readIndex('https://github.com/acme/other/pull/7')).toBeNull()
+      expect(await cache.readIndex('7')).toBeNull()
+
+      // A force push repoints the index at the new diff.
+      await cache.write(url, 'oid-2', review({ headOid: 'oid-2', commitId: 'oid-2' }))
+      expect((await cache.readIndex(url))?.headRefOid).toBe('oid-2')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a corrupt or superseded index as a miss', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'better-code-diff-pr-index-bad-'))
+    try {
+      const cacheDirectory = join(directory, 'pr-cache')
+      const cache = new PullRequestReviewCache(cacheDirectory)
+      const url = 'https://github.com/acme/app/pull/7'
+      await cache.write(url, 'oid-1', review())
+      const indexName = (await readdir(cacheDirectory)).find((name) => name.endsWith('.latest.json'))
+      await writeFile(join(cacheDirectory, indexName ?? ''), '{ not json', 'utf8')
+      expect(await cache.readIndex(url)).toBeNull()
+
+      await writeFile(join(cacheDirectory, indexName ?? ''), JSON.stringify({ version: 0 }), 'utf8')
+      expect(await cache.readIndex(url)).toBeNull()
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('RepositoryService content search', () => {
+  it('caps the repository pass and still marks every hit in the open file', async () => {
+    const folderPath = await mkdtemp(join(tmpdir(), 'better-code-diff-search-cap-'))
+    const repository = new RepositoryService()
+    try {
+      for (let index = 0; index < 30; index += 1) {
+        await writeFile(join(folderPath, `file-${index}.ts`), 'const needle = 1\n', 'utf8')
+      }
+      const openPath = 'open.ts'
+      await writeFile(
+        join(folderPath, openPath),
+        Array.from({ length: 40 }, (_value, line) => `const needle${line} = ${line}`).join('\n'),
+        'utf8'
+      )
+      await repository.open(folderPath)
+
+      const capped = await repository.searchContent('needle')
+      // 24 rows, not 200: the palette renders eight of them.
+      expect(capped).toHaveLength(24)
+      expect(capped.filter((result) => result.path === openPath).length).toBeLessThanOrEqual(20)
+
+      const withOpenFile = await repository.searchContent('needle', openPath)
+      // Every hit in the file on screen, so the diff can mark all of them.
+      expect(withOpenFile.filter((result) => result.path === openPath)).toHaveLength(40)
+      expect(withOpenFile.filter((result) => result.path !== openPath).length).toBeLessThanOrEqual(24)
+      const keys = withOpenFile.map((result) => `${result.path}:${result.line}`)
+      expect(new Set(keys).size).toBe(keys.length)
+    } finally {
+      repository.dispose()
+      await rm(folderPath, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores an open path that is not inside the repository', async () => {
+    const folderPath = await mkdtemp(join(tmpdir(), 'better-code-diff-search-escape-'))
+    const repository = new RepositoryService()
+    try {
+      await writeFile(join(folderPath, 'value.ts'), 'const needle = 1\n', 'utf8')
+      await repository.open(folderPath)
+      expect(await repository.searchContent('needle', '../../etc/passwd'))
+        .toEqual(await repository.searchContent('needle'))
+    } finally {
+      repository.dispose()
+      await rm(folderPath, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('RepositoryService pull request review', () => {
+  const cachedReview = (): PullRequestReview => ({
+    kind: 'github',
+    selector: 'https://github.com/acme/app/pull/7',
+    baseOid: 'base-oid-1',
+    headOid: 'oid-1',
+    commitId: 'oid-1',
+    viewerCanSubmitDecision: true,
+    pullRequest: {
+      number: 7,
+      title: 'Add a thing',
+      url: 'https://github.com/acme/app/pull/7',
+      state: 'open',
+      isDraft: false,
+      author: { login: 'author' },
+      headRefName: 'feature',
+      baseRefName: 'main',
+      reviewDecision: null,
+      updatedAt: '2026-08-17T00:00:00Z',
+      additions: 1,
+      deletions: 0,
+      changedFiles: 1
+    },
+    files: [{ path: 'src/a.ts', additions: 1, deletions: 0 }],
+    patch: 'diff --git a/src/a.ts b/src/a.ts\n',
+    omittedFiles: [],
+    expectedFileCount: 1
+  })
+
+  async function openCachedRepository(prefix: string): Promise<{
+    repositoryPath: string
+    repository: RepositoryService
+    url: string
+  }> {
+    const repositoryPath = await mkdtemp(join(tmpdir(), prefix))
+    await initRepository(repositoryPath)
+    await writeFile(join(repositoryPath, 'value.ts'), 'export const value = 1\n', 'utf8')
+    await commitAll(repositoryPath, 'Initial commit')
+    const cacheDirectory = join(repositoryPath, 'pr-cache')
+    const url = 'https://github.com/acme/app/pull/7'
+    await new PullRequestReviewCache(cacheDirectory).write(url, 'oid-1', cachedReview())
+    const repository = new RepositoryService()
+    await repository.open(repositoryPath)
+    repository.setPullRequestCacheDirectory(cacheDirectory)
+    return { repositoryPath, repository, url }
+  }
+
+  it('opens a cached pull request from the URL index before asking GitHub anything', async () => {
+    const { repositoryPath, repository, url } = await openCachedRepository('better-code-diff-pr-open-')
+    try {
+      const events: PullRequestReviewProgress[] = []
+      const promise = repository.getPullRequestReview(url, (progress) => events.push(progress), 'req-1')
+      // Cancelling now leaves the disk paint intact and stops the background
+      // revalidation before it can spawn, so the test never touches the network.
+      repository.cancelPullRequestReview('req-1')
+      const reply = await promise
+
+      expect(events.map((event) => event.kind)).toEqual(['metadata', 'files', 'done'])
+      const [metadata, page] = events
+      expect(metadata?.kind === 'metadata' && metadata.review.pullRequest.title).toBe('Add a thing')
+      expect(metadata?.kind === 'metadata' && metadata.review.headOid).toBe('oid-1')
+      expect(page?.kind === 'files' && page.patch).toBe('diff --git a/src/a.ts b/src/a.ts\n')
+      expect(page?.kind === 'files' && page.files).toEqual([{ path: 'src/a.ts', additions: 1, deletions: 0 }])
+      // Streamed, so the reply leaves the patch out rather than cloning it twice.
+      expect(reply.patch).toBe('')
+      expect(reply.files).toEqual([])
+      expect(reply.expectedFileCount).toBe(1)
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('lets a reader join the warmup flight instead of waiting behind it', async () => {
+    const { repositoryPath, repository, url } = await openCachedRepository('better-code-diff-pr-join-')
+    try {
+      const events: PullRequestReviewProgress[] = []
+      const warmup = repository.getPullRequestReview(url, undefined, `warmup:${url}`, 'warmup')
+      const reader = repository.getPullRequestReview(url, (progress) => events.push(progress), 'req-2')
+      // The warmup never claimed the flight, so the reader's cancel still ends it.
+      repository.cancelPullRequestReview('req-2')
+      const [warmed, reply] = await Promise.all([warmup, reader])
+
+      // The warmup used to take the only progress callback with it; the reader
+      // received nothing at all and waited for the resolved review.
+      expect(events.map((event) => event.kind)).toEqual(['metadata', 'files', 'done'])
+      expect(warmed.files).toHaveLength(1)
+      expect(reply.files).toEqual([])
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
     }
   })
 })
@@ -1561,7 +1817,10 @@ describe('RepositoryService', () => {
       expect(snapshot.branch).toBeNull()
       expect(snapshot.paths).toContain('README.md')
       expect(snapshot.paths).toContain('src/value.ts')
-      expect(snapshot.paths).not.toContain('.env')
+      // The listing shows the dotfiles the live snapshot shows, so opening a
+      // folder does not have to re-derive the tree once git answers.
+      expect(snapshot.paths).toContain('.env')
+      expect(snapshot.paths).not.toContain('node_modules/dependency.js')
       expect(snapshot.statuses).toEqual([])
 
       const refreshed = await repository.refresh()
@@ -1634,6 +1893,230 @@ describe('RepositoryService', () => {
       expect(rootCommitReview.patch).toContain('+base')
     } finally {
       await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('shares one git cycle between callers asking for the same state', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-refresh-dedupe-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'tracked\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await repository.open(repositoryPath)
+
+      const first = repository.refresh()
+      const second = repository.refresh()
+      expect(second).toBe(first)
+
+      const [left, right] = await Promise.all([first, second])
+      expect(left).toBe(right)
+      expect(left.statuses).toEqual([])
+
+      // A settled run is not reused, not even by the caller that just awaited it.
+      const settled = await repository.refresh()
+      const next = repository.refresh()
+      expect(next).not.toBe(first)
+      expect(await next).not.toBe(settled)
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('does not hand a refresh that started before a write to a caller asking after it', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-refresh-mutation-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'a.ts'), 'export const a = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await repository.open(repositoryPath)
+      await repository.refresh()
+      const comparison = await repository.getComparison('a.ts')
+
+      const settled: string[] = []
+      const started = repository.refresh().then((snapshot) => {
+        settled.push('started')
+        return snapshot
+      })
+      await repository.saveWorkingFile({
+        path: 'a.ts',
+        contents: 'export const a = 2\n',
+        expectedCacheKey: comparison.newFile?.cacheKey ?? ''
+      })
+      const afterWrite = repository.refresh().then((snapshot) => {
+        settled.push('after-write')
+        return snapshot
+      })
+
+      const [before, after] = await Promise.all([started, afterWrite])
+      // Chained, not raced: two `git status` runs against one index answer the
+      // same thing and cost twice as much.
+      expect(settled).toEqual(['started', 'after-write'])
+      expect(after).not.toBe(before)
+      expect(after.statuses).toEqual([{ path: 'a.ts', status: 'modified' }])
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('runs a fresh cycle for the external change a watcher tick reports', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-refresh-external-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'watched.ts'), 'export const watched = 1\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await repository.open(repositoryPath)
+      await repository.refresh()
+
+      const started = repository.refresh()
+      // The write the tick is about to report. Nothing here bumps the mutation
+      // counter, so without `refreshAfterExternalChange` the call below would
+      // join the run above, which read the tree before this line.
+      await writeFile(join(repositoryPath, 'watched.ts'), 'export const watched = 2\n', 'utf8')
+      const afterTick = repository.refreshAfterExternalChange()
+      expect(afterTick).not.toBe(started)
+
+      const settled: string[] = []
+      const [before, after] = await Promise.all([
+        started.then((snapshot) => {
+          settled.push('started')
+          return snapshot
+        }),
+        afterTick.then((snapshot) => {
+          settled.push('after-tick')
+          return snapshot
+        })
+      ])
+
+      expect(settled).toEqual(['started', 'after-tick'])
+      expect(after).not.toBe(before)
+      expect(after.statuses).toEqual([{ path: 'watched.ts', status: 'modified' }])
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('refreshes without rewriting the index, and announces the write it might still make', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-refresh-locks-'))
+    const repository = new RepositoryService()
+    const selfWrites: string[] = []
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'tracked\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'edited\n', 'utf8')
+      await repository.open(repositoryPath)
+      repository.setSelfWriteObserver((path) => selfWrites.push(path))
+
+      const indexPath = join(repositoryPath, '.git', 'index')
+      const before = await stat(indexPath)
+      const refreshed = await repository.refresh()
+      const after = await stat(indexPath)
+
+      expect(refreshed.statuses).toEqual([{ path: 'tracked.txt', status: 'modified' }])
+      expect(after.mtimeMs).toBe(before.mtimeMs)
+      expect(selfWrites).toEqual(['.git/index', '.git/index'])
+    } finally {
+      repository.setSelfWriteObserver(null)
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('lists gitignored files without walking excluded directories, and re-lists them on the next refresh', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-ignored-refresh-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, '.gitignore'), '.env\nnode_modules/\nlogs/\n*.pyc\n', 'utf8')
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'tracked\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(repositoryPath, '.env'), 'SECRET=1\n', 'utf8')
+      await mkdir(join(repositoryPath, 'logs'), { recursive: true })
+      await writeFile(join(repositoryPath, 'logs', 'today.log'), 'entry\n', 'utf8')
+      await writeFile(join(repositoryPath, 'logs', 'stale.pyc'), 'bytecode\n', 'utf8')
+      await mkdir(join(repositoryPath, 'node_modules', 'pkg'), { recursive: true })
+      await writeFile(join(repositoryPath, 'node_modules', 'pkg', 'index.js'), 'pkg\n', 'utf8')
+
+      await repository.open(repositoryPath)
+      const first = await repository.refresh()
+      expect(first.paths).toEqual(['.env', '.gitignore', 'logs/today.log', 'tracked.txt'])
+
+      await writeFile(join(repositoryPath, 'logs', 'yesterday.log'), 'entry\n', 'utf8')
+      const second = await repository.refresh()
+
+      expect(second.paths).toEqual([
+        '.env', '.gitignore', 'logs/today.log', 'logs/yesterday.log', 'tracked.txt'
+      ])
+    } finally {
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('drops a gitignored set that lands after a newer refresh replaced its run', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-ignored-stale-'))
+    const repository = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, '.gitignore'), 'logs/\n', 'utf8')
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'tracked\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await mkdir(join(repositoryPath, 'logs'), { recursive: true })
+      await writeFile(join(repositoryPath, 'logs', 'today.log'), 'entry\n', 'utf8')
+
+      await repository.open(repositoryPath)
+      const published: string[][] = []
+      repository.setSnapshotObserver((snapshot) => published.push(snapshot.paths))
+      const refreshed = await repository.refresh()
+      expect(refreshed.paths).toContain('logs/today.log')
+
+      // Cancelling a walk only takes effect on its next directory, so the run a
+      // newer refresh replaced can still resolve with paths that are already out
+      // of date.
+      repository.mergeIgnoredPathsForTests(['logs/superseded.log'], 'superseded')
+
+      expect(published).toEqual([])
+      expect(repository.getSessionSnapshot()?.paths).toBe(refreshed.paths)
+
+      repository.mergeIgnoredPathsForTests(['logs/late.log'], 'current')
+
+      expect(published).toEqual([['.gitignore', 'logs/late.log', 'tracked.txt']])
+      expect(repository.getSessionSnapshot()?.paths).toEqual(['.gitignore', 'logs/late.log', 'tracked.txt'])
+    } finally {
+      repository.setSnapshotObserver(null)
+      repository.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+    }
+  })
+
+  it('marks the opening listing as a skeleton and every refreshed snapshot as live', async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), 'better-code-diff-snapshot-stage-'))
+    const folderPath = await mkdtemp(join(tmpdir(), 'better-code-diff-snapshot-stage-folder-'))
+    const repository = new RepositoryService()
+    const folder = new RepositoryService()
+    try {
+      await initRepository(repositoryPath)
+      await writeFile(join(repositoryPath, 'tracked.txt'), 'tracked\n', 'utf8')
+      await commitAll(repositoryPath, 'Initial commit')
+      await writeFile(join(folderPath, 'notes.md'), '# notes\n', 'utf8')
+
+      // The renderer re-derives the workspace view when a snapshot goes from the
+      // bounded listing to the git answer, so the two have to be distinguishable.
+      expect((await repository.open(repositoryPath)).stage).toBe('skeleton')
+      expect((await repository.refresh()).stage).toBe('live')
+      expect((await folder.open(folderPath)).stage).toBe('skeleton')
+      expect((await folder.refresh()).stage).toBe('live')
+    } finally {
+      repository.dispose()
+      folder.dispose()
+      await rm(repositoryPath, { recursive: true, force: true })
+      await rm(folderPath, { recursive: true, force: true })
     }
   })
 
@@ -2025,6 +2508,60 @@ describe('RepositoryService.hydrate', () => {
     } finally {
       repository.dispose()
       await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('RepositoryService.open', () => {
+  it('resolves the path once when the caller has already resolved it', async () => {
+    const folderPath = await mkdtemp(join(tmpdir(), 'better-code-diff-open-resolved-'))
+    const resolvedPath = await realpath(folderPath)
+    // macOS hands out symlinked temp roots, so an unresolved path is a different
+    // string from its realpath and the two cases are distinguishable.
+    expect(resolvedPath).not.toBe(folderPath)
+    const resolving = new RepositoryService()
+    const preResolved = new RepositoryService()
+    try {
+      expect((await resolving.open(folderPath)).root).toBe(resolvedPath)
+      expect((await preResolved.open(folderPath, true)).root).toBe(folderPath)
+    } finally {
+      resolving.dispose()
+      preResolved.dispose()
+      await rm(folderPath, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('pull request command lane', () => {
+  it('sends warmup hops to the background lane and reader hops to the interactive one', () => {
+    expect(pullRequestReviewLane('warmup')).toBe('background')
+    expect(pullRequestReviewLane('foreground')).toBe('interactive')
+  })
+
+  // The retry loop around every `gh` read is the one place a lane can be dropped
+  // on the floor, so it is checked against the real semaphore rather than a stub.
+  it('queues a background gh read behind a saturated background lane', async () => {
+    const releases: Array<() => void> = []
+    for (let slot = 0; slot < MAX_BACKGROUND_COMMANDS; slot += 1) {
+      releases.push(await commandSemaphore.acquire('background'))
+    }
+    try {
+      let backgroundDone = false
+      const background = runGitHubReadCommand('/bin/echo', ['warm'], process.cwd(), undefined, 'background')
+        .then((result) => {
+          backgroundDone = true
+          return result
+        })
+      // An interactive read still has slots, so it overtakes the queued one.
+      const interactive = await runGitHubReadCommand('/bin/echo', ['read'], process.cwd())
+      expect(interactive.stdout.toString('utf8').trim()).toBe('read')
+      expect(backgroundDone).toBe(false)
+      expect(commandSemaphore.waiting).toBe(1)
+
+      for (const release of releases.splice(0)) release()
+      expect((await background).stdout.toString('utf8').trim()).toBe('warm')
+    } finally {
+      for (const release of releases) release()
     }
   })
 })

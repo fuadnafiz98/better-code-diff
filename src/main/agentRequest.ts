@@ -8,6 +8,7 @@ import type {
   AgentRateLimitWindow,
   AgentUsageUpdate
 } from '../shared/contracts.js'
+import { normalizeGitHubPullRequestUrl } from '../shared/pullRequestUrl.js'
 
 // Review mode passes this list to the agent and uses it to label activity, so
 // its enforced access and displayed access cannot drift apart.
@@ -39,19 +40,28 @@ function decodeAgentSubject(value: unknown): AgentRequestSubject | null {
   const prototype = Object.getPrototypeOf(value) as unknown
   if (prototype !== Object.prototype && prototype !== null) return null
   const candidate = value as Record<string, unknown>
-  const { tabId, repositoryRoot, repositoryName, source, baseOid, headOid } = candidate
+  const { tabId, repositoryRoot, repositoryName, source, baseOid, headOid, pullRequestUrl, workingBranch } = candidate
   if (typeof tabId !== 'string' || typeof repositoryRoot !== 'string'
     || typeof repositoryName !== 'string' || typeof source !== 'string') return null
   if (baseOid !== null && typeof baseOid !== 'string') return null
   if (headOid !== null && typeof headOid !== 'string') return null
   if (!AGENT_SUBJECT_SOURCES.has(source as AgentRequestSubject['source'])) return null
+  if (pullRequestUrl !== undefined
+    && (typeof pullRequestUrl !== 'string' || normalizeGitHubPullRequestUrl(pullRequestUrl) !== pullRequestUrl)) {
+    return null
+  }
+  if (workingBranch !== undefined && (typeof workingBranch !== 'string' || workingBranch.length > 256)) {
+    return null
+  }
   return {
     tabId,
     repositoryRoot,
     repositoryName,
     source: source as AgentRequestSubject['source'],
     baseOid,
-    headOid
+    headOid,
+    ...(pullRequestUrl == null ? {} : { pullRequestUrl }),
+    ...(workingBranch == null || workingBranch === '' ? {} : { workingBranch })
   }
 }
 

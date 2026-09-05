@@ -5,6 +5,7 @@ import type { PullRequestConversation } from '../../shared/contracts'
 import { GitHubMarkdownContent } from './GitHubMarkdownContent'
 import { formatCommentAge } from './RemoteReviewThreads'
 import { useReviewClock } from './reviewClock'
+import './PullRequestContext.css'
 
 function reviewStateLabel(state: string): string {
   return state.toLowerCase().replaceAll('_', ' ')

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test'
 import {
   describeGitHubPullRequest,
   extractGitHubPullRequestUrl,
+  githubRepoSlugFromPullRequestUrl,
   normalizeGitHubPullRequestUrl
 } from './pullRequestUrl.js'
 
@@ -43,5 +44,16 @@ describe('describeGitHubPullRequest', () => {
         number: 12,
         url: 'https://github.com/Acme/App/pull/12'
       })
+  })
+})
+
+describe('githubRepoSlugFromPullRequestUrl', () => {
+  it('lowercases the owner and repository', () => {
+    expect(githubRepoSlugFromPullRequestUrl('https://github.com/Acme/App/pull/12'))
+      .toBe('acme/app')
+  })
+
+  it('returns null when the text is not a pull request', () => {
+    expect(githubRepoSlugFromPullRequestUrl('https://github.com/acme/app/issues/12')).toBeNull()
   })
 })

@@ -3,6 +3,7 @@ import { IconFolder, IconRefresh } from '@pierre/icons'
 
 import type { FolderPickerCatalog } from '../../shared/contracts'
 import { highlightPathMatches } from '../../shared/folderPath'
+import { OPEN_SPINNER_DELAY_MS } from './folderOpenSettle'
 import { buildFolderPickerRows, preloadFolderCatalog, type FolderPickerRow } from './folderPickerModel'
 import { nextPaletteIndex } from './paletteCommands'
 import { getErrorMessage, requireRepositoryApi } from './repositoryApi'
@@ -65,6 +66,8 @@ export function FolderChromeButton({
 interface FolderPickerProps {
   recentFolders: readonly RecentFolder[]
   openingPath: string | null
+  dialogLabel?: string
+  inputId?: string
   onClose(): void
   onSelect(path: string): void
   onUseExisting(): void
@@ -125,10 +128,13 @@ function FolderRow({
 export function FolderPicker({
   recentFolders,
   openingPath,
+  dialogLabel = 'Open folder',
+  inputId = 'folder-picker-input',
   onClose,
   onSelect,
   onUseExisting
 }: FolderPickerProps): React.JSX.Element {
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([])
   const [query, setQuery] = useState('')
@@ -161,8 +167,17 @@ export function FolderPicker({
     return () => document.removeEventListener('pointerdown', onPointerDown)
   }, [onClose])
 
+  // Non-modal: the picker is anchored under its button, not a centred sheet, and
+  // the top layer would take it out of that anchor. `show()` still gives screen
+  // readers the native dialog role; Escape and outside clicks are handled below,
+  // because a non-modal dialog fires no `cancel`.
   useLayoutEffect(() => {
+    const dialog = dialogRef.current
+    if (dialog != null && !dialog.open) dialog.show()
     inputRef.current?.focus()
+    return () => {
+      if (dialog?.open) dialog.close()
+    }
   }, [])
 
   const rows = useMemo(
@@ -174,6 +189,19 @@ export function FolderPicker({
   const activeRow = rows[clampedIndex]
   const searching = query.trim() !== ''
   const busy = openingPath != null
+
+  // Most folders open inside a frame or two. Marking the row immediately turns
+  // every ⌘O into a spinner blink, so the row only spins once the open is slow
+  // enough to be worth reporting.
+  const [openingSlowly, setOpeningSlowly] = useState(false)
+  useEffect(() => {
+    if (openingPath == null) return
+    const timer = setTimeout(() => setOpeningSlowly(true), OPEN_SPINNER_DELAY_MS)
+    return () => {
+      clearTimeout(timer)
+      setOpeningSlowly(false)
+    }
+  }, [openingPath])
 
   useLayoutEffect(() => {
     rowRefs.current[clampedIndex]?.scrollIntoView({ block: 'nearest' })
@@ -202,10 +230,10 @@ export function FolderPicker({
     : [{ label: 'Recents', items: folderRows }]
 
   return (
-    <div
+    <dialog
+      ref={dialogRef}
       className="folder-picker"
-      role="dialog"
-      aria-label="Open folder"
+      aria-label={dialogLabel}
       onKeyDown={(event) => {
         if (event.key !== 'Escape') return
         event.preventDefault()
@@ -219,10 +247,10 @@ export function FolderPicker({
           runActive()
         }}
       >
-        <label className="sr-only" htmlFor="folder-picker-input">Search folders</label>
+        <label className="sr-only" htmlFor={inputId}>Search folders</label>
         <input
           ref={inputRef}
-          id="folder-picker-input"
+          id={inputId}
           value={query}
           onChange={(event) => updateQuery(event.target.value)}
           onKeyDown={(event) => {
@@ -268,7 +296,7 @@ export function FolderPicker({
                     row={row}
                     active={row.id === activeRow?.id}
                     query={query.trim()}
-                    opening={openingPath === row.folder.path}
+                    opening={openingSlowly && openingPath === row.folder.path}
                     disabled={busy}
                     buttonRef={(node) => { rowRefs.current[index] = node }}
                     onPointerEnter={() => setActiveIndex(index)}
@@ -298,6 +326,6 @@ export function FolderPicker({
           <span className="folder-picker-chevron" aria-hidden="true">›</span>
         </button>
       </div>
-    </div>
+    </dialog>
   )
 }

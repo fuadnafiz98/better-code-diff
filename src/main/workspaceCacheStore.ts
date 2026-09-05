@@ -1,34 +1,47 @@
 import { readFileSync } from 'node:fs'
-import { writeFile } from 'node:fs/promises'
+import { rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
-  parseWorkspaceCache,
-  type WorkspaceCache
+  EMPTY_WORKSPACE_CACHE_STORE,
+  parseWorkspaceCacheStore,
+  type WorkspaceCacheStore
 } from '../shared/workspaceCache.js'
 
 const FILE_NAME = 'last-workspace.json'
+const TEMP_FILE_NAME = 'last-workspace.json.tmp'
 let pendingSave: Promise<void> = Promise.resolve()
 
 /**
  * Synchronous because the first HTML/React paint needs real folder names
  * before git status returns.
  */
-export function loadWorkspaceCache(directory: string): WorkspaceCache | null {
+export function loadWorkspaceCache(directory: string): WorkspaceCacheStore {
   try {
-    return parseWorkspaceCache(JSON.parse(readFileSync(join(directory, FILE_NAME), 'utf8')))
+    return parseWorkspaceCacheStore(JSON.parse(readFileSync(join(directory, FILE_NAME), 'utf8')))
   } catch {
-    return null
+    return EMPTY_WORKSPACE_CACHE_STORE
   }
 }
 
-export function saveWorkspaceCache(directory: string, cache: WorkspaceCache): Promise<void> {
+/**
+ * Writes through a sibling temp file and renames it over the target: a quit or
+ * a crash mid-write leaves the previous cache intact instead of a truncated
+ * file the next launch has to throw away. Saves are chained so two of them
+ * cannot interleave on the same temp path.
+ */
+export function saveWorkspaceCache(directory: string, store: WorkspaceCacheStore): Promise<void> {
   const path = join(directory, FILE_NAME)
-  const serialized = JSON.stringify(cache)
+  const tempPath = join(directory, TEMP_FILE_NAME)
+  const serialized = JSON.stringify(store)
   pendingSave = pendingSave
-    .then(() => writeFile(path, serialized, 'utf8'))
-    .catch((error) => {
+    .then(async () => {
+      await writeFile(tempPath, serialized, 'utf8')
+      await rename(tempPath, path)
+    })
+    .catch(async (error: unknown) => {
       console.error('Could not persist the last workspace:', error)
+      await unlink(tempPath).catch(() => undefined)
     })
   return pendingSave
 }

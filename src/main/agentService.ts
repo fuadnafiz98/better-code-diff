@@ -756,13 +756,15 @@ function describeClaudeTool(toolName: string, input: Record<string, unknown>): s
   return summary === '{}' ? toolName : summary.slice(0, 2_000)
 }
 
-function composeAgentPrompt(question: string, reviewContext = ''): string {
+export function composeAgentPrompt(question: string, reviewContext = ''): string {
   const instructions = [
-    'Answer from evidence in the open repository.',
-    'Inspect the relevant files and call sites before reaching a conclusion.',
-    'Use repository search and Git commands when the selected access mode permits them.',
-    'For reviews, inspect beyond the patch when dependencies or callers affect the answer.',
+    'Horus already loaded this review into the matching local checkout.',
+    'The working directory is that checkout. Stay inside it.',
+    'Do not fetch remotes, clone repositories, or call GitHub, gh, or the network.',
+    'If a review bundle path is listed, read that patch first, then only the listed files and their direct callers or callees.',
+    'The working tree is the current codebase and may differ from the pull-request head. Treat the patch as the change under review.',
     'Cite concrete file paths and line numbers. Separate verified facts from inferences.',
+    'When a flow, state machine, or sequence helps, include a mermaid diagram.',
     'Do not change files unless the user explicitly asks for a change.'
   ].join(' ')
   if (reviewContext === '') return `${question}\n\nReview instructions: ${instructions}`

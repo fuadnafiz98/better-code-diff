@@ -19,8 +19,6 @@ declare namespace Preferences {
   export type OpenPullRequest = ExtensionPreferences & {}
   /** Preferences accessible in the `open-clipboard-pull-request` command */
   export type OpenClipboardPullRequest = ExtensionPreferences & {}
-  /** Preferences accessible in the `warmup-clipboard` command */
-  export type WarmupClipboard = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -33,7 +31,5 @@ declare namespace Arguments {
 }
   /** Arguments passed to the `open-clipboard-pull-request` command */
   export type OpenClipboardPullRequest = {}
-  /** Arguments passed to the `warmup-clipboard` command */
-  export type WarmupClipboard = {}
 }
 

@@ -20,7 +20,7 @@ const SELF_WRITE_WINDOW_MS = 1_000
 const OPERATION_MARKERS = ['index.lock', 'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD'] as const
 const EXCLUDED_SEGMENTS = new Set([
   '.cache', '.next', '.nuxt', '.output', '.parcel-cache', '.svelte-kit', '.turbo',
-  '.vercel', '.vite', 'DerivedData', 'build', 'coverage', 'dist', 'node_modules',
+  '.vercel', '.vite', '.horus', 'DerivedData', 'build', 'coverage', 'dist', 'node_modules',
   'out', 'target'
 ])
 
@@ -154,6 +154,7 @@ export class RepositoryWatcher {
   #timer: ReturnType<typeof setTimeout> | null = null
   #refreshing = false
   #suspended = false
+  #paused = false
   #generation = 0
   #revision = 0
 
@@ -163,8 +164,14 @@ export class RepositoryWatcher {
     private readonly reportError: (error: unknown) => void
   ) {}
 
+  /** True while the OS watch handles are closed but the snapshot is still held. */
+  get paused(): boolean {
+    return this.#paused
+  }
+
   start(snapshot: RepositorySnapshot): void {
     this.stop()
+    this.#paused = false
     this.#snapshot = snapshot
     this.#publishedPaths = snapshot.paths
     const generation = this.#generation
@@ -223,13 +230,38 @@ export class RepositoryWatcher {
     }
   }
 
-  stop(): void {
+  /**
+   * Closes the watch handles of a repository nobody is looking at. The snapshot
+   * stays, so re-arming costs one `watch()` instead of a reopen — and a machine
+   * with six folders open stops running six recursive watches and six refresh
+   * loops against every broad filesystem event.
+   */
+  pause(): void {
+    if (this.#paused) return
+    this.#paused = true
     this.#generation += 1
-    this.#watcher?.close()
-    this.#watcher = null
-    this.#gitDirectoryWatcher?.close()
-    this.#gitDirectoryWatcher = null
-    this.#gitDirectory = null
+    this.#closeHandles()
+    this.#pendingPaths.clear()
+    this.#pendingContentCount = 0
+    this.#deferredSince = 0
+    if (this.#timer != null) clearTimeout(this.#timer)
+    this.#timer = null
+  }
+
+  /** Re-arms a paused watcher. Returns false when there was nothing to re-arm. */
+  resume(): boolean {
+    if (!this.#paused) return false
+    this.#paused = false
+    const snapshot = this.#snapshot
+    if (snapshot == null) return false
+    this.start(snapshot)
+    return true
+  }
+
+  stop(): void {
+    this.#paused = false
+    this.#generation += 1
+    this.#closeHandles()
     this.#snapshot = null
     this.#publishedPaths = null
     this.#pendingPaths.clear()
@@ -240,8 +272,16 @@ export class RepositoryWatcher {
     this.#timer = null
   }
 
+  #closeHandles(): void {
+    this.#watcher?.close()
+    this.#watcher = null
+    this.#gitDirectoryWatcher?.close()
+    this.#gitDirectoryWatcher = null
+    this.#gitDirectory = null
+  }
+
   #schedule(generation: number, delay?: number): void {
-    if (this.#suspended) return
+    if (this.#suspended || this.#paused) return
     if (this.#timer != null) clearTimeout(this.#timer)
     const metadataOnly = this.#pendingContentCount === 0
     this.#timer = setTimeout(() => {
@@ -262,14 +302,14 @@ export class RepositoryWatcher {
   }
 
   async #flush(generation: number): Promise<void> {
-    if (generation !== this.#generation || this.#snapshot == null || this.#suspended) return
+    if (generation !== this.#generation || this.#snapshot == null || this.#suspended || this.#paused) return
     if (this.#refreshing) {
       this.#schedule(generation)
       return
     }
 
     const operationInProgress = await this.#operationInProgress()
-    if (generation !== this.#generation || this.#snapshot == null || this.#suspended) return
+    if (generation !== this.#generation || this.#snapshot == null || this.#suspended || this.#paused) return
     if (operationInProgress) {
       const now = Date.now()
       if (this.#deferredSince === 0) this.#deferredSince = now

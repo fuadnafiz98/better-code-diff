@@ -24,16 +24,23 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
   const resizerRef = useRef<HTMLDivElement>(null)
   const [committedWidth, setCommittedWidth] = useState(loadSidebarWidth)
   const liveWidthRef = useRef(committedWidth)
+  // What the workspace element is already showing. Every path that commits a
+  // width has written it to the DOM and clamped it against the same workspace
+  // bounds first, so re-measuring and re-writing in the effect that follows the
+  // commit would lay the explorer and the diff out a second time for nothing.
+  const paintedWidthRef = useRef<number | null>(null)
 
   useLayoutEffect(() => {
     const workspace = resizerRef.current == null ? null : getWorkspace(resizerRef.current)
     if (workspace == null) return
+    if (paintedWidthRef.current === committedWidth) return
 
     const boundedWidth = clampSidebarWidth(
       committedWidth,
       workspace.getBoundingClientRect().width
     )
     liveWidthRef.current = boundedWidth
+    paintedWidthRef.current = boundedWidth
     applyWidth(workspace, boundedWidth)
     if (boundedWidth !== committedWidth) {
       setCommittedWidth(boundedWidth)
@@ -41,8 +48,10 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
     }
   }, [committedWidth])
 
-  const commitWidth = useCallback((width: number) => {
+  const commitWidth = useCallback((workspace: HTMLDivElement, width: number) => {
     liveWidthRef.current = width
+    paintedWidthRef.current = width
+    applyWidth(workspace, width)
     setCommittedWidth(width)
     saveSidebarWidth(width)
   }, [])
@@ -62,12 +71,13 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
     const raw = drag.width + (pointerX - drag.pointerX)
     const maximum = clampSidebarWidth(MAX_SIDEBAR_WIDTH, drag.workspaceWidth)
     liveWidthRef.current = clampSidebarWidth(raw, drag.workspaceWidth)
-    applyWidth(workspace, Math.round(withResistance(
-      raw,
-      MIN_SIDEBAR_WIDTH,
-      maximum,
-      drag.workspaceWidth
-    )))
+    const painted = Math.round(withResistance(raw, MIN_SIDEBAR_WIDTH, maximum, drag.workspaceWidth))
+    // A high-rate pointer sends several moves per frame and most of them land on
+    // the same rounded pixel; only a value that actually changes is worth
+    // invalidating the explorer's and the diff's layout for.
+    if (painted === paintedWidthRef.current) return
+    paintedWidthRef.current = painted
+    applyWidth(workspace, painted)
   }, [])
 
   const endDrag = useCallback((resizer: HTMLDivElement) => {
@@ -77,8 +87,7 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
     if (workspace == null) return
     delete workspace.dataset.resizing
     // The overshoot has to be written back or the sidebar stays stretched.
-    applyWidth(workspace, liveWidthRef.current)
-    commitWidth(liveWidthRef.current)
+    commitWidth(workspace, liveWidthRef.current)
   }, [commitWidth])
 
   return (
@@ -124,8 +133,7 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
         const workspace = getWorkspace(event.currentTarget)
         if (workspace == null) return
         dragRef.current = null
-        applyWidth(workspace, DEFAULT_SIDEBAR_WIDTH)
-        commitWidth(DEFAULT_SIDEBAR_WIDTH)
+        commitWidth(workspace, DEFAULT_SIDEBAR_WIDTH)
       }}
       onKeyDown={(event) => {
         const workspace = getWorkspace(event.currentTarget)
@@ -141,8 +149,7 @@ export const SidebarResizer = memo(function SidebarResizer(): React.JSX.Element 
 
         event.preventDefault()
         nextWidth = clampSidebarWidth(nextWidth, workspaceWidth)
-        applyWidth(workspace, nextWidth)
-        commitWidth(nextWidth)
+        commitWidth(workspace, nextWidth)
       }}
     />
   )

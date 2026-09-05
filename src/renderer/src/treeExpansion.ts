@@ -1,4 +1,8 @@
-import { prepareFileTreeInput } from '@pierre/trees'
+// Tree ordering lives in two modules so that the boot path can ask for
+// `firstTreePath` without loading the tree widget; both stay exported here
+// because every caller already reaches for them through this module.
+export { firstTreePath } from './treePathOrder'
+export { orderPathsForTree } from './treeWidgetOrder'
 
 export interface TreeFollowBehavior {
   offset: 'nearest' | 'center'
@@ -11,29 +15,34 @@ export function getTreeFollowBehavior(source: 'direct-navigation' | 'review-scro
     : { offset: 'center', animate: false }
 }
 
-export function orderPathsForTree(filePaths: readonly string[]): string[] {
-  return [...prepareFileTreeInput(filePaths).paths]
-}
-
-export function firstTreePath(filePaths: readonly string[]): string | null {
-  if (filePaths.length === 0) return null
-  if (filePaths.length === 1) return filePaths[0] ?? null
-  return orderPathsForTree(filePaths)[0] ?? null
-}
-
 // The workspace and the explorer ask for the directories of the same path array,
 // so the answer is kept per input identity rather than computed twice.
 const directoryPathsByInput = new WeakMap<readonly string[], string[]>()
 
-export type TreeContentSyncMode = 'skip' | 'status' | 'reset'
+export interface AppliedTreeContent {
+  root: string
+  paths: readonly string[]
+  statuses: unknown
+}
+
+/**
+ * `adopt` is a reset whose collapse pass is pointless: the tree holds nothing
+ * the reader expanded, either because this is its first content or because the
+ * root changed under it. Opening a folder used to walk every directory twice —
+ * once for the skeleton listing, once for the git snapshot behind it.
+ */
+export type TreeContentSyncMode = 'skip' | 'status' | 'reset' | 'adopt'
 
 export function treeContentSyncMode(
-  applied: { paths: readonly string[]; statuses: unknown } | null,
+  applied: AppliedTreeContent | null,
+  root: string,
   nextPaths: readonly string[],
   nextStatuses: unknown
 ): TreeContentSyncMode {
-  if (applied?.paths === nextPaths && applied.statuses === nextStatuses) return 'skip'
-  if (applied?.paths === nextPaths) return 'status'
+  const sameRoot = applied != null && applied.root === root
+  if (sameRoot && applied.paths === nextPaths && applied.statuses === nextStatuses) return 'skip'
+  if (sameRoot && applied.paths === nextPaths) return 'status'
+  if (!sameRoot || applied.paths.length === 0) return 'adopt'
   return 'reset'
 }
 

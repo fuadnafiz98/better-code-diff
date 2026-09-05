@@ -3,8 +3,9 @@ import { expect, test } from 'bun:test'
 import { fileURLToPath } from 'node:url'
 
 test('the workspace stays keyed on the repository root, not the world', () => {
-  const source = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8')
-  expect(source).toContain('workspaceKey={view.snapshot.root}')
+  // The stage moved out of App.tsx in the P13 split; the rule it guards did not.
+  const source = readFileSync(fileURLToPath(new URL('./WorkspaceRootHost.tsx', import.meta.url)), 'utf8')
+  expect(source).toContain('workspaceKey={snapshot.root}')
   expect(source).not.toMatch(/worldId \?\? 'desk'/)
 })
 

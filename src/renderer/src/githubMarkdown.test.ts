@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { isExternalMarkdownHref, resolveGitHubHref } from './GitHubMarkdownContent'
+import { githubMarkdownClassName, isExternalMarkdownHref, resolveGitHubHref } from './githubMarkdown'
 
 describe('markdown hrefs', () => {
   test('maps GitHub root-relative paths and leaves local paths alone', () => {
@@ -14,5 +14,13 @@ describe('markdown hrefs', () => {
     expect(isExternalMarkdownHref('mailto:dev@example.com')).toBe(true)
     expect(isExternalMarkdownHref('./notes.md')).toBe(false)
     expect(isExternalMarkdownHref('#heading')).toBe(false)
+  })
+})
+
+describe('githubMarkdownClassName', () => {
+  test('gives the raw fallback and the rendered markdown the same wrapper', () => {
+    expect(githubMarkdownClassName('pr-context-markdown', 'document')).toBe('pr-context-markdown gh-markdown')
+    expect(githubMarkdownClassName(undefined, 'comment')).toBe('gh-markdown comment')
+    expect(githubMarkdownClassName('', 'document')).toBe('gh-markdown')
   })
 })

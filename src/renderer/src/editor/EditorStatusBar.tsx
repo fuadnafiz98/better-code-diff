@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import type { Editor } from '@pierre/diffs/edit'
 
 import type { ReviewAnnotationMetadata } from '../ReviewComments'
 import type { DocumentView } from '../documentView'
-import { EMPTY_CARET, readCaret, type CaretReadout } from './caret'
-import { EDITOR_SHORTCUTS, formatEditorShortcut } from './editorKeymap'
+import { EditorShortcutsSheet } from './EditorShortcutsSheet'
+import { caretSelectionLabel, editorStatusLabel, type EditorStatusMode } from './editorStatus'
+import { formatEditorShortcut } from './editorKeymap'
+import { useCaretReadout } from './useCaretReadout'
 
 interface EditorStatusBarProps {
-  mode: 'read' | 'edit' | 'preview'
+  mode: EditorStatusMode
   documentView?: DocumentView
   dirty: boolean
   fileExtension?: string
@@ -21,70 +23,17 @@ export function EditorStatusBar({
   fileExtension,
   getEditor
 }: EditorStatusBarProps): React.JSX.Element {
-  const [caret, setCaret] = useState<CaretReadout>(EMPTY_CARET)
-  const [shortcutsOpen, setShortcutsOpen] = useState(false)
-  const frameRef = useRef<number | null>(null)
-  const dialogRef = useRef<HTMLDialogElement | null>(null)
-
-  const sampleCaret = useCallback(() => {
-    frameRef.current = null
-    setCaret((current) => {
-      const next = readCaret(getEditor())
-      return next.line === current.line
-        && next.column === current.column
-        && next.selectedLines === current.selectedLines
-        && next.selectedCharacters === current.selectedCharacters
-        ? current
-        : next
-    })
-  }, [getEditor])
-
-  // selectionchange fires far more often than the readout can change, so every
-  // burst collapses into one frame.
-  useEffect(() => {
-    if (mode !== 'edit') {
-      setCaret(EMPTY_CARET)
-      return
-    }
-    const schedule = (): void => {
-      if (frameRef.current != null) return
-      frameRef.current = window.requestAnimationFrame(sampleCaret)
-    }
-    document.addEventListener('selectionchange', schedule)
-    schedule()
-    return () => {
-      document.removeEventListener('selectionchange', schedule)
-      if (frameRef.current != null) window.cancelAnimationFrame(frameRef.current)
-      frameRef.current = null
-    }
-  }, [mode, sampleCaret])
-
-  useEffect(() => {
-    const dialog = dialogRef.current
-    if (dialog == null) return
-    if (shortcutsOpen && !dialog.open) dialog.showModal()
-    if (!shortcutsOpen && dialog.open) dialog.close()
-  }, [shortcutsOpen])
-
   const editing = mode === 'edit'
-  const status = editing
-    ? 'Editing'
-    : mode === 'preview'
-      ? 'Draft preview'
-      : documentView === 'preview' ? 'Preview'
-        : documentView === 'split' ? 'Source and preview'
-          : 'Read only'
+  const caret = useCaretReadout(editing, getEditor)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const selection = editing ? caretSelectionLabel(caret) : null
 
   return (
     <footer className="editor-statusbar">
-      <span>{status}</span>
+      <span>{editorStatusLabel(mode, documentView)}</span>
       {editing ? <span>{dirty ? 'Unsaved' : 'Saved'}</span> : null}
       {editing ? <span>Ln {caret.line}, Col {caret.column}</span> : null}
-      {editing && caret.selectedLines > 0 ? (
-        <span>{caret.selectedLines} lines selected</span>
-      ) : editing && caret.selectedCharacters > 0 ? (
-        <span>{caret.selectedCharacters} selected</span>
-      ) : null}
+      {selection == null ? null : <span>{selection}</span>}
       <span>UTF-8</span>
       <span>LF</span>
       {fileExtension != null ? <span>{fileExtension}</span> : null}
@@ -95,21 +44,7 @@ export function EditorStatusBar({
           <button type="button" onClick={() => setShortcutsOpen(true)}>Shortcuts…</button>
         </>
       ) : null}
-      <dialog ref={dialogRef} className="editor-shortcuts-sheet" onClose={() => setShortcutsOpen(false)}
-        aria-label="Editor keyboard shortcuts">
-        <strong>Editor shortcuts</strong>
-        <dl>
-          {EDITOR_SHORTCUTS.map((shortcut) => (
-            <div key={shortcut.shortcut}>
-              <dt><kbd>{formatEditorShortcut(shortcut.shortcut)}</kbd></dt>
-              <dd>{shortcut.label}</dd>
-            </div>
-          ))}
-        </dl>
-        <form method="dialog">
-          <button type="submit">Close</button>
-        </form>
-      </dialog>
+      <EditorShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </footer>
   )
 }

@@ -60,18 +60,26 @@ const repositoryApi: RepositoryApi = {
   restoreHint,
   cachedWorkspace,
   persistWorkspaceUi: (ui) => ipcRenderer.invoke(IPC_CHANNELS.persistWorkspaceUi, ui),
+  persistFileText: (fileText) => ipcRenderer.invoke(IPC_CHANNELS.persistFileText, fileText),
   getSessionSnapshot: () => ipcRenderer.invoke(IPC_CHANNELS.getSessionSnapshot),
   openFolder: () => ipcRenderer.invoke(IPC_CHANNELS.openFolder),
+  chooseFolder: () => ipcRenderer.invoke(IPC_CHANNELS.chooseFolder),
   listFolderCandidates: () => ipcRenderer.invoke(IPC_CHANNELS.listFolderCandidates),
   openPickedFolder: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPickedFolder, path),
   openPath: (path) => ipcRenderer.invoke(IPC_CHANNELS.openPath, path),
   activateRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.activateRepository, root),
   releaseRepository: (root) => ipcRenderer.invoke(IPC_CHANNELS.releaseRepository, root),
-  resolvePullRequestRepository: (pullRequestUrl) =>
-    ipcRenderer.invoke(IPC_CHANNELS.resolvePullRequestRepository, pullRequestUrl),
+  previewPullRequestFolder: (pullRequestUrl) =>
+    ipcRenderer.invoke(IPC_CHANNELS.previewPullRequestFolder, pullRequestUrl),
+  resolvePullRequestRepository: (pullRequestUrl, preferredRoot) =>
+    ipcRenderer.invoke(IPC_CHANNELS.resolvePullRequestRepository, pullRequestUrl, preferredRoot),
   getPendingExternalPullRequest: () => ipcRenderer.invoke(IPC_CHANNELS.getPendingExternalPullRequest),
   onOpenExternalPullRequest: (listener) => {
-    const handler = (_event: Electron.IpcRendererEvent, url: string): void => listener(url)
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      url: string,
+      root: string | null
+    ): void => listener(url, root ?? null)
     ipcRenderer.on(IPC_CHANNELS.openExternalPullRequest, handler)
     return () => ipcRenderer.removeListener(IPC_CHANNELS.openExternalPullRequest, handler)
   },
@@ -81,8 +89,9 @@ const repositoryApi: RepositoryApi = {
   getComparison: (path) => ipcRenderer.invoke(IPC_CHANNELS.getComparison, path),
   saveWorkingFile: (request) => ipcRenderer.invoke(IPC_CHANNELS.saveWorkingFile, request),
   getWorkingTreePatch: (paths) => ipcRenderer.invoke(IPC_CHANNELS.getWorkingTreePatch, paths),
-  searchContent: (query) => ipcRenderer.invoke(IPC_CHANNELS.searchContent, query),
+  searchContent: (query, forOpenPath) => ipcRenderer.invoke(IPC_CHANNELS.searchContent, query, forOpenPath ?? null),
   cancelContentSearch: () => ipcRenderer.send(IPC_CHANNELS.cancelContentSearch),
+  getMarkdownMedia: (url) => ipcRenderer.invoke(IPC_CHANNELS.getMarkdownMedia, url),
   getGitIntegration: () => ipcRenderer.invoke(IPC_CHANNELS.getGitIntegration),
   getPullRequestInbox: () => ipcRenderer.invoke(IPC_CHANNELS.getPullRequestInbox),
   getClosedPullRequests: () => ipcRenderer.invoke(IPC_CHANNELS.getClosedPullRequests),

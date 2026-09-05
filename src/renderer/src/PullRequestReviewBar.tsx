@@ -1,13 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
-import {
-  IconApproved,
-  IconComment,
-  IconInReview,
-  IconWarningOctogonFill,
-  IconX
-} from '@pierre/icons'
+import { useEffect, useRef } from 'react'
+import './PullRequestReviewBar.css'
 
 import type { PullRequestReviewEvent } from '../../shared/contracts'
+import { PullRequestReviewComposer } from './PullRequestReviewComposer'
+import { PullRequestReviewSummaryBar } from './PullRequestReviewSummaryBar'
+import { useOptionalState } from './useOptionalState'
 
 interface PullRequestReviewBarProps {
   submitting: boolean
@@ -15,6 +12,11 @@ interface PullRequestReviewBarProps {
   inlineCommentCount: number
   orphanedCommentCount: number
   viewerCanSubmitDecision: boolean
+  variant?: 'toolbar' | 'finish'
+  expanded?: boolean
+  body?: string
+  onExpandedChange?(expanded: boolean): void
+  onBodyChange?(body: string): void
   onOpen(): void
   onSubmit(event: PullRequestReviewEvent, body: string): Promise<boolean>
 }
@@ -25,76 +27,53 @@ export function PullRequestReviewBar({
   inlineCommentCount,
   orphanedCommentCount,
   viewerCanSubmitDecision,
+  variant = 'toolbar',
+  expanded: expandedProp,
+  body: bodyProp,
+  onExpandedChange,
+  onBodyChange,
   onOpen,
   onSubmit
 }: PullRequestReviewBarProps): React.JSX.Element {
-  const [expanded, setExpanded] = useState(false)
-  const [body, setBody] = useState('')
+  const finish = variant === 'finish'
+  const [expanded, setExpanded] = useOptionalState(expandedProp, finish, onExpandedChange)
+  const [body, setBody] = useOptionalState(bodyProp, '', onBodyChange)
   const bodyRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
-    if (expanded) bodyRef.current?.focus()
-  }, [expanded])
+    if (expanded && !finish) bodyRef.current?.focus()
+  }, [expanded, finish])
 
   const submit = async (event: PullRequestReviewEvent): Promise<void> => {
     if (!await onSubmit(event, body)) return
     setBody('')
-    setExpanded(false)
+    if (!finish) setExpanded(false)
   }
 
-  if (!expanded) {
+  if (!finish && !expanded) {
     return (
-      <div className="review-bar pr-review-bar compact">
-        <span className={message == null ? undefined : 'success'}>
-          {message ?? (orphanedCommentCount > 0
-            ? `${orphanedCommentCount} orphaned ${orphanedCommentCount === 1 ? 'comment needs' : 'comments need'} attention`
-            : inlineCommentCount === 0
-            ? 'Review this pull request on GitHub'
-            : `${inlineCommentCount} inline ${inlineCommentCount === 1 ? 'comment' : 'comments'} ready`)}
-        </span>
-        <button className="bar-button" type="button" onClick={() => { onOpen(); setExpanded(true) }}><IconInReview />Submit Review</button>
-      </div>
+      <PullRequestReviewSummaryBar
+        message={message}
+        inlineCommentCount={inlineCommentCount}
+        orphanedCommentCount={orphanedCommentCount}
+        onSubmitReview={() => { onOpen(); setExpanded(true) }}
+      />
     )
   }
 
-  const hasReviewMessage = body.trim() !== ''
-  const hasReviewContent = hasReviewMessage || inlineCommentCount > 0
-
   return (
-    <section className="review-bar pr-review-bar expanded" aria-label="Submit pull request review">
-      <label className="sr-only" htmlFor="pull-request-review-body">Review summary</label>
-      <textarea
-        ref={bodyRef}
-        id="pull-request-review-body"
-        value={body}
-        onChange={(event) => setBody(event.target.value)}
-        placeholder={viewerCanSubmitDecision
-          ? 'Add an optional approval note, or explain requested changes…'
-          : 'Add a review comment…'}
-      />
-      {message == null ? null : <p className="success" role="alert">{message}</p>}
-      {inlineCommentCount > 0 ? <p>{inlineCommentCount} unresolved inline {inlineCommentCount === 1 ? 'comment' : 'comments'} will be posted with this review.</p> : null}
-      {orphanedCommentCount > 0 ? <p>{orphanedCommentCount} orphaned {orphanedCommentCount === 1 ? 'comment must' : 'comments must'} be reattached or dropped before submission.</p> : null}
-      {!viewerCanSubmitDecision ? <p>GitHub only allows comment reviews on your own pull request.</p> : null}
-      <div>
-        <button className="bar-button" type="button" onClick={() => setExpanded(false)} disabled={submitting}><IconX />Cancel</button>
-        <button className="bar-button" type="button" onClick={() => void submit('comment')}
-          disabled={submitting || !hasReviewContent || orphanedCommentCount > 0}><IconComment />Comment</button>
-        <button
-          className="bar-button danger"
-          type="button"
-          title={viewerCanSubmitDecision ? undefined : 'You cannot request changes on your own pull request.'}
-          onClick={() => void submit('request-changes')}
-          disabled={submitting || !hasReviewContent || !viewerCanSubmitDecision || orphanedCommentCount > 0}
-        ><IconWarningOctogonFill />Request Changes</button>
-        <button
-          className="bar-button primary"
-          type="button"
-          title={viewerCanSubmitDecision ? undefined : 'You cannot approve your own pull request.'}
-          onClick={() => void submit('approve')}
-          disabled={submitting || !viewerCanSubmitDecision || orphanedCommentCount > 0}
-        ><IconApproved />Approve</button>
-      </div>
-    </section>
+    <PullRequestReviewComposer
+      variant={variant}
+      submitting={submitting}
+      message={message}
+      inlineCommentCount={inlineCommentCount}
+      orphanedCommentCount={orphanedCommentCount}
+      viewerCanSubmitDecision={viewerCanSubmitDecision}
+      body={body}
+      bodyRef={bodyRef}
+      onBodyChange={setBody}
+      onCancel={() => setExpanded(false)}
+      onSubmit={(event) => void submit(event)}
+    />
   )
 }

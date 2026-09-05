@@ -1,10 +1,17 @@
 import type { FileComparison, RepositorySnapshot, RepositoryStatusEntry } from './contracts.js'
 
 export const WORKSPACE_CACHE_VERSION = 1
-export const MAX_CACHED_PATHS = 20_000
-export const MAX_CACHED_STATUSES = 4_000
+/**
+ * The file holding several entries. Version 1 files carry a single workspace at
+ * the top level and are read as a one-slot store.
+ */
+export const WORKSPACE_CACHE_STORE_VERSION = 2
+export const MAX_CACHED_PATHS = 25_000
+export const MAX_CACHED_STATUSES = 5_000
 export const MAX_CACHED_FILE_CHARS = 512 * 1024
-export const MAX_WORKSPACE_CACHE_BYTES = 2 * 1024 * 1024
+// Alternating between two repositories used to repaint the second one from a
+// skeleton every time, because the cache had exactly one slot.
+export const MAX_WORKSPACE_CACHE_SLOTS = 3
 
 export type CachedWorkspaceView = 'file' | 'multi'
 
@@ -23,10 +30,28 @@ export interface WorkspaceCache {
   savedAt: number
 }
 
+/**
+ * A patch, not a snapshot of the whole UI: the open file's text travels on its
+ * own channel and only when its contents actually changed, so most updates
+ * carry two strings instead of half a megabyte.
+ */
 export interface WorkspaceUiState {
-  selectedPath: string | null
-  workspaceView: CachedWorkspaceView
-  fileText: CachedFileText | null
+  selectedPath?: string | null
+  workspaceView?: CachedWorkspaceView
+  fileText?: CachedFileText | null
+}
+
+export interface WorkspaceCacheStore {
+  version: typeof WORKSPACE_CACHE_STORE_VERSION
+  lastRoot: string | null
+  /** Most recently opened first, capped at MAX_WORKSPACE_CACHE_SLOTS. */
+  entries: WorkspaceCache[]
+}
+
+export const EMPTY_WORKSPACE_CACHE_STORE: WorkspaceCacheStore = {
+  version: WORKSPACE_CACHE_STORE_VERSION,
+  lastRoot: null,
+  entries: []
 }
 
 export interface InitialWorkspacePaint {
@@ -75,36 +100,87 @@ export function parseWorkspaceUi(raw: unknown): WorkspaceUiState | null {
   return {
     selectedPath,
     workspaceView: record.workspaceView === 'multi' ? 'multi' : 'file',
-    fileText: parseCachedFileText(record.fileText)
+    ...(record.fileText === undefined ? {} : { fileText: parseCachedFileText(record.fileText) })
   }
 }
 
+
+/**
+ * Bounded by counts. Measuring the cache by serializing it cost up to 112 ms of
+ * the main process on every publish, for a limit that path and status counts
+ * already imply.
+ */
 export function capWorkspaceCache(cache: WorkspaceCache): WorkspaceCache {
-  let snapshot = capSnapshot(cache.snapshot)
-  let fileText = capFileText(cache.fileText)
-  let selectedPath = parseSelectedPath(cache.selectedPath, snapshot.paths)
-  let next: WorkspaceCache = {
+  const snapshot = capSnapshot(cache.snapshot)
+  const selectedPath = parseSelectedPath(cache.selectedPath, snapshot.paths)
+  const fileText = capFileText(cache.fileText)
+  return {
     ...cache,
     version: WORKSPACE_CACHE_VERSION,
     snapshot,
     selectedPath,
     fileText: fileText != null && selectedPath != null && fileText.path === selectedPath ? fileText : null
   }
-  if (workspaceCacheBytes(next) <= MAX_WORKSPACE_CACHE_BYTES) return next
-  next = { ...next, fileText: null }
-  if (workspaceCacheBytes(next) <= MAX_WORKSPACE_CACHE_BYTES) return next
-  let paths = next.snapshot.paths
-  while (paths.length > 0 && workspaceCacheBytes(next) > MAX_WORKSPACE_CACHE_BYTES) {
-    paths = paths.slice(0, Math.max(1, Math.floor(paths.length / 2)))
-    snapshot = { ...next.snapshot, paths, statuses: next.snapshot.statuses.filter((entry) => paths.includes(entry.path)) }
-    selectedPath = parseSelectedPath(next.selectedPath, paths)
-    next = { ...next, snapshot, selectedPath }
-  }
-  return next
 }
 
-export function workspaceCacheBytes(cache: WorkspaceCache): number {
-  return new TextEncoder().encode(JSON.stringify(cache)).length
+/**
+ * Reads both file shapes: the version 1 single workspace and the version 2
+ * multi-slot store.
+ */
+export function parseWorkspaceCacheStore(raw: unknown): WorkspaceCacheStore {
+  if (typeof raw !== 'object' || raw == null) return EMPTY_WORKSPACE_CACHE_STORE
+  const record = raw as Record<string, unknown>
+  if (record.version === WORKSPACE_CACHE_VERSION) {
+    const single = parseWorkspaceCache(raw)
+    return single == null
+      ? EMPTY_WORKSPACE_CACHE_STORE
+      : { version: WORKSPACE_CACHE_STORE_VERSION, lastRoot: single.lastRoot, entries: [single] }
+  }
+  if (record.version !== WORKSPACE_CACHE_STORE_VERSION || !Array.isArray(record.entries)) {
+    return EMPTY_WORKSPACE_CACHE_STORE
+  }
+  const seen = new Set<string>()
+  const entries: WorkspaceCache[] = []
+  for (const candidate of record.entries) {
+    if (entries.length >= MAX_WORKSPACE_CACHE_SLOTS) break
+    const entry = parseWorkspaceCache(candidate)
+    if (entry == null || seen.has(entry.lastRoot)) continue
+    seen.add(entry.lastRoot)
+    entries.push(entry)
+  }
+  const lastRoot = typeof record.lastRoot === 'string' && seen.has(record.lastRoot)
+    ? record.lastRoot
+    : entries[0]?.lastRoot ?? null
+  return { version: WORKSPACE_CACHE_STORE_VERSION, lastRoot, entries }
+}
+
+export function workspaceCacheForRoot(
+  store: WorkspaceCacheStore,
+  root: string | null | undefined
+): WorkspaceCache | null {
+  if (root == null || root === '') return null
+  return store.entries.find((entry) => entry.lastRoot === root) ?? null
+}
+
+/** The workspace the next launch paints before git answers. */
+export function lastWorkspaceCache(store: WorkspaceCacheStore): WorkspaceCache | null {
+  return workspaceCacheForRoot(store, store.lastRoot)
+}
+
+/**
+ * Upserts one repository's entry and moves it to the front. Beyond
+ * MAX_WORKSPACE_CACHE_SLOTS the least recently opened entry falls off.
+ */
+export function rememberWorkspaceCacheEntry(
+  store: WorkspaceCacheStore,
+  entry: WorkspaceCache
+): WorkspaceCacheStore {
+  const rest = store.entries.filter((candidate) => candidate.lastRoot !== entry.lastRoot)
+  return {
+    version: WORKSPACE_CACHE_STORE_VERSION,
+    lastRoot: entry.lastRoot,
+    entries: [entry, ...rest].slice(0, MAX_WORKSPACE_CACHE_SLOTS)
+  }
 }
 
 export function initialWorkspacePaint(cache: WorkspaceCache | null): InitialWorkspacePaint {
@@ -161,6 +237,16 @@ export function comparisonWithoutOpenSession(
   return idleFileComparison(path)
 }
 
+/**
+ * Identity of the text the cache would keep for this comparison. `cacheKey` is
+ * main's sha1 of the file's contents, so the renderer can tell "the same file
+ * again" from "the file changed" without hashing half a megabyte per render.
+ */
+export function cachedFileTextIdentity(comparison: FileComparison | null): string | null {
+  if (cachedFileTextFromComparison(comparison) == null || comparison == null) return null
+  return `${comparison.path}\0${comparison.newFile?.cacheKey ?? ''}`
+}
+
 export function cachedFileTextFromComparison(comparison: FileComparison | null): CachedFileText | null {
   const text = comparison?.newFile?.contents
   if (comparison == null || text == null || text === '' || comparison.binary || comparison.oversized) {
@@ -215,7 +301,7 @@ function parseCachedSnapshot(raw: unknown): RepositorySnapshot | null {
 
 function parseStatuses(raw: unknown, paths: readonly string[]): RepositoryStatusEntry[] {
   if (!Array.isArray(raw)) return []
-  const allowed = new Set(paths)
+  const allowed = pathSet(paths)
   const statuses: RepositoryStatusEntry[] = []
   for (const entry of raw) {
     if (statuses.length >= MAX_CACHED_STATUSES) break
@@ -245,10 +331,24 @@ function isStatus(value: unknown): value is RepositoryStatusEntry['status'] {
 
 function parseSelectedPath(raw: unknown, paths: readonly string[]): string | null {
   if (typeof raw !== 'string' || raw === '') return null
-  return paths.includes(raw) ? raw : null
+  // Membership in a 25,000-path list, run once per publish and once per parse.
+  return pathSet(paths).has(raw) ? raw : null
 }
 
-function parseCachedFileText(raw: unknown): CachedFileText | null {
+// Snapshots keep their path array identity across publishes, so the set behind
+// one is built once and reused by every membership question about it.
+const pathSetsByList = new WeakMap<readonly string[], Set<string>>()
+
+function pathSet(paths: readonly string[]): Set<string> {
+  const cached = pathSetsByList.get(paths)
+  if (cached != null) return cached
+  const set = new Set(paths)
+  pathSetsByList.set(paths, set)
+  return set
+}
+
+/** Also the IPC payload of the open file's own channel; `null` clears what was kept. */
+export function parseCachedFileText(raw: unknown): CachedFileText | null {
   if (typeof raw !== 'object' || raw == null) return null
   const record = raw as Record<string, unknown>
   if (typeof record.path !== 'string' || record.path === '') return null
@@ -257,8 +357,11 @@ function parseCachedFileText(raw: unknown): CachedFileText | null {
 }
 
 function capSnapshot(snapshot: RepositorySnapshot): RepositorySnapshot {
+  if (snapshot.paths.length <= MAX_CACHED_PATHS && snapshot.statuses.length <= MAX_CACHED_STATUSES) {
+    return snapshot
+  }
   const paths = snapshot.paths.slice(0, MAX_CACHED_PATHS)
-  const allowed = new Set(paths)
+  const allowed = pathSet(paths)
   return {
     ...snapshot,
     paths,

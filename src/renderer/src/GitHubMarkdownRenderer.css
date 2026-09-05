@@ -1,0 +1,148 @@
+
+.markdown-video { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+.markdown-video video { max-width: min(100%, 720px); border-radius: var(--corner-control); background: #000; }
+.markdown-video a { color: var(--muted); font-size: var(--text-xs); }
+.markdown-split {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns:
+    minmax(0, var(--markdown-split-before, 50fr))
+    0
+    minmax(0, var(--markdown-split-after, 50fr));
+}
+.markdown-split-source,
+.markdown-split > .markdown-file-scroll {
+  min-width: 0;
+  min-height: 0;
+}
+.markdown-split-source {
+  display: flex;
+  flex-direction: column;
+}
+.markdown-split-resizer {
+  position: relative;
+  z-index: var(--z-raised);
+  width: 0;
+  cursor: col-resize;
+  touch-action: none;
+  outline: 0;
+}
+.markdown-split-resizer::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  left: -6px;
+  width: 12px;
+}
+.markdown-split-resizer::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  left: -0.5px;
+  width: 1px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.markdown-split-resizer:hover::after,
+.markdown-split-resizer:focus-visible::after,
+.markdown-split[data-resizing] .markdown-split-resizer::after {
+  width: 2px;
+  left: -1px;
+  background: color-mix(in srgb, var(--accent) 78%, transparent);
+}
+.markdown-split[data-resizing],
+.markdown-split[data-resizing] * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+.markdown-split .markdown-file-scroll {
+  padding: 28px 24px 40px;
+}
+.markdown-split .markdown-file-preview { max-width: none; }
+.markdown-file-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 32px var(--gutter) 48px;
+  background: var(--canvas);
+  scrollbar-gutter: stable;
+}
+.markdown-file-preview {
+  max-width: 72ch;
+  margin: 0 auto;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--text-lg);
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+.markdown-file-preview > * + * { margin-top: 0.9em; }
+.markdown-file-preview > :first-child { margin-top: 0; }
+.markdown-file-preview > :last-child { margin-bottom: 0; }
+.markdown-file-preview h1, .markdown-file-preview h2, .markdown-file-preview h3,
+.markdown-file-preview h4, .markdown-file-preview h5, .markdown-file-preview h6 {
+  color: var(--text);
+  font-weight: var(--weight-strong);
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  text-wrap: pretty;
+}
+.markdown-file-preview h1 { font-size: var(--text-3xl); }
+.markdown-file-preview h2 { font-size: var(--text-2xl); }
+.markdown-file-preview h3 { font-size: var(--text-xl); }
+.markdown-file-preview h4, .markdown-file-preview h5, .markdown-file-preview h6 { font-size: var(--text-lg); }
+.markdown-file-preview p { margin: 0; text-wrap: pretty; }
+.markdown-file-preview ul, .markdown-file-preview ol { margin: 0; padding-left: 1.4em; }
+.markdown-file-preview li + li { margin-top: 0.3em; }
+.markdown-file-preview strong { font-weight: var(--weight-bold); }
+.markdown-file-preview a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.markdown-file-preview code {
+  border-radius: var(--corner-inline);
+  padding: 1px 5px;
+  background: var(--control-recessed);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.markdown-file-preview pre {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--corner-control);
+  padding: 12px 14px;
+  background: var(--control-recessed);
+}
+.markdown-file-preview pre code { padding: 0; background: transparent; }
+.markdown-file-preview blockquote {
+  margin: 0;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 12px;
+  color: var(--muted);
+}
+.markdown-file-preview hr { border: 0; border-top: 1px solid var(--border); }
+.markdown-file-preview table {
+  width: max-content;
+  min-width: 100%;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+  border-spacing: 0;
+  border-collapse: collapse;
+}
+.markdown-file-preview th, .markdown-file-preview td {
+  border: 1px solid var(--border);
+  padding: 7px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-file-preview th { background: var(--control-fill); font-weight: var(--weight-strong); }
+.markdown-file-preview details {
+  border: 1px solid var(--border);
+  border-radius: var(--corner-control);
+}
+.markdown-file-preview details > summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  font-weight: var(--weight-strong);
+}
+.markdown-file-preview details[open] > summary { border-bottom: 1px solid var(--border); }
+.markdown-file-preview details > :not(summary) { margin: 10px; }

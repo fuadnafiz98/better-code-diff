@@ -78,6 +78,7 @@ describe('normalizeChangedPath', () => {
     expect(normalizeChangedPath('.git/refs/heads/main.lock')).toBeNull()
     expect(normalizeChangedPath('src/.horus-save-1234')).toBeNull()
     expect(normalizeChangedPath('node_modules/pkg/index.js')).toBeNull()
+    expect(normalizeChangedPath('.horus/review/changes.patch')).toBeNull()
     expect(normalizeChangedPath('.git/COMMIT_EDITMSG')).toBeNull()
   })
 })
@@ -175,6 +176,20 @@ async function waitForQuiet(count: () => number): Promise<void> {
   }
 }
 
+// A `.git/*` change is metadata-only, so the watcher gives it the longer
+// debounce; a rewrite loop has to outlast that or every write just restarts the
+// timer and the flush never runs.
+const METADATA_SETTLE_MS = 500
+
+async function rewriteMetadataUntil(file: string, satisfied: () => boolean): Promise<boolean> {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await writeFile(file, `revision ${attempt}\n`, 'utf8')
+    await sleep(METADATA_SETTLE_MS)
+    if (satisfied()) return true
+  }
+  return satisfied()
+}
+
 describe('RepositoryWatcher', () => {
   it('publishes a targeted event after an existing file changes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'better-code-diff-watcher-'))
@@ -242,6 +257,102 @@ describe('RepositoryWatcher', () => {
       watcher.setSuspended(false)
       expect(await waitFor(() => targeted().length > 0)).toBe(true)
       expect(targeted()[0]?.changedPaths).toEqual(['src/existing.ts'])
+      expect(errors).toEqual([])
+    } finally {
+      watcher.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, WATCH_TEST_TIMEOUT_MS)
+
+  it('stops watching while paused and catches up once it is re-armed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'better-code-diff-watcher-pause-'))
+    const current = snapshot({ root, kind: 'folder', branch: null, head: null, statuses: [] })
+    const events: RepositoryChangeEvent[] = []
+    const errors: unknown[] = []
+    const watcher = new RepositoryWatcher(
+      async () => current,
+      (event) => events.push(event),
+      (error) => errors.push(error)
+    )
+    const targeted = (): RepositoryChangeEvent[] =>
+      events.filter((event) => event.changedPaths.includes('src/existing.ts'))
+
+    try {
+      const sourceDirectory = join(root, 'src')
+      await mkdir(sourceDirectory)
+      const file = join(sourceDirectory, 'existing.ts')
+      await writeFile(file, 'first\n', 'utf8')
+      watcher.start(current)
+      expect(await rewriteUntil(file, () => targeted().length > 0)).toBe(true)
+      await waitForQuiet(() => events.length)
+
+      watcher.pause()
+      expect(watcher.paused).toBe(true)
+      events.length = 0
+      await writeFile(file, 'while paused\n', 'utf8')
+      await sleep(WATCH_SETTLE_MS * 2)
+      // Unlike suspension, a paused watcher holds no OS handle, so the write is
+      // never seen at all — not even after it is re-armed.
+      expect(targeted()).toEqual([])
+
+      expect(watcher.resume()).toBe(true)
+      expect(watcher.paused).toBe(false)
+      expect(await rewriteUntil(file, () => targeted().length > 0)).toBe(true)
+      expect(errors).toEqual([])
+    } finally {
+      watcher.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, WATCH_TEST_TIMEOUT_MS)
+
+  it('resuming a watcher that was never paused re-arms nothing', () => {
+    const watcher = new RepositoryWatcher(
+      async () => snapshot(),
+      () => {},
+      () => {}
+    )
+    expect(watcher.paused).toBe(false)
+    expect(watcher.resume()).toBe(false)
+  })
+
+  it('drops the index write a refresh announced and still reports HEAD moving', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'better-code-diff-watcher-index-'))
+    const errors: unknown[] = []
+    let refreshes = 0
+    const watcher = new RepositoryWatcher(
+      async () => {
+        refreshes += 1
+        return snapshot({ root, head: `head-${refreshes}` })
+      },
+      () => {},
+      (error) => errors.push(error)
+    )
+
+    try {
+      const gitDirectory = join(root, '.git')
+      await mkdir(gitDirectory)
+      const indexFile = join(gitDirectory, 'index')
+      const headFile = join(gitDirectory, 'HEAD')
+      await writeFile(indexFile, 'index 0\n', 'utf8')
+      await writeFile(headFile, 'ref: refs/heads/main\n', 'utf8')
+      watcher.start(snapshot({ root }))
+
+      // An unannounced index write must reach the watcher, or the assertion
+      // below would pass for a watcher that never sees `.git/index` at all.
+      expect(await rewriteMetadataUntil(indexFile, () => refreshes > 0)).toBe(true)
+      await waitForQuiet(() => refreshes)
+
+      const announced = refreshes
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        // Every refresh re-arms the window, exactly as `RepositoryService` does.
+        watcher.expectSelfWrite('.git/index')
+        await writeFile(indexFile, `index self ${attempt}\n`, 'utf8')
+        await sleep(METADATA_SETTLE_MS)
+      }
+      expect(refreshes).toBe(announced)
+
+      watcher.expectSelfWrite('.git/index')
+      expect(await rewriteMetadataUntil(headFile, () => refreshes > announced)).toBe(true)
       expect(errors).toEqual([])
     } finally {
       watcher.stop()

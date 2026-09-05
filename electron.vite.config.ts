@@ -27,6 +27,7 @@ function contentSecurityPolicyPlugin(): Plugin {
           "style-src 'self' 'unsafe-inline'",
           "font-src 'self'",
           "img-src 'self' data:",
+          "media-src 'self' blob:",
           "worker-src 'self' blob:",
           development ? "connect-src 'self' ws: wss: http://localhost:*" : "connect-src 'none'",
           "base-uri 'none'",
@@ -132,6 +133,72 @@ function trimShikiThemesPlugin(): Plugin {
   }
 }
 
+// @pierre/diffs creates a main-thread highlighter only when the worker pool is
+// not working or an edit session is attached (renderers/FileRenderer.js:132);
+// every diff in this app is tokenised in the diff worker, which has its own copy
+// of the engine. The static import still made the renderer fetch, parse and
+// evaluate 173 KB of textmate + oniguruma before the first paint, because an ES
+// import is evaluated whether or not its bindings are ever read. Both call sites
+// below are already inside an async function, so the engine can be fetched on the
+// first main-thread highlight instead. The worker keeps the eager import.
+const SHARED_HIGHLIGHTER_MODULE = '/@pierre/diffs/dist/highlighter/shared_highlighter.js'
+const HIGHLIGHTER_ENGINE_IMPORT =
+  'import { createHighlighter, createJavaScriptRegexEngine, createOnigurumaEngine } from "shiki";'
+const SHARED_HIGHLIGHTER_SIGNATURE =
+  'async function getSharedHighlighter({ themes, langs, preferredHighlighter = "shiki-js" }) {'
+
+function lazyHighlighterEnginePlugin(): Plugin {
+  return {
+    name: 'horus:lazy-highlighter-engine',
+    enforce: 'pre',
+    transform(code, id) {
+      const normalized = id.split('?')[0]?.replaceAll('\\', '/') ?? id
+      if (!normalized.endsWith(SHARED_HIGHLIGHTER_MODULE)) return null
+      if (!code.includes(HIGHLIGHTER_ENGINE_IMPORT) || !code.includes(SHARED_HIGHLIGHTER_SIGNATURE)) {
+        throw new Error(
+          "@pierre/diffs shared_highlighter.js no longer matches horus:lazy-highlighter-engine. Update the anchors after checking that getSharedHighlighter is still async, or remove the plugin and accept the engine on the boot path."
+        )
+      }
+      return code
+        .replace(HIGHLIGHTER_ENGINE_IMPORT, '')
+        .replace(
+          SHARED_HIGHLIGHTER_SIGNATURE,
+          `${SHARED_HIGHLIGHTER_SIGNATURE}\n  const { createHighlighter, createJavaScriptRegexEngine, createOnigurumaEngine } = await import('shiki')`
+        )
+    }
+  }
+}
+
+// The other static edge from the viewer into the tokenizer: every theme
+// descriptor wraps its loader in `normalizeTheme`, which lives in @shikijs/core.
+// The wrapper is async and only runs when a theme is actually loaded for a
+// main-thread highlighter, so the normaliser travels with the engine.
+const THEME_NORMALIZER_MODULE = '/@pierre/theming/dist/modules/createTheme.js'
+const THEME_NORMALIZER_IMPORT = 'import { normalizeTheme } from "shiki/core";'
+const THEME_NORMALIZER_CALL = 'return normalizeTheme(unwrapDefault(await loader()));'
+
+function lazyThemeNormalizerPlugin(): Plugin {
+  return {
+    name: 'horus:lazy-theme-normalizer',
+    enforce: 'pre',
+    transform(code, id) {
+      const normalized = id.split('?')[0]?.replaceAll('\\', '/') ?? id
+      if (!normalized.endsWith(THEME_NORMALIZER_MODULE)) return null
+      if (!code.includes(THEME_NORMALIZER_IMPORT) || !code.includes(THEME_NORMALIZER_CALL)) {
+        throw new Error(
+          '@pierre/theming createTheme.js no longer matches horus:lazy-theme-normalizer. Update the anchors after checking that the loader is still async, or remove the plugin and accept the tokenizer on the boot path.'
+        )
+      }
+      return code
+        .replace(THEME_NORMALIZER_IMPORT, '')
+        .replace(
+          THEME_NORMALIZER_CALL,
+          `const { normalizeTheme } = await import('shiki/core')\n\t\t${THEME_NORMALIZER_CALL}`
+        )
+    }
+  }
+}
+
 function preloadBootChunkPlugin(): Plugin {
   return {
     name: 'horus:preload-boot',
@@ -148,9 +215,12 @@ function preloadBootChunkPlugin(): Plugin {
               injectTo: 'head'
             })
           } else if (file.type === 'asset' && file.fileName.endsWith('.css') && file.fileName.includes('boot-')) {
+            // Without crossorigin the preload's credentials mode does not match
+            // the stylesheet link Vite emits, so Chromium discards the warmed
+            // response and fetches the sheet a second time.
             tags.push({
               tag: 'link',
-              attrs: { rel: 'preload', as: 'style', href: `./${file.fileName}` },
+              attrs: { rel: 'preload', as: 'style', crossorigin: '', href: `./${file.fileName}` },
               injectTo: 'head'
             })
           }
@@ -159,6 +229,67 @@ function preloadBootChunkPlugin(): Plugin {
       }
     }
   }
+}
+
+// Rollup names shared chunks after an arbitrary module inside them, which is how
+// the markdown pipeline ended up hiding in a chunk called BackToTopButton. Naming
+// the four heavy vendor groups makes `bun run check:entry` and a source-map read
+// say what actually ships on the pre-mount path.
+const VENDOR_CHUNKS: ReadonlyArray<readonly [string, RegExp]> = [
+  ['vendor-react', /\/node_modules\/(?:react|react-dom|scheduler)\//],
+  // The code editor is only imported when a file is opened for editing
+  // (useFileEditing.ts). Left inside vendor-diffs it rode the viewer's static
+  // import and dragged shiki's textmate tokenizer onto the boot path with it.
+  ['vendor-diffs-edit', /\/node_modules\/@pierre\/diffs\/dist\/(?:edit|editor)\//],
+  ['vendor-diffs', /\/node_modules\/@pierre\/diffs\//],
+  // hast-*, property-information and the entity tables are shared with shiki's
+  // HTML serializer, so they stay out of this group: pulling them in makes
+  // vendor-markdown a dependency of the highlighter and puts it back on the
+  // pre-mount path.
+  [
+    'vendor-markdown',
+    /\/node_modules\/(?:react-markdown|rehype-[^/]+|remark-[^/]+|micromark[^/]*|mdast-[^/]+|parse5|unified)\//
+  ],
+  // The HTML serializer and its tables are shared by the markdown pipeline and
+  // shiki. Left unassigned Rollup folded them into vendor-shiki, which made the
+  // whole tokenizer engine a static dependency of both.
+  [
+    'vendor-hast',
+    /\/node_modules\/(?:hast-util-to-html|hast-util-whitespace|property-information|stringify-entities|character-entities[^/]*|comma-separated-tokens|space-separated-tokens|html-void-elements|zwitch|ccount)\//
+  ],
+  // Named rather than left to Rollup, which merges an unassigned shared module
+  // into whichever chunk already imports it — here, the engine it is supposed to
+  // keep off the boot path.
+  ['vendor-shiki-langs', /\/node_modules\/shiki\/dist\/langs-bundle-full/],
+  ['vendor-shiki', /\/node_modules\/(?:shiki|@shikijs\/[^/]+|oniguruma-[^/]+)\//]
+]
+
+// Two shiki leaves the viewer needs before it can highlight anything: the
+// language registry `resolveLanguage` looks names up in, and the token-style
+// transformer the renderers wrap every file with. Neither pulls the tokenizer in,
+// but grouping them with it made the engine a static dependency of the viewer, so
+// they are left for Rollup to place next to their importer.
+const MAIN_THREAD_HIGHLIGHT_SUPPORT = /\/node_modules\/@shikijs\/transformers\//
+
+// Every grammar and theme is already an on-demand chunk keyed by language name.
+// Folding them into vendor-shiki with the engine shipped 8.2 MB of grammars in
+// one chunk, so they stay out of the grouping.
+const ON_DEMAND_HIGHLIGHT_ASSETS =
+  /\/node_modules\/(?:@shikijs\/(?:langs|themes)|@pierre\/theme|shiki\/dist\/langs)\//
+
+function vendorChunk(id: string): string | undefined {
+  const normalized = id.replaceAll('\\', '/')
+  // Vite's dynamic-import preload helper is shared by every lazy chunk. Left
+  // unassigned it is small enough for Rollup's chunk merging to fold it into a
+  // vendor group — it landed in vendor-shiki, and the entry then statically
+  // imported 208 KB of highlighter before boot. A manual chunk is never merged.
+  if (normalized.includes('vite/preload-helper')) return 'vite-preload'
+  if (ON_DEMAND_HIGHLIGHT_ASSETS.test(normalized)) return undefined
+  if (MAIN_THREAD_HIGHLIGHT_SUPPORT.test(normalized)) return undefined
+  for (const [name, pattern] of VENDOR_CHUNKS) {
+    if (pattern.test(normalized)) return name
+  }
+  return undefined
 }
 
 function dropShikiWasmPlugin(): Plugin {
@@ -177,6 +308,31 @@ function dropShikiWasmPlugin(): Plugin {
       return "throw new Error('shiki/wasm is stubbed out of this build; the highlighter uses the JS regex engine. Remove the horus:drop-shiki-wasm plugin to ship the oniguruma engine.')\n"
     }
   }
+}
+
+interface CompilerLogEvent {
+  kind: string
+  fnName?: string | null
+  fnLoc?: { start?: { line?: number } } | null
+  detail?: { reason?: string; description?: string } | null
+}
+
+// A component the compiler skips is a component nothing in it is memoised in, and
+// the build says nothing about it. HORUS_COMPILER_LOG=1 prints one line per skip
+// with the reason; src/renderer/src/reactCompiler.test.ts keeps the hot components
+// honest without the build.
+function reactCompilerOptions(): Record<string, unknown> {
+  const options: Record<string, unknown> = { target: '19' }
+  if (process.env.HORUS_COMPILER_LOG !== '1') return options
+  options.logger = {
+    logEvent(filename: string | null, event: CompilerLogEvent) {
+      if (event.kind === 'CompileSuccess') return
+      const where = `${filename ?? '?'}:${event.fnLoc?.start?.line ?? '?'}`
+      const reason = event.detail?.reason ?? event.detail?.description ?? ''
+      console.log(`[react-compiler] ${event.kind} ${event.fnName ?? ''} ${where} ${reason}`)
+    }
+  }
+  return options
 }
 
 export default defineConfig({
@@ -214,18 +370,25 @@ export default defineConfig({
     plugins: [
       react({
         babel: {
-          plugins: [['babel-plugin-react-compiler', { target: '19' }]]
+          plugins: [['babel-plugin-react-compiler', reactCompilerOptions()]]
         }
       }),
       contentSecurityPolicyPlugin(),
       preloadBootChunkPlugin(),
       dropShikiWasmPlugin(),
-      trimShikiThemesPlugin()
+      trimShikiThemesPlugin(),
+      lazyHighlighterEnginePlugin(),
+      lazyThemeNormalizerPlugin()
     ],
     build: {
       minify: 'esbuild',
       cssMinify: 'esbuild',
-      sourcemap: 'hidden'
+      sourcemap: 'hidden',
+      rollupOptions: {
+        output: {
+          manualChunks: vendorChunk
+        }
+      }
     },
     worker: {
       format: 'es',

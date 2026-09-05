@@ -137,6 +137,13 @@ describe('parseAgentAskRequest', () => {
     await expect(parseAgentAskRequest({ ...valid, resumeSessionId: 7 })).rejects.toThrow('not understood')
   })
 
+  it('rejects a pull request URL that is not a GitHub selector', async () => {
+    await expect(parseAgentAskRequest({
+      ...valid,
+      subject: { ...valid.subject, pullRequestUrl: 'https://example.com/acme/app/pull/7' }
+    })).rejects.toThrow('not understood')
+  })
+
   it('requires a registered-tab-shaped subject with an absolute repository root', async () => {
     await expect(parseAgentAskRequest({
       ...valid,

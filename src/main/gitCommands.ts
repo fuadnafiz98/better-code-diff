@@ -1,8 +1,20 @@
 import { execFile, spawn } from 'node:child_process'
+import { cpus } from 'node:os'
 
 export const MAX_DIFF_FILE_BYTES = 2 * 1024 * 1024
 export const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 export const COMMAND_ABORTED_MESSAGE = 'The command was cancelled before it finished.'
+
+/**
+ * A plain `git status` takes the optional index lock and rewrites `.git/index`,
+ * which the repository watcher reads as a change and answers with another
+ * refresh: one `touch README.md` produced three refresh cycles and 11.3 s of
+ * saturated core. `GIT_OPTIONAL_LOCKS=0` is `--no-optional-locks` for every
+ * subcommand, including the ones `gh` runs for us.
+ */
+function commandEnvironment(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
+}
 
 export interface CommandResult {
   stdout: Buffer
@@ -102,7 +114,10 @@ export class GitObjectReader {
     if (this.#child != null) return this.#child
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn('git', ['-C', this.#root, 'cat-file', '--batch'], { windowsHide: true })
+      child = spawn('git', ['-C', this.#root, 'cat-file', '--batch'], {
+        env: commandEnvironment(),
+        windowsHide: true
+      })
     } catch (error) {
       this.#failAll(error instanceof Error ? error : new Error(String(error)))
       return null
@@ -252,13 +267,151 @@ export async function readGitObject(root: string, object: string): Promise<GitOb
   }
 }
 
-export function runCommand(
+/**
+ * Git, gh and ripgrep children all fork/exec a process that then walks the
+ * filesystem, so running more of them than the machine has spare cores makes
+ * every one of them slower: during a Cmd+H, 307 `git remote -v` probes running
+ * eight wide against a four-way ignored walk each cost 3-6x their idle time.
+ *
+ * The interactive lane is work somebody is waiting on — refreshing the active
+ * root, opening a pull request, searching, reading a file. The background lane is
+ * speculative: pull request warmup, remote probing, ignored listings for
+ * repositories nobody is looking at.
+ */
+export type CommandLane = 'interactive' | 'background'
+
+export const MAX_CONCURRENT_COMMANDS = Math.max(4, cpus().length - 2)
+/**
+ * Lane priority only orders the queue. A background burst that already filled
+ * every slot would still make the next interactive command wait for a child to
+ * exit, so two slots are held back for the interactive lane.
+ */
+export const MAX_BACKGROUND_COMMANDS = Math.max(1, MAX_CONCURRENT_COMMANDS - 2)
+
+interface CommandWaiter {
+  grant(): void
+}
+
+/**
+ * Admission control for command children: at most `limit` at a time, of which at
+ * most `backgroundLimit` are background. Waiting interactive commands are always
+ * admitted before waiting background ones, and a waiter whose signal aborts
+ * leaves the queue instead of spawning when its turn finally comes.
+ */
+export class CommandSemaphore {
+  #limit: number
+  #backgroundLimit: number
+  #running = 0
+  #backgroundRunning = 0
+  #interactiveQueue: CommandWaiter[] = []
+  #backgroundQueue: CommandWaiter[] = []
+
+  constructor(limit: number = MAX_CONCURRENT_COMMANDS, backgroundLimit: number = MAX_BACKGROUND_COMMANDS) {
+    this.#limit = Math.max(1, limit)
+    this.#backgroundLimit = Math.max(1, Math.min(this.#limit, backgroundLimit))
+  }
+
+  get running(): number {
+    return this.#running
+  }
+
+  get backgroundRunning(): number {
+    return this.#backgroundRunning
+  }
+
+  get waiting(): number {
+    return this.#interactiveQueue.length + this.#backgroundQueue.length
+  }
+
+  /** Resolves with the function that hands the slot back. Calling it twice is a no-op. */
+  acquire(lane: CommandLane, signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted === true) return Promise.reject(new Error(COMMAND_ABORTED_MESSAGE))
+    if (this.#hasSlot(lane)) return Promise.resolve(this.#take(lane))
+    return new Promise<() => void>((resolveSlot, rejectSlot) => {
+      const queue = lane === 'interactive' ? this.#interactiveQueue : this.#backgroundQueue
+      // Assigned before the waiter can be granted: a grant only ever comes from
+      // another command releasing its slot, which cannot happen synchronously here.
+      let detach = (): void => {}
+      const waiter: CommandWaiter = {
+        grant: () => {
+          detach()
+          resolveSlot(this.#take(lane))
+        }
+      }
+      queue.push(waiter)
+      if (signal == null) return
+      const onAbort = (): void => {
+        const index = queue.indexOf(waiter)
+        if (index !== -1) queue.splice(index, 1)
+        rejectSlot(new Error(COMMAND_ABORTED_MESSAGE))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      detach = () => signal.removeEventListener('abort', onAbort)
+    })
+  }
+
+  #hasSlot(lane: CommandLane): boolean {
+    if (this.#running >= this.#limit) return false
+    return lane === 'interactive' || this.#backgroundRunning < this.#backgroundLimit
+  }
+
+  #take(lane: CommandLane): () => void {
+    this.#running += 1
+    if (lane === 'background') this.#backgroundRunning += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.#running -= 1
+      if (lane === 'background') this.#backgroundRunning -= 1
+      this.#pump()
+    }
+  }
+
+  #pump(): void {
+    for (;;) {
+      const waiter = this.#nextWaiter()
+      if (waiter == null) return
+      waiter.grant()
+    }
+  }
+
+  #nextWaiter(): CommandWaiter | null {
+    if (!this.#hasSlot('interactive')) return null
+    const interactive = this.#interactiveQueue.shift()
+    if (interactive != null) return interactive
+    if (!this.#hasSlot('background')) return null
+    return this.#backgroundQueue.shift() ?? null
+  }
+}
+
+/** The one semaphore every `runCommand` child passes through. */
+export const commandSemaphore = new CommandSemaphore()
+
+export async function runCommand(
   executable: string,
   args: readonly string[],
   cwd?: string,
   allowedExitCodes: readonly number[] = [],
   input?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  lane: CommandLane = 'interactive'
+): Promise<CommandResult> {
+  const release = await commandSemaphore.acquire(lane, signal)
+  try {
+    return await spawnCommand(executable, args, cwd, allowedExitCodes, input, signal)
+  } finally {
+    release()
+  }
+}
+
+function spawnCommand(
+  executable: string,
+  args: readonly string[],
+  cwd: string | undefined,
+  allowedExitCodes: readonly number[],
+  input: string | undefined,
+  signal: AbortSignal | undefined
 ): Promise<CommandResult> {
   return new Promise((resolveCommand, rejectCommand) => {
     if (signal?.aborted === true) {
@@ -271,6 +424,7 @@ export function runCommand(
       {
         cwd,
         encoding: 'buffer',
+        env: commandEnvironment(),
         maxBuffer: MAX_GIT_OUTPUT_BYTES,
         windowsHide: true,
         signal
